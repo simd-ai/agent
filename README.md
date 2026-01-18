@@ -245,9 +245,9 @@ Then call it from the main `lint()` method.
 
 ## Adding New Providers
 
-The service uses `simd_codegen` for LLM operations. To add a new provider:
+The service uses `codegen` for LLM operations. To add a new provider:
 
-1. Implement the provider in `simd_codegen`
+1. Implement the provider in `codegen`
 2. Add the API key environment variable to `settings.py`:
 
 ```python

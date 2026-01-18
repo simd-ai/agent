@@ -4,7 +4,7 @@ SIMD Agent - FastAPI service for orchestrating CFD workflows via WebSockets.
 
 This service provides:
 - CFD configuration linting and validation
-- OpenFOAM case generation using simd_codegen
+- OpenFOAM case generation using codegen
 - Self-healing execution loop with remote sandbox
 - Real-time progress streaming via WebSocket events
 """

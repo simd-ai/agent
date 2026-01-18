@@ -1,6 +1,7 @@
 # simd_agent/orchestration.py
 """Main orchestration logic for CFD workflows."""
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -114,16 +115,22 @@ class Orchestrator:
         return self._error_summarizer
     
     async def _init_code_generator(self) -> None:
-        """Initialize the code generator from simd_codegen."""
+        """Initialize the code generator from codegen."""
+        # Use internal mock generator for testing without codegen dependency
+        if self.request.provider == "mock":
+            logger.info("Using internal mock generator for provider='mock'")
+            self._code_generator = MockCodeGenerator()
+            return
+        
         try:
-            from simd_codegen import CodeGenerator
+            from codegen import CodeGenerator
             
             self._code_generator = CodeGenerator(
                 provider=self.request.provider,
                 prompt_pack=self.request.prompt_pack,
             )
         except ImportError:
-            logger.warning("simd_codegen not available, using mock generator")
+            logger.warning("codegen not available, using mock generator")
             self._code_generator = MockCodeGenerator()
     
     async def run(self) -> FinalResult:
@@ -319,11 +326,11 @@ class Orchestrator:
                         solver=solver,
                     )
                 
-                # Sandbox failed - analyze error
-                self._retries += 1
-                
-                if self._retries > max_retries:
+                # Sandbox failed - check if we can retry
+                if self._retries >= max_retries:
                     break
+                
+                self._retries += 1
                 
                 # Summarize error
                 error_summary = await self.error_summarizer.summarize(
@@ -349,9 +356,9 @@ class Orchestrator:
                 
             except SandboxError as e:
                 logger.error(f"Sandbox error: {e}")
-                self._retries += 1
-                if self._retries > max_retries:
+                if self._retries >= max_retries:
                     break
+                self._retries += 1
                 await self.event_bus.emit_retrying(self._retries, max_retries)
         
         # Max retries exceeded
@@ -420,35 +427,70 @@ class Orchestrator:
         return None
     
     async def _generate_code(self, planning_result: Any) -> str:
-        """Generate OpenFOAM case code using simd_codegen."""
+        """Generate OpenFOAM case code using codegen."""
         try:
-            from simd_codegen import GenerationContext
+            from codegen import GenerationContext
             
-            # Build context
-            context_data = {
-                "task": "codegen",
-                "domain": "openfoam_case",
-                "requirements": self.request.user_requirements,
-                "validated_config": self._lint_result.validated_config if self._lint_result else {},
-                "solver": planning_result.solver,
-                "turbulence_model": planning_result.turbulence_model,
-                "mesh_strategy": planning_result.mesh_strategy,
-                "case_type": planning_result.case_type,
-            }
+            # Build enhanced requirements with planning context
+            enhanced_requirements = self._build_requirements(planning_result)
             
-            # Add error context if retrying
-            if self._previous_errors:
-                context_data["previous_errors"] = self._previous_errors
-                context_data["previous_code"] = self._current_files
+            # Check if we're retrying after a failure
+            if self._previous_errors and self._current_files:
+                # Use codefix task for retries
+                last_error = self._previous_errors[-1]
+                previous_code = "\n\n".join(
+                    f"```file:{path}\n{content}\n```"
+                    for path, content in self._current_files.items()
+                )
+                
+                context = GenerationContext(
+                    task="codefix",
+                    domain="openfoam",
+                    requirements=enhanced_requirements,
+                    previous_code=previous_code,
+                    sandbox_error=last_error.get("root_cause", "Unknown error"),
+                    sandbox_logs="\n".join(
+                        change.get("description", "")
+                        for change in last_error.get("changes", [])
+                    ),
+                )
+            else:
+                # Initial generation
+                context = GenerationContext(
+                    task="codegen",
+                    domain="openfoam",
+                    requirements=enhanced_requirements,
+                )
             
-            context = GenerationContext(**context_data)
-            result = await self._code_generator.generate(context)
-            return result.content
+            # codegen.generate() is synchronous, run in thread to avoid blocking
+            result = await asyncio.to_thread(self._code_generator.generate, context)
+            return result.final_text
         except ImportError:
             # Fallback to mock
-            return await self._mock_generate_code(planning_result)
+            return self._mock_generate_code(planning_result)
     
-    async def _mock_generate_code(self, planning_result: Any) -> str:
+    def _build_requirements(self, planning_result: Any) -> str:
+        """Build enhanced requirements string with planning context."""
+        parts = [self.request.user_requirements]
+        
+        # Add validated config context
+        if self._lint_result and self._lint_result.validated_config:
+            import json
+            parts.append(f"\n\nValidated configuration:\n```json\n{json.dumps(self._lint_result.validated_config, indent=2)}\n```")
+        
+        # Add planning decisions
+        if planning_result.solver:
+            parts.append(f"\n\nSolver: {planning_result.solver}")
+        if planning_result.turbulence_model:
+            parts.append(f"Turbulence model: {planning_result.turbulence_model}")
+        if planning_result.mesh_strategy:
+            parts.append(f"Mesh strategy: {planning_result.mesh_strategy}")
+        if planning_result.case_type:
+            parts.append(f"Case type: {planning_result.case_type}")
+        
+        return "".join(parts)
+    
+    def _mock_generate_code(self, planning_result: Any) -> str:
         """Generate mock OpenFOAM case for testing."""
         solver = planning_result.solver or "simpleFoam"
         
@@ -788,16 +830,17 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
 
 
 class MockCodeGenerator:
-    """Mock code generator for testing without simd_codegen."""
+    """Mock code generator for testing without codegen."""
     
-    async def generate(self, context: Any) -> Any:
+    def generate(self, context: Any) -> Any:
         """Generate mock result."""
         class MockResult:
-            content = ""
+            final_text = ""
+            extracted_code_blocks = []
         
         result = MockResult()
         # Return minimal OpenFOAM case
-        result.content = '''```file:system/controlDict
+        result.final_text = '''```file:system/controlDict
 FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }
 application simpleFoam;
 startFrom startTime;

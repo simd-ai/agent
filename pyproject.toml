@@ -20,7 +20,7 @@ dependencies = [
     "pydantic-settings>=2.1.0",
     "sqlalchemy[asyncio]>=2.0.25",
     "asyncpg>=0.29.0",
-    "simd_codegen",
+    "codegen @ git+https://github.com/simd-ai/codegen.git",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +36,9 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["simd_agent"]

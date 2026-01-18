@@ -1,6 +1,7 @@
 # simd_agent/error_summarizer.py
 """Error summarizer agent for analyzing sandbox failures."""
 
+import asyncio
 import logging
 import re
 from typing import Any
@@ -119,7 +120,7 @@ class ErrorSummarizer:
         Args:
             event_bus: Optional event bus for progress updates
             use_llm: Whether to use LLM for complex analysis
-            code_generator: Optional CodeGenerator from simd_codegen
+            code_generator: Optional CodeGenerator from codegen
         """
         self.event_bus = event_bus
         self.use_llm = use_llm
@@ -213,25 +214,35 @@ class ErrorSummarizer:
     ) -> ErrorSummary:
         """Use LLM to analyze complex errors."""
         try:
-            from simd_codegen import CodeGenerator, GenerationContext
+            from codegen import GenerationContext
             
-            # Build context for error analysis
-            context = GenerationContext(
-                task="error_summary",
-                domain="openfoam_error",
-                requirements=f"Analyze the following OpenFOAM execution logs and determine the root cause of failure.\n\nExit code: {exit_code}\n\nLogs (last 200 lines):\n{logs[-10000:]}",
-            )
+            # Build requirements string with all context
+            requirements_parts = [
+                "Analyze the following OpenFOAM execution logs and determine the root cause of failure.",
+                f"\n\nExit code: {exit_code}",
+                f"\n\nLogs (last 200 lines):\n{logs[-10000:]}",
+            ]
             
             # Add current files if provided
             if current_files:
                 file_summary = "\n".join(f"- {path}" for path in current_files.keys())
-                context.requirements += f"\n\nCase files present:\n{file_summary}"
+                requirements_parts.append(f"\n\nCase files present:\n{file_summary}")
             
-            # Generate error analysis
-            result = await self.code_generator.generate(context)
+            # Build context for error analysis (using codefix task for error analysis)
+            context = GenerationContext(
+                task="codefix",
+                domain="openfoam",
+                requirements="".join(requirements_parts),
+                previous_code="",
+                sandbox_error=f"Exit code: {exit_code}",
+                sandbox_logs=logs[-10000:],
+            )
+            
+            # Generate error analysis (codegen.generate is synchronous)
+            result = await asyncio.to_thread(self.code_generator.generate, context)
             
             # Parse LLM response
-            return self._parse_llm_response(result.content)
+            return self._parse_llm_response(result.final_text)
         except Exception as e:
             logger.error(f"LLM error analysis failed: {e}")
             # Fall back to pattern matching

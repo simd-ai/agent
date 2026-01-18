@@ -71,15 +71,16 @@ TURBULENCE_MODELS = {
     "SpalartAllmaras": {"regime": "turbulent", "description": "Spalart-Allmaras one-equation"},
 }
 
-# Case type detection patterns
-CASE_PATTERNS = {
-    "pipe_flow": ["pipe", "duct", "channel", "tube"],
-    "external_aero": ["external", "aerodynamic", "airfoil", "wing", "vehicle", "car", "cylinder"],
-    "heat_transfer": ["heat", "thermal", "temperature", "convection", "cooling", "heating"],
-    "cavity": ["cavity", "lid-driven", "enclosed"],
-    "mixing": ["mixing", "mixer", "impeller", "stirred"],
-    "porous": ["porous", "filter", "packed bed"],
-}
+# Case type detection patterns (ordered by priority - more specific first)
+# Note: Using longer patterns or word-specific patterns to avoid substring false positives
+CASE_PATTERNS = [
+    ("heat_transfer", ["heated", "thermal", "temperature", "convection", "cooling", "heating", "heat transfer"]),
+    ("cavity", ["cavity", "lid-driven", "lid driven", "enclosed"]),
+    ("mixing", ["mixing", "mixer", "impeller", "stirred"]),
+    ("porous", ["porous", "filter", "packed bed"]),
+    ("external_aero", ["external flow", "aerodynamic", "airfoil", "aircraft", "vehicle", "bluff body", "around a"]),
+    ("pipe_flow", ["pipe", "duct", "channel", "tube", "cylinder", "internal flow"]),
+]
 
 
 class CFDLinter:
@@ -174,10 +175,10 @@ class CFDLinter:
         if "case_type" in config:
             return config["case_type"]
         
-        # Search for patterns in user requirements
+        # Search for patterns in user requirements (ordered by priority)
         req_lower = user_requirements.lower()
         
-        for case_type, patterns in CASE_PATTERNS.items():
+        for case_type, patterns in CASE_PATTERNS:
             for pattern in patterns:
                 if pattern in req_lower:
                     return case_type
@@ -232,22 +233,23 @@ class CFDLinter:
         velocity = validated.get("inlet", {}).get("velocity") or validated.get("velocity")
         if velocity is not None:
             # Velocity can be negative for direction, but magnitude should be reasonable
+            # Above ~100 m/s (Mach 0.3), compressibility effects become significant
             if isinstance(velocity, (int, float)):
-                if abs(velocity) > 1000:  # Supersonic check
+                if abs(velocity) > 100:  # Compressibility threshold
                     issues.append(LintIssue(
                         code="HIGH_VELOCITY",
                         path="velocity",
-                        message=f"Velocity {velocity} m/s may be supersonic; ensure incompressible assumption is valid",
+                        message=f"Velocity {velocity} m/s is high; compressibility effects may be significant (Mach > 0.3)",
                         severity="warning",
                     ))
             elif isinstance(velocity, (list, tuple)):
                 # Vector velocity
                 magnitude = math.sqrt(sum(v**2 for v in velocity))
-                if magnitude > 1000:
+                if magnitude > 100:
                     issues.append(LintIssue(
                         code="HIGH_VELOCITY",
                         path="velocity",
-                        message=f"Velocity magnitude {magnitude:.1f} m/s may be supersonic",
+                        message=f"Velocity magnitude {magnitude:.1f} m/s is high; compressibility effects may be significant",
                         severity="warning",
                     ))
         
