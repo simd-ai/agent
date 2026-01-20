@@ -3,7 +3,7 @@
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Callable, Awaitable
 
 import httpx
 
@@ -216,7 +216,7 @@ class SandboxClient:
         run_id: str,
         poll_interval: float | None = None,
         timeout: float | None = None,
-        on_status: callable | None = None,
+        on_status: Callable[..., Awaitable[None]] | None = None,
     ) -> SandboxStatus:
         """Wait for a sandbox run to complete.
         
@@ -255,7 +255,7 @@ class SandboxClient:
         case_zip: bytes,
         run_script: str = "run.sh",
         metadata: dict[str, Any] | None = None,
-        on_status: callable | None = None,
+        on_status: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str, SandboxStatus, str]:
         """Submit a run and wait for completion.
         

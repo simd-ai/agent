@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     
     # Sandbox
     sandbox_base_url: str = Field(
-        default="https://sandbox.simd.dev",
+        default="https://legal-many-zebra.ngrok-free.app",
         description="Base URL for the SIMD sandbox execution service",
     )
     sandbox_timeout: int = Field(
