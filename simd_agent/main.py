@@ -9,9 +9,20 @@ from uuid import uuid4
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from simd_agent.db import close_db, init_db
+
+# Try to import mesh module (may fail on some Python versions due to VTK compatibility)
+MESH_ENABLED = False
+try:
+    from simd_agent.mesh import mesh_router, STORAGE_DIR
+    MESH_ENABLED = True
+except ImportError as e:
+    logging.warning(f"Mesh module not available: {e}")
+    mesh_router = None
+    STORAGE_DIR = None
 from simd_agent.event_bus import EventBus
 from simd_agent.models import (
     AgentEvent,
@@ -71,6 +82,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount static files and mesh routes (if available)
+if MESH_ENABLED and STORAGE_DIR:
+    app.mount("/static", StaticFiles(directory=str(STORAGE_DIR)), name="static")
+    app.include_router(mesh_router)
+    logger.info("Mesh converter enabled at /api/mesh/convert")
+else:
+    logger.warning("Mesh converter disabled (VTK/PyVista not available)")
+
 
 @app.get("/health")
 async def health_check() -> dict[str, str]:
@@ -79,13 +98,120 @@ async def health_check() -> dict[str, str]:
 
 
 @app.get("/")
-async def root() -> dict[str, str]:
+async def root() -> dict[str, Any]:
     """Root endpoint with service info."""
+    endpoints = {
+        "websocket": "/ws/run",
+        "precheck": "/api/precheck",
+        "runs": "/runs/{run_id}",
+        "events": "/runs/{run_id}/events",
+    }
+    if MESH_ENABLED:
+        endpoints["mesh_convert"] = "/api/mesh/convert"
+    
     return {
         "service": "simd_agent",
         "version": "0.1.0",
-        "websocket": "/ws/run",
+        "mesh_enabled": MESH_ENABLED,
+        "endpoints": endpoints,
     }
+
+
+# --- Precheck Endpoint ---
+
+@app.post("/api/precheck")
+async def precheck(request: dict[str, Any]):
+    """Analyze user prompt and extract simulation specifications.
+    
+    Uses LLM to parse natural language simulation descriptions and return
+    structured configuration suggestions, boundary condition hints, and
+    interpretation of the user's intent.
+    
+    Request:
+        {
+            "prompt": "Simulate turbulent flow through a pipe...",
+            "mesh": { ... },  // Optional mesh info
+            "previousConfig": { ... }  // Optional previous config
+        }
+    
+    Response:
+        {
+            "success": true,
+            "suggestedConfig": { ... },
+            "boundaryHints": { ... },
+            "interpretation": { ... },
+            "confidence": { ... },
+            ...
+        }
+    """
+    from simd_agent.precheck import PrecheckRequest, get_precheck_service
+    
+    try:
+        # Parse and validate request
+        precheck_request = PrecheckRequest(**request)
+        
+        # Get precheck service and analyze
+        service = get_precheck_service()
+        response = await service.analyze(precheck_request)
+        
+        return response.model_dump()
+        
+    except ValidationError as e:
+        logger.warning(f"Invalid precheck request: {e}")
+        return {
+            "success": False,
+            "errors": [f"Invalid request: {e}"],
+            "suggestedConfig": {
+                "flowRegime": "turbulent",
+                "timeScheme": "steady",
+                "compressibility": "incompressible",
+                "enableHeatTransfer": False,
+                "maxIterations": 1000,
+                "convergenceCriteria": 1e-6,
+            },
+            "interpretation": {
+                "summary": "Request validation failed",
+                "simulationType": "Unknown",
+                "keyPhysics": [],
+                "assumptions": [],
+            },
+            "confidence": {
+                "overall": 0.0,
+                "flowRegime": 0.0,
+                "boundaryConditions": 0.0,
+                "physicsSettings": 0.0,
+            },
+            "nextStep": 1,
+            "shouldShowMeshViewer": False,
+        }
+    except Exception as e:
+        logger.exception(f"Precheck failed: {e}")
+        return {
+            "success": False,
+            "errors": [f"Internal error: {e}"],
+            "suggestedConfig": {
+                "flowRegime": "turbulent",
+                "timeScheme": "steady",
+                "compressibility": "incompressible",
+                "enableHeatTransfer": False,
+                "maxIterations": 1000,
+                "convergenceCriteria": 1e-6,
+            },
+            "interpretation": {
+                "summary": "Analysis failed due to internal error",
+                "simulationType": "Unknown",
+                "keyPhysics": [],
+                "assumptions": [],
+            },
+            "confidence": {
+                "overall": 0.0,
+                "flowRegime": 0.0,
+                "boundaryConditions": 0.0,
+                "physicsSettings": 0.0,
+            },
+            "nextStep": 1,
+            "shouldShowMeshViewer": False,
+        }
 
 
 @app.websocket("/ws/run")

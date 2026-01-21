@@ -179,7 +179,7 @@ class TestRealCodegen:
         print(f"   Turbulence: {planning_result.turbulence_model}")
         print(f"   Mesh Strategy: {planning_result.mesh_strategy}")
         
-        # Step 3: Code Generation (using real LLM via simd_codegen)
+        # Step 3: Code Generation (using real LLM via codegen)
         print("\n" + "-"*40)
         print("Step 3: Code Generation (Gemini)")
         print("-"*40)

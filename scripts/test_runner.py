@@ -282,6 +282,87 @@ async def test_sandbox_connectivity(sandbox_url: str):
         return False
 
 
+async def test_precheck(use_mock: bool):
+    """Test the precheck endpoint."""
+    print("\n" + "-" * 40)
+    print("🔮 Testing Precheck (Prompt Analysis)")
+    print("-" * 40)
+    
+    from simd_agent.precheck import PrecheckRequest, get_precheck_service
+    
+    # Test 1: Simple turbulent pipe flow
+    print("\n📝 Test 1: Turbulent pipe flow prompt")
+    request1 = PrecheckRequest(
+        prompt="I want to simulate turbulent water flow through a 10cm diameter pipe at 2 m/s inlet velocity. I need to achieve a pressure drop less than 500 Pa."
+    )
+    
+    service = get_precheck_service()
+    response1 = await service.analyze(request1)
+    
+    print(f"   ✅ Success: {response1.success}")
+    print(f"   📊 Suggested Config:")
+    print(f"      Flow Regime: {response1.suggestedConfig.flowRegime}")
+    print(f"      Time Scheme: {response1.suggestedConfig.timeScheme}")
+    print(f"      Heat Transfer: {response1.suggestedConfig.enableHeatTransfer}")
+    print(f"      Turbulence Model: {response1.suggestedConfig.turbulenceModel}")
+    print(f"   📋 Interpretation:")
+    print(f"      Summary: {response1.interpretation.summary[:80]}...")
+    print(f"      Type: {response1.interpretation.simulationType}")
+    print(f"      Physics: {response1.interpretation.keyPhysics}")
+    print(f"   📈 Confidence: {response1.confidence.overall:.0%}")
+    if response1.kpiTargets and response1.kpiTargets.pressureDrop:
+        print(f"   🎯 KPI Target: pressure drop < {response1.kpiTargets.pressureDrop.value} {response1.kpiTargets.pressureDrop.unit}")
+    
+    # Test 2: Heat transfer case
+    print("\n📝 Test 2: Heat transfer prompt")
+    request2 = PrecheckRequest(
+        prompt="Simulate cooling of a hot plate with air at 25°C flowing at 5 m/s. The plate is at 100°C."
+    )
+    
+    response2 = await service.analyze(request2)
+    
+    print(f"   ✅ Success: {response2.success}")
+    print(f"   📊 Heat Transfer Enabled: {response2.suggestedConfig.enableHeatTransfer}")
+    print(f"   📋 Key Physics: {response2.interpretation.keyPhysics}")
+    
+    # Test 3: With mesh info
+    print("\n📝 Test 3: Prompt with mesh info")
+    from simd_agent.precheck import MeshInfo, MeshPatch, CheckMeshInfo
+    
+    request3 = PrecheckRequest(
+        prompt="Run a steady-state simulation of airflow through this duct",
+        mesh=MeshInfo(
+            meshId="test-mesh-123",
+            fileName="duct.msh",
+            patches=[
+                MeshPatch(name="inlet", type="patch", nCells=500),
+                MeshPatch(name="outlet", type="patch", nCells=500),
+                MeshPatch(name="walls", type="wall", nCells=10000),
+                MeshPatch(name="symmetryPlane", type="symmetry", nCells=2000),
+            ],
+            checkMesh=CheckMeshInfo(
+                cells=250000,
+                faces=780000,
+                points=260000,
+            ),
+        ),
+    )
+    
+    response3 = await service.analyze(request3)
+    
+    print(f"   ✅ Success: {response3.success}")
+    print(f"   📊 Boundary Hints:")
+    if response3.boundaryHints:
+        for patch_name, hint in response3.boundaryHints.items():
+            print(f"      {patch_name}: {hint.suggestedType} (confidence: {hint.confidence:.0%})")
+            if hint.reasoning:
+                print(f"         → {hint.reasoning[:50]}...")
+    print(f"   🖼️  Show Mesh Viewer: {response3.shouldShowMeshViewer}")
+    print(f"   ➡️  Next Step: {response3.nextStep}")
+    
+    return response1, response2, response3
+
+
 async def main():
     """Main interactive test runner."""
     use_mock, sandbox_url = check_environment()
@@ -291,27 +372,31 @@ async def main():
     print("  2. Planning only")
     print("  3. Code generation")
     print("  4. Sandbox connectivity")
-    print("  5. All of the above")
+    print("  5. Precheck (prompt analysis)")
+    print("  6. All of the above")
     print("  q. Quit")
     print()
     
-    choice = input("Choice [1-5, q]: ").strip()
+    choice = input("Choice [1-6, q]: ").strip()
     
     if choice == 'q':
         return
     
     try:
-        if choice in ('1', '5'):
+        if choice in ('1', '6'):
             await test_linting()
         
-        if choice in ('2', '5'):
+        if choice in ('2', '6'):
             await test_planning()
         
-        if choice in ('3', '5'):
+        if choice in ('3', '6'):
             await test_codegen(use_mock)
         
-        if choice in ('4', '5'):
+        if choice in ('4', '6'):
             await test_sandbox_connectivity(sandbox_url)
+        
+        if choice in ('5', '6'):
+            await test_precheck(use_mock)
         
         print("\n" + "=" * 60)
         print("✅ Tests complete!")

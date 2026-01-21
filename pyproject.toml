@@ -13,14 +13,19 @@ authors = [
     {name = "SIMD Team"}
 ]
 dependencies = [
-    "fastapi>=0.109.0",
-    "uvicorn[standard]>=0.27.0",
+    "fastapi==0.115.6",
+    "uvicorn[standard]==0.32.1",
     "httpx>=0.26.0",
     "pydantic>=2.5.0",
     "pydantic-settings>=2.1.0",
     "sqlalchemy[asyncio]>=2.0.25",
     "asyncpg>=0.29.0",
     "codegen @ git+https://github.com/simd-ai/codegen.git",
+    # Mesh converter dependencies
+    "pyvista>=0.45.0",
+    "meshio>=5.3.5",
+    "numpy>=2.0.0",
+    "python-multipart==0.0.19",
 ]
 
 [project.optional-dependencies]
