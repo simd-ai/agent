@@ -5,3 +5,4 @@ __pycache__/
 vir/
 vir312/
 .DS_Store
+storage/

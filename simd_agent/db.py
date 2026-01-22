@@ -31,14 +31,60 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
 def get_database_url() -> str:
-    """Get async database URL from settings."""
+    """Get async database URL from settings.
+    
+    Converts standard postgres URLs to asyncpg format and handles
+    Neon-specific parameters that asyncpg doesn't support.
+    """
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+    
     settings = get_settings()
     url = str(settings.database_url)
+    
     # Convert postgres:// to postgresql+asyncpg://
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
     elif url.startswith("postgresql://"):
         url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    
+    # Parse URL to handle query parameters properly
+    parsed = urlparse(url)
+    
+    if parsed.query:
+        # Parse query parameters
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        
+        # Parameters that asyncpg doesn't support (libpq-specific)
+        unsupported_params = {
+            "sslmode",        # asyncpg uses 'ssl' instead
+            "channel_binding",  # Not supported by asyncpg
+            "options",        # libpq-specific
+            "application_name",  # Handled via connect_args in SQLAlchemy
+        }
+        
+        # Convert sslmode to ssl if present
+        if "sslmode" in params:
+            ssl_value = params.pop("sslmode")[0]
+            params["ssl"] = [ssl_value]
+        
+        # Remove other unsupported parameters
+        for param in unsupported_params:
+            params.pop(param, None)
+        
+        # Flatten params (parse_qs returns lists)
+        flat_params = {k: v[0] for k, v in params.items()}
+        new_query = urlencode(flat_params) if flat_params else ""
+        
+        # Rebuild URL
+        url = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            parsed.fragment,
+        ))
+    
     return url
 
 
