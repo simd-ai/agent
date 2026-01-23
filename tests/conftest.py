@@ -42,19 +42,37 @@ def run_id():
 
 @pytest.fixture
 def sample_simulation_config() -> dict:
-    """Sample simulation configuration for testing."""
+    """Sample simulation configuration for testing (complete V1 format)."""
     return {
+        "mesh": {
+            "mesh_id": "test-mesh-123",
+            "patches": [
+                {"name": "inlet", "type": "patch", "n_faces": 100},
+                {"name": "outlet", "type": "patch", "n_faces": 100},
+                {"name": "wall", "type": "wall", "n_faces": 5000},
+            ],
+        },
         "geometry": {
             "type": "pipe",
             "diameter": 0.1,
             "length": 1.0,
         },
-        "inlet": {
-            "velocity": 1.0,
-        },
         "fluid": {
             "viscosity": 1e-6,
             "density": 1000.0,
+        },
+        "boundary_conditions": {
+            "inlet": {
+                "patch_type": "inlet",
+                "velocity": {"type": "fixedValue", "value": [1.0, 0, 0]},
+            },
+            "outlet": {
+                "patch_type": "outlet",
+                "pressure": {"type": "fixedValue", "value": 0},
+            },
+            "wall": {
+                "patch_type": "wall",
+            },
         },
     }
 
@@ -69,6 +87,7 @@ def sample_requirements() -> str:
 def turbulent_config() -> dict:
     """Configuration for turbulent flow testing."""
     return {
+        "mesh": {"mesh_id": "turbulent-test"},
         "geometry": {
             "type": "pipe",
             "diameter": 0.1,
@@ -81,6 +100,15 @@ def turbulent_config() -> dict:
             "viscosity": 1e-6,
             "density": 1000.0,
         },
+        "boundary_conditions": {
+            "inlet": {
+                "patch_type": "inlet",
+                "velocity": {"value": [10.0, 0, 0]},
+            },
+            "outlet": {
+                "patch_type": "outlet",
+            },
+        },
     }
 
 
@@ -88,6 +116,7 @@ def turbulent_config() -> dict:
 def laminar_config() -> dict:
     """Configuration for laminar flow testing."""
     return {
+        "mesh": {"mesh_id": "laminar-test"},
         "geometry": {
             "type": "pipe",
             "diameter": 0.01,  # Small pipe
@@ -99,6 +128,15 @@ def laminar_config() -> dict:
         "fluid": {
             "viscosity": 1e-3,  # High viscosity (honey-like)
             "density": 1000.0,
+        },
+        "boundary_conditions": {
+            "inlet": {
+                "patch_type": "inlet",
+                "velocity": {"value": [0.01, 0, 0]},
+            },
+            "outlet": {
+                "patch_type": "outlet",
+            },
         },
     }
 

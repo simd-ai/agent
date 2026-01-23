@@ -2,6 +2,7 @@
 """FastAPI application with WebSocket endpoint for CFD workflow orchestration."""
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -230,14 +231,20 @@ async def websocket_run(websocket: WebSocket):
     store = EventStore()
     event_bus = None
     
+    logger.info("=" * 60)
+    logger.info(f"[WS] NEW CONNECTION - Run ID: {run_id}")
+    logger.info("=" * 60)
+    
     try:
         # Receive start request
+        logger.info("[WS] Waiting for start request from client...")
         try:
             data = await asyncio.wait_for(
                 websocket.receive_json(),
                 timeout=30.0,  # 30 second timeout for initial message
             )
         except asyncio.TimeoutError:
+            logger.error("[WS] Timeout waiting for start request")
             await websocket.send_json({
                 "error": "Timeout waiting for start request",
                 "type": "error",
@@ -245,10 +252,34 @@ async def websocket_run(websocket: WebSocket):
             await websocket.close(code=1008)
             return
         
+        logger.info("[WS] Received start request:")
+        logger.info("=" * 60)
+        logger.info("[WS] FULL REQUEST PAYLOAD:")
+        logger.info(f"[WS]   op: {data.get('op')}")
+        logger.info(f"[WS]   provider: {data.get('provider')}")
+        logger.info(f"[WS]   prompt_pack: {data.get('prompt_pack')}")
+        logger.info(f"[WS]   user_requirements: {data.get('user_requirements', '')}")
+        logger.info(f"[WS]   simulation_config:")
+        sim_config = data.get('simulation_config', {})
+        for key, value in sim_config.items():
+            if isinstance(value, dict):
+                logger.info(f"[WS]     {key}: {json.dumps(value, indent=6)}")
+            else:
+                logger.info(f"[WS]     {key}: {value}")
+        constraints = data.get('constraints', {})
+        if constraints:
+            logger.info(f"[WS]   constraints: {json.dumps(constraints, indent=4)}")
+        metadata = data.get('metadata', {})
+        if metadata:
+            logger.info(f"[WS]   metadata: {json.dumps(metadata, indent=4)}")
+        logger.info("=" * 60)
+        
         # Parse request
         try:
             request = StartRequest(**data)
+            logger.info(f"[WS] StartRequest parsed successfully: op={request.op.value}")
         except ValidationError as e:
+            logger.error(f"[WS] Invalid start request: {e}")
             await websocket.send_json({
                 "error": f"Invalid start request: {e}",
                 "type": "error",
@@ -257,6 +288,7 @@ async def websocket_run(websocket: WebSocket):
             return
         
         # Create event bus
+        logger.info("[WS] Creating EventBus...")
         event_bus = EventBus(
             run_id=run_id,
             websocket=websocket,
@@ -265,6 +297,7 @@ async def websocket_run(websocket: WebSocket):
         )
         
         # Create run in database
+        logger.info("[WS] Creating run in database...")
         try:
             await store.create_run(
                 op=request.op,
@@ -273,18 +306,23 @@ async def websocket_run(websocket: WebSocket):
                 user_requirements=request.user_requirements,
                 simulation_config=request.simulation_config,
                 run_id=run_id,
+                raw_config=data.get('simulation_config', {}),  # Save raw config too
             )
+            logger.info(f"[WS] Run created in database: {run_id}")
         except Exception as e:
-            logger.error(f"Failed to create run in database: {e}")
+            logger.error(f"[WS] Failed to create run in database: {e}")
             # Continue anyway - event streaming still works
         
         # Update run status
+        logger.info("[WS] Updating run status to RUNNING...")
         try:
             await store.update_run_status(run_id, RunStatus.RUNNING)
+            logger.info("[WS] Run status updated to RUNNING")
         except Exception as e:
-            logger.warning(f"Failed to update run status: {e}")
+            logger.warning(f"[WS] Failed to update run status: {e}")
         
         # Create and run orchestrator
+        logger.info("[WS] Creating Orchestrator...")
         orchestrator = Orchestrator(
             run_id=run_id,
             event_bus=event_bus,
@@ -293,16 +331,21 @@ async def websocket_run(websocket: WebSocket):
         )
         
         # Start heartbeat task
+        logger.info("[WS] Starting heartbeat task...")
         heartbeat_task = asyncio.create_task(
             _heartbeat_loop(websocket, get_settings().ws_heartbeat_interval)
         )
         
         try:
             # Execute the workflow
+            logger.info("[WS] Starting orchestrator.run()...")
+            logger.info("-" * 60)
             result = await orchestrator.run()
+            logger.info("-" * 60)
             
             # Final event already sent by orchestrator
-            logger.info(f"Run {run_id} completed with status: {result.status}")
+            logger.info(f"[WS] Run {run_id} completed with status: {result.status}")
+            logger.info(f"[WS] Result summary: {result.summary if hasattr(result, 'summary') else 'N/A'}")
             
         finally:
             heartbeat_task.cancel()

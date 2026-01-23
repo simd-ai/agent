@@ -74,18 +74,38 @@ class EventBus:
             payload=payload or {},
         )
         
+        # Log event details
+        logger.info(f"[EVENT #{seq}] {level.value.upper()} | {event_type}")
+        logger.info(f"[EVENT #{seq}] Message: {message}")
+        if payload:
+            # Log payload keys and summary (avoid logging huge payloads)
+            payload_keys = list(payload.keys())
+            logger.info(f"[EVENT #{seq}] Payload keys: {payload_keys}")
+            for key in payload_keys[:5]:  # Log first 5 keys
+                val = payload[key]
+                if isinstance(val, str) and len(val) > 100:
+                    logger.info(f"[EVENT #{seq}]   {key}: {val[:100]}...")
+                elif isinstance(val, (list, dict)):
+                    logger.info(f"[EVENT #{seq}]   {key}: {type(val).__name__} with {len(val)} items")
+                else:
+                    logger.info(f"[EVENT #{seq}]   {key}: {val}")
+        
         # Persist to database
         if self.persist:
             try:
                 await self.store.append_event(event)
+                logger.debug(f"[EVENT #{seq}] Persisted to database")
             except Exception as e:
-                logger.error(f"Failed to persist event: {e}")
+                logger.error(f"[EVENT #{seq}] Failed to persist event: {e}")
         
         # Send via WebSocket
         try:
-            await self.websocket.send_json(event.to_ws_message())
+            ws_message = event.to_ws_message()
+            logger.info(f"[EVENT #{seq}] >>> SENDING TO FRONTEND: type={ws_message.get('type')}")
+            await self.websocket.send_json(ws_message)
+            logger.debug(f"[EVENT #{seq}] Sent successfully")
         except Exception as e:
-            logger.error(f"Failed to send event via WebSocket: {e}")
+            logger.error(f"[EVENT #{seq}] Failed to send event via WebSocket: {e}")
         
         return event
     
@@ -148,6 +168,65 @@ class EventBus:
             {"op": op, "provider": provider},
         )
     
+    # --- Config validation events (NEW) ---
+    
+    async def emit_config_received(
+        self,
+        config_keys: list[str],
+        has_mesh: bool,
+        has_boundary_conditions: bool,
+        mesh_patches: list[str] | None = None,
+        bc_patches: list[str] | None = None,
+    ) -> AgentEvent:
+        """Emit config received event showing what was parsed from the request."""
+        return await self.emit_info(
+            EventTypes.CONFIG_RECEIVED,
+            f"Config received: {len(config_keys)} keys, mesh={has_mesh}, bcs={has_boundary_conditions}",
+            {
+                "config_keys": config_keys,
+                "has_mesh": has_mesh,
+                "has_boundary_conditions": has_boundary_conditions,
+                "mesh_patches": mesh_patches or [],
+                "bc_patches": bc_patches or [],
+            },
+        )
+    
+    async def emit_config_incomplete(
+        self,
+        missing_fields: list[dict[str, Any]],
+        suggestions: list[dict[str, Any]] | None = None,
+        can_lint: bool = True,
+        can_codegen: bool = False,
+    ) -> AgentEvent:
+        """Emit config incomplete event when required fields are missing."""
+        return await self.emit_warn(
+            EventTypes.CONFIG_INCOMPLETE,
+            f"Config incomplete: {len(missing_fields)} required fields missing",
+            {
+                "missing_fields": missing_fields,
+                "suggestions": suggestions or [],
+                "can_lint": can_lint,
+                "can_codegen": can_codegen,
+            },
+        )
+    
+    async def emit_config_normalized(
+        self,
+        original_format: str,
+        normalized_keys: list[str],
+        transformations: list[str] | None = None,
+    ) -> AgentEvent:
+        """Emit config normalized event showing what transformations were applied."""
+        return await self.emit_info(
+            EventTypes.CONFIG_NORMALIZED,
+            f"Config normalized from {original_format} format",
+            {
+                "original_format": original_format,
+                "normalized_keys": normalized_keys,
+                "transformations": transformations or [],
+            },
+        )
+    
     async def emit_lint_started(self) -> AgentEvent:
         """Emit lint started event."""
         return await self.emit_info(
@@ -163,18 +242,27 @@ class EventBus:
         regime: str | None = None,
         solver: str | None = None,
         reynolds: float | None = None,
+        missing_fields: list[dict[str, Any]] | None = None,
+        is_complete: bool = True,
+        detected_case_type: str | None = None,
     ) -> AgentEvent:
-        """Emit lint result event."""
+        """Emit lint result event with full validation details."""
+        missing_count = len(missing_fields) if missing_fields else 0
+        status = "complete" if is_complete else f"incomplete ({missing_count} missing)"
+        
         return await self.emit_info(
             EventTypes.LINT_RESULT,
-            f"Linting complete: {len(issues)} issues, {len(apply_changes)} recommendations",
+            f"Linting {status}: {len(issues)} issues, {len(apply_changes)} recommendations",
             {
                 "validated_config": validated_config,
                 "apply_changes": apply_changes,
                 "issues": issues,
+                "missing_fields": missing_fields or [],
+                "is_complete": is_complete,
                 "regime": regime,
                 "solver": solver,
                 "reynolds_number": reynolds,
+                "detected_case_type": detected_case_type,
             },
         )
     

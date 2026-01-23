@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # --- Enums ---
@@ -32,6 +32,7 @@ class RunStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     NOT_CLEAR = "not_clear"
+    CONFIG_INCOMPLETE = "config_incomplete"
 
 
 class FlowRegime(str, Enum):
@@ -41,12 +42,441 @@ class FlowRegime(str, Enum):
     TURBULENT = "turbulent"
 
 
+class TimeScheme(str, Enum):
+    """Time discretization scheme."""
+    STEADY = "steady"
+    TRANSIENT = "transient"
+
+
+class Compressibility(str, Enum):
+    """Compressibility type."""
+    INCOMPRESSIBLE = "incompressible"
+    COMPRESSIBLE = "compressible"
+
+
+class BoundaryType(str, Enum):
+    """Boundary condition type classification."""
+    INLET = "inlet"
+    OUTLET = "outlet"
+    WALL = "wall"
+    SYMMETRY = "symmetry"
+    PERIODIC = "periodic"
+    EMPTY = "empty"
+
+
 class SandboxState(str, Enum):
     """Sandbox run states."""
     QUEUED = "queued"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+# =============================================================================
+# SIMULATION CONFIG V1 - Canonical Schema
+# =============================================================================
+
+class CheckMeshInfoV1(BaseModel):
+    """Mesh quality information from checkMesh."""
+    cells: int = Field(..., gt=0, description="Total number of cells")
+    faces: int = Field(..., gt=0, description="Total number of faces")
+    points: int = Field(..., gt=0, description="Total number of points")
+    bounding_box: dict[str, list[float]] | None = Field(
+        default=None,
+        description="Bounding box as {min: [x,y,z], max: [x,y,z]}"
+    )
+    characteristic_length: float | None = Field(
+        default=None,
+        gt=0,
+        description="Characteristic length scale (m)"
+    )
+    max_aspect_ratio: float | None = Field(default=None, description="Max cell aspect ratio")
+    max_skewness: float | None = Field(default=None, description="Max cell skewness")
+    
+    class Config:
+        populate_by_name = True
+
+
+class MeshPatchV1(BaseModel):
+    """Mesh patch/boundary definition."""
+    name: str = Field(..., min_length=1, description="Patch name")
+    type: str = Field(..., description="OpenFOAM patch type (patch, wall, empty, etc.)")
+    n_faces: int = Field(default=0, ge=0, description="Number of faces in patch")
+    
+    class Config:
+        populate_by_name = True
+
+
+class MeshInfoV1(BaseModel):
+    """Complete mesh information."""
+    mesh_id: str = Field(..., min_length=1, description="Mesh identifier/reference")
+    file_name: str | None = Field(default=None, description="Original file name")
+    patches: list[MeshPatchV1] = Field(default_factory=list, description="Mesh patches/boundaries")
+    check_mesh: CheckMeshInfoV1 | None = Field(default=None, description="checkMesh output")
+    
+    class Config:
+        populate_by_name = True
+    
+    def get_patch_names(self) -> list[str]:
+        """Get list of patch names."""
+        return [p.name for p in self.patches]
+    
+    def has_patch(self, name: str) -> bool:
+        """Check if patch exists (case-insensitive)."""
+        return any(p.name.lower() == name.lower() for p in self.patches)
+
+
+class PhysicsV1(BaseModel):
+    """Physics settings for simulation."""
+    # flow_regime defaults to None - will be auto-detected from Reynolds number
+    flow_regime: FlowRegime | None = Field(default=None, description="Flow regime (auto-detected from Reynolds if not specified)")
+    time_scheme: TimeScheme = Field(default=TimeScheme.STEADY, description="Time scheme")
+    compressibility: Compressibility = Field(
+        default=Compressibility.INCOMPRESSIBLE,
+        description="Compressibility treatment"
+    )
+    heat_transfer: bool = Field(default=False, description="Enable heat transfer")
+    turbulence_model: str | None = Field(
+        default=None,
+        description="Turbulence model (kEpsilon, kOmegaSST, laminar, etc.)"
+    )
+    
+    class Config:
+        populate_by_name = True
+
+
+class SolverV1(BaseModel):
+    """Solver settings."""
+    type: str = Field(default="simpleFoam", description="OpenFOAM solver application")
+    max_iterations: int = Field(default=1000, gt=0, description="Maximum iterations")
+    convergence_criteria: float = Field(default=1e-6, gt=0, description="Convergence residual")
+    end_time: float | None = Field(default=None, gt=0, description="End time (transient)")
+    delta_t: float | None = Field(default=None, gt=0, description="Time step (transient)")
+    write_interval: int = Field(default=100, gt=0, description="Write interval")
+    
+    class Config:
+        populate_by_name = True
+
+
+class FluidV1(BaseModel):
+    """Fluid properties.
+    
+    Note: Validation of positive values is done in the linting phase,
+    not during model construction, to allow lint issues to be reported.
+    """
+    name: str = Field(default="air", description="Fluid name (air, water, custom)")
+    density: float = Field(default=1.225, description="Density (kg/m³)")
+    kinematic_viscosity: float = Field(
+        default=1.5e-5,
+        description="Kinematic viscosity (m²/s)"
+    )
+    dynamic_viscosity: float | None = Field(
+        default=None,
+        description="Dynamic viscosity (Pa·s)"
+    )
+    specific_heat: float | None = Field(default=None, description="Specific heat (J/kg·K)")
+    thermal_conductivity: float | None = Field(
+        default=None,
+        description="Thermal conductivity (W/m·K)"
+    )
+    prandtl_number: float | None = Field(default=None, description="Prandtl number")
+    
+    class Config:
+        populate_by_name = True
+
+
+class GeometryV1(BaseModel):
+    """Geometry description.
+    
+    Note: Validation of positive values is done in the linting phase,
+    not during model construction, to allow lint issues to be reported.
+    """
+    type: str | None = Field(default=None, description="Geometry type (pipe, airfoil, etc.)")
+    diameter: float | None = Field(default=None, description="Diameter (m)")
+    length: float | None = Field(default=None, description="Length (m)")
+    width: float | None = Field(default=None, description="Width (m)")
+    height: float | None = Field(default=None, description="Height (m)")
+    radius: float | None = Field(default=None, description="Radius (m)")
+    chord: float | None = Field(default=None, description="Chord length (m)")
+    
+    class Config:
+        populate_by_name = True
+    
+    def get_characteristic_length(self) -> float | None:
+        """Get characteristic length for Reynolds number calculation."""
+        if self.diameter:
+            return self.diameter
+        if self.radius:
+            return self.radius * 2
+        if self.chord:
+            return self.chord
+        if self.length:
+            return self.length
+        return None
+
+
+class VelocityBCV1(BaseModel):
+    """Velocity boundary condition."""
+    type: str = Field(default="fixedValue", description="BC type")
+    value: list[float] | float | None = Field(
+        default=None,
+        description="Velocity value [Ux, Uy, Uz] or magnitude"
+    )
+    magnitude: float | None = Field(default=None, description="Velocity magnitude (m/s)")
+    direction: list[float] | None = Field(default=None, description="Flow direction [x, y, z]")
+    
+    class Config:
+        populate_by_name = True
+    
+    def get_velocity_vector(self) -> list[float] | None:
+        """Get velocity as [Ux, Uy, Uz] vector."""
+        if isinstance(self.value, list) and len(self.value) == 3:
+            return self.value
+        if self.magnitude is not None and self.direction:
+            # Normalize direction and scale by magnitude
+            import math
+            d = self.direction
+            norm = math.sqrt(sum(x**2 for x in d))
+            if norm > 0:
+                return [self.magnitude * x / norm for x in d]
+        if isinstance(self.value, (int, float)):
+            # Assume x-direction
+            return [float(self.value), 0.0, 0.0]
+        return None
+    
+    def get_magnitude(self) -> float | None:
+        """Get velocity magnitude."""
+        if self.magnitude is not None:
+            return self.magnitude
+        if isinstance(self.value, (int, float)):
+            return abs(float(self.value))
+        if isinstance(self.value, list):
+            import math
+            return math.sqrt(sum(x**2 for x in self.value))
+        return None
+
+
+class PressureBCV1(BaseModel):
+    """Pressure boundary condition."""
+    type: str = Field(default="fixedValue", description="BC type")
+    value: float | None = Field(default=None, description="Pressure value (Pa)")
+    
+    class Config:
+        populate_by_name = True
+
+
+class TemperatureBCV1(BaseModel):
+    """Temperature boundary condition."""
+    type: str = Field(default="fixedValue", description="BC type")
+    value: float | None = Field(default=None, description="Temperature value (K)")
+    
+    class Config:
+        populate_by_name = True
+
+
+class TurbulenceBCV1(BaseModel):
+    """Turbulence boundary condition."""
+    k: dict[str, Any] | None = Field(default=None, description="Turbulent kinetic energy BC")
+    epsilon: dict[str, Any] | None = Field(default=None, description="Turbulent dissipation BC")
+    omega: dict[str, Any] | None = Field(default=None, description="Specific dissipation BC")
+    nut: dict[str, Any] | None = Field(default=None, description="Turbulent viscosity BC")
+    
+    class Config:
+        populate_by_name = True
+
+
+class BoundaryConditionV1(BaseModel):
+    """Complete boundary condition for a single patch."""
+    patch_type: BoundaryType | str = Field(
+        default=BoundaryType.WALL,
+        description="Boundary type classification"
+    )
+    velocity: VelocityBCV1 | None = Field(default=None, description="Velocity BC")
+    pressure: PressureBCV1 | None = Field(default=None, description="Pressure BC")
+    temperature: TemperatureBCV1 | None = Field(default=None, description="Temperature BC")
+    turbulence: TurbulenceBCV1 | None = Field(default=None, description="Turbulence BCs")
+    
+    class Config:
+        populate_by_name = True
+    
+    def is_inlet(self) -> bool:
+        """Check if this is an inlet-type BC."""
+        if isinstance(self.patch_type, BoundaryType):
+            return self.patch_type == BoundaryType.INLET
+        return str(self.patch_type).lower() == "inlet"
+    
+    def is_outlet(self) -> bool:
+        """Check if this is an outlet-type BC."""
+        if isinstance(self.patch_type, BoundaryType):
+            return self.patch_type == BoundaryType.OUTLET
+        return str(self.patch_type).lower() == "outlet"
+    
+    def is_wall(self) -> bool:
+        """Check if this is a wall-type BC."""
+        if isinstance(self.patch_type, BoundaryType):
+            return self.patch_type == BoundaryType.WALL
+        return str(self.patch_type).lower() == "wall"
+
+
+class KPITargetV1(BaseModel):
+    """A KPI target value."""
+    name: str = Field(..., description="KPI name")
+    value: float = Field(..., description="Target value")
+    unit: str = Field(default="", description="Unit of measurement")
+    tolerance: float | None = Field(default=None, description="Acceptable tolerance")
+    
+    class Config:
+        populate_by_name = True
+
+
+class SimulationConfigV1(BaseModel):
+    """
+    Canonical V1 schema for simulation configuration.
+    
+    This is the normalized form used internally. The normalizer converts
+    various input formats (legacy, camelCase, etc.) to this schema.
+    """
+    # Core components (all optional for backward compat, validated at runtime)
+    mesh: MeshInfoV1 | None = Field(default=None, description="Mesh information")
+    physics: PhysicsV1 = Field(default_factory=PhysicsV1, description="Physics settings")
+    solver: SolverV1 = Field(default_factory=SolverV1, description="Solver settings")
+    fluid: FluidV1 = Field(default_factory=FluidV1, description="Fluid properties")
+    geometry: GeometryV1 | None = Field(default=None, description="Geometry description")
+    
+    # Boundary conditions keyed by patch name
+    boundary_conditions: dict[str, BoundaryConditionV1] = Field(
+        default_factory=dict,
+        description="Boundary conditions per patch"
+    )
+    
+    # Optional KPI targets
+    kpi_targets: list[KPITargetV1] = Field(
+        default_factory=list,
+        description="KPI targets to achieve"
+    )
+    
+    # Legacy/passthrough fields for backward compatibility
+    case_type: str | None = Field(default=None, description="Detected case type")
+    inlet: dict[str, Any] | None = Field(default=None, description="Legacy inlet config")
+    outlet: dict[str, Any] | None = Field(default=None, description="Legacy outlet config")
+    
+    class Config:
+        populate_by_name = True
+        extra = "allow"  # Allow extra fields for forward compatibility
+    
+    def get_inlet_velocity_magnitude(self) -> float | None:
+        """Get inlet velocity magnitude from boundary conditions or legacy inlet."""
+        # Check boundary conditions first
+        for name, bc in self.boundary_conditions.items():
+            if bc.is_inlet() and bc.velocity:
+                mag = bc.velocity.get_magnitude()
+                if mag is not None:
+                    return mag
+        
+        # Fall back to legacy inlet
+        if self.inlet:
+            vel = self.inlet.get("velocity")
+            if isinstance(vel, (int, float)):
+                return abs(float(vel))
+            if isinstance(vel, list):
+                import math
+                return math.sqrt(sum(x**2 for x in vel))
+        
+        return None
+    
+    def get_characteristic_length(self) -> float | None:
+        """Get characteristic length for Reynolds number."""
+        # Try geometry first
+        if self.geometry:
+            length = self.geometry.get_characteristic_length()
+            if length:
+                return length
+        
+        # Try mesh bounding box
+        if self.mesh and self.mesh.check_mesh:
+            if self.mesh.check_mesh.characteristic_length:
+                return self.mesh.check_mesh.characteristic_length
+            if self.mesh.check_mesh.bounding_box:
+                bb = self.mesh.check_mesh.bounding_box
+                if "min" in bb and "max" in bb:
+                    # Use max dimension
+                    dims = [bb["max"][i] - bb["min"][i] for i in range(3)]
+                    return max(dims)
+        
+        return None
+    
+    def get_kinematic_viscosity(self) -> float:
+        """Get kinematic viscosity."""
+        return self.fluid.kinematic_viscosity
+    
+    def has_required_boundary_conditions(self) -> tuple[bool, list[str]]:
+        """
+        Check if required boundary conditions are present.
+        
+        Returns:
+            Tuple of (is_complete, list of missing fields)
+        """
+        missing = []
+        
+        # Must have at least one inlet and one outlet for flow problems
+        has_inlet = any(bc.is_inlet() for bc in self.boundary_conditions.values())
+        has_outlet = any(bc.is_outlet() for bc in self.boundary_conditions.values())
+        has_wall = any(bc.is_wall() for bc in self.boundary_conditions.values())
+        
+        if not has_inlet:
+            missing.append("boundary_conditions.inlet")
+        if not has_outlet:
+            missing.append("boundary_conditions.outlet")
+        
+        # Check inlet has velocity defined
+        if has_inlet:
+            for name, bc in self.boundary_conditions.items():
+                if bc.is_inlet():
+                    if not bc.velocity or bc.velocity.get_magnitude() is None:
+                        missing.append(f"boundary_conditions.{name}.velocity")
+        
+        # Check mesh is defined
+        if not self.mesh or not self.mesh.mesh_id:
+            missing.append("mesh.mesh_id")
+        
+        return len(missing) == 0, missing
+    
+    def get_patches_without_bc(self) -> list[str]:
+        """Get list of mesh patches that don't have boundary conditions."""
+        if not self.mesh:
+            return []
+        
+        mesh_patches = set(p.name for p in self.mesh.patches)
+        bc_patches = set(self.boundary_conditions.keys())
+        
+        return list(mesh_patches - bc_patches)
+
+
+class MissingFieldInfo(BaseModel):
+    """Information about a missing required field."""
+    field: str = Field(..., description="Field path (e.g., 'boundary_conditions.inlet')")
+    description: str = Field(..., description="What this field should contain")
+    required_for: str = Field(
+        default="codegen",
+        description="Which operation requires this field"
+    )
+    suggested_value: Any = Field(default=None, description="Suggested default value")
+
+
+class ConfigValidationResult(BaseModel):
+    """Result of configuration validation."""
+    is_valid: bool = Field(..., description="Whether config is valid for the operation")
+    is_complete: bool = Field(..., description="Whether all required fields are present")
+    normalized_config: SimulationConfigV1 | None = Field(
+        default=None,
+        description="Normalized configuration"
+    )
+    missing_fields: list[MissingFieldInfo] = Field(
+        default_factory=list,
+        description="List of missing required fields"
+    )
+    warnings: list[str] = Field(default_factory=list, description="Non-fatal warnings")
+    errors: list[str] = Field(default_factory=list, description="Fatal errors")
 
 
 # --- Client -> Server ---
@@ -123,6 +553,11 @@ class EventTypes:
     RUN_FAILED = "run_failed"
     SIMULATION_NOT_CLEAR = "simulation_not_clear"
     
+    # Config validation (NEW)
+    CONFIG_RECEIVED = "config_received"
+    CONFIG_INCOMPLETE = "config_incomplete"
+    CONFIG_NORMALIZED = "config_normalized"
+    
     # Linting
     LINT_STARTED = "lint_started"
     LINT_RESULT = "lint_result"
@@ -175,12 +610,24 @@ class LintIssue(BaseModel):
 class LintResult(BaseModel):
     """Result of CFD linting."""
     validated_config: dict[str, Any]
+    normalized_config: SimulationConfigV1 | None = Field(
+        default=None,
+        description="Fully normalized V1 config"
+    )
     apply_changes: list[ApplyChange] = Field(default_factory=list)
     issues: list[LintIssue] = Field(default_factory=list)
+    missing_fields: list[MissingFieldInfo] = Field(
+        default_factory=list,
+        description="Required fields that are missing"
+    )
     detected_case_type: str | None = None
     detected_regime: FlowRegime | None = None
     selected_solver: str | None = None
     reynolds_number: float | None = None
+    is_complete: bool = Field(
+        default=False,
+        description="Whether config is complete for codegen"
+    )
 
 
 # --- Planning Models ---

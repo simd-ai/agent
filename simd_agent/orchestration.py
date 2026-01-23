@@ -2,6 +2,7 @@
 """Main orchestration logic for CFD workflows."""
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from simd_agent.error_summarizer import ErrorSummarizer
 from simd_agent.event_bus import EventBus
 from simd_agent.linting import CFDLinter
 from simd_agent.models import (
+    BoundaryType,
     FinalResult,
     LintResult,
     Operation,
@@ -23,7 +25,7 @@ from simd_agent.packaging import (
     package_from_llm_output,
     merge_files,
 )
-from simd_agent.planning import Planner, SharedContext
+from simd_agent.planning import Planner
 from simd_agent.sandbox_client import SandboxClient, SandboxError
 from simd_agent.settings import get_settings
 from simd_agent.store import EventStore
@@ -139,8 +141,25 @@ class Orchestrator:
         Returns:
             FinalResult with operation outcome
         """
-        await self._init_code_generator()
+        logger.info("=" * 50)
+        logger.info("[ORCHESTRATOR] Starting run...")
+        logger.info(f"[ORCHESTRATOR]   Run ID: {self.run_id}")
+        logger.info(f"[ORCHESTRATOR]   Operation: {self.request.op.value}")
+        logger.info(f"[ORCHESTRATOR]   Provider: {self.request.provider}")
+        logger.info(f"[ORCHESTRATOR]   Prompt Pack: {self.request.prompt_pack}")
+        logger.info(f"[ORCHESTRATOR]   User requirements: {self.request.user_requirements}")
+        logger.info(f"[ORCHESTRATOR]   Simulation config:")
+        import json
+        for key, value in self.request.simulation_config.items():
+            logger.info(f"[ORCHESTRATOR]     {key}: {json.dumps(value) if isinstance(value, (dict, list)) else value}")
+        logger.info(f"[ORCHESTRATOR]   Constraints: max_retries={self.request.constraints.max_retries}, timeout={self.request.constraints.timeout_seconds}s")
+        logger.info("=" * 50)
         
+        logger.info("[ORCHESTRATOR] Initializing code generator...")
+        await self._init_code_generator()
+        logger.info("[ORCHESTRATOR] Code generator initialized: %s", type(self._code_generator).__name__)
+        
+        logger.info("[ORCHESTRATOR] Emitting RUN_STARTED event...")
         await self.event_bus.emit_run_started(
             self.request.op.value,
             self.request.provider,
@@ -148,13 +167,15 @@ class Orchestrator:
         
         try:
             if self.request.op == Operation.CFD_LINT:
+                logger.info("[ORCHESTRATOR] Running CFD_LINT operation...")
                 return await self._run_lint()
             elif self.request.op == Operation.CFD_CODEGEN_RUN:
+                logger.info("[ORCHESTRATOR] Running CFD_CODEGEN_RUN operation...")
                 return await self._run_codegen_and_sandbox()
             else:
                 raise OrchestrationError(f"Unknown operation: {self.request.op}")
         except Exception as e:
-            logger.exception(f"Orchestration failed: {e}")
+            logger.exception(f"[ORCHESTRATOR] Orchestration failed: {e}")
             await self.event_bus.emit_run_failed(str(e))
             return FinalResult(
                 status=RunStatus.FAILED,
@@ -168,13 +189,51 @@ class Orchestrator:
     
     async def _run_lint(self) -> FinalResult:
         """Run the CFD linting operation."""
+        logger.info("[LINT] Starting CFD linting...")
+        logger.info(f"[LINT] Input config keys: {list(self.request.simulation_config.keys())}")
+        
         await self.event_bus.emit_lint_started()
         
+        logger.info("[LINT] Calling linter.lint()...")
         lint_result = await self.linter.lint(
             self.request.simulation_config,
             self.request.user_requirements,
         )
         
+        logger.info("[LINT] Linting complete:")
+        logger.info(f"[LINT]   - Issues: {len(lint_result.issues)}")
+        logger.info(f"[LINT]   - Apply changes: {len(lint_result.apply_changes)}")
+        logger.info(f"[LINT]   - Detected regime: {lint_result.detected_regime}")
+        logger.info(f"[LINT]   - Selected solver: {lint_result.selected_solver}")
+        logger.info(f"[LINT]   - Reynolds number: {lint_result.reynolds_number}")
+        logger.info(f"[LINT]   - Validated config keys: {list(lint_result.validated_config.keys())}")
+        
+        # Log full issues
+        if lint_result.issues:
+            logger.info("[LINT] === ISSUES ===")
+            for i, issue in enumerate(lint_result.issues, 1):
+                logger.info(f"[LINT]   Issue #{i}:")
+                logger.info(f"[LINT]     - Code: {issue.code}")
+                logger.info(f"[LINT]     - Severity: {issue.severity}")
+                logger.info(f"[LINT]     - Path: {issue.path}")
+                logger.info(f"[LINT]     - Message: {issue.message}")
+        
+        # Log full apply_changes (recommendations)
+        if lint_result.apply_changes:
+            logger.info("[LINT] === RECOMMENDATIONS ===")
+            for i, change in enumerate(lint_result.apply_changes, 1):
+                logger.info(f"[LINT]   Recommendation #{i}:")
+                logger.info(f"[LINT]     - Path: {change.path}")
+                logger.info(f"[LINT]     - Value: {change.value}")
+                logger.info(f"[LINT]     - Severity: {change.severity}")
+                logger.info(f"[LINT]     - Reason: {change.reason}")
+        
+        # Log validated config
+        logger.info("[LINT] === VALIDATED CONFIG ===")
+        for key, value in lint_result.validated_config.items():
+            logger.info(f"[LINT]   {key}: {json.dumps(value) if isinstance(value, (dict, list)) else value}")
+        
+        logger.info("[LINT] Emitting LINT_RESULT event...")
         await self.event_bus.emit_lint_result(
             validated_config=lint_result.validated_config,
             apply_changes=[c.model_dump() for c in lint_result.apply_changes],
@@ -184,6 +243,7 @@ class Orchestrator:
             reynolds=lint_result.reynolds_number,
         )
         
+        logger.info("[LINT] Finalizing run in database...")
         await self.store.finalize_run(
             run_id=self.run_id,
             status=RunStatus.SUCCEEDED,
@@ -191,12 +251,14 @@ class Orchestrator:
             result={"lint_result": lint_result.model_dump()},
         )
         
+        logger.info("[LINT] Emitting FINAL event...")
         await self.event_bus.emit_final(
             status="succeeded",
             validated_config=lint_result.validated_config,
             summary=f"Linting complete: {len(lint_result.issues)} issues, {len(lint_result.apply_changes)} recommendations",
         )
         
+        logger.info("[LINT] CFD linting operation completed successfully")
         return FinalResult(
             status=RunStatus.SUCCEEDED,
             validated_config=lint_result.validated_config,
@@ -222,11 +284,12 @@ class Orchestrator:
                 summary="Simulation type unclear",
             )
         
-        # Step 2: Run CFD linting
+        # Step 2: Run CFD linting with operation context
         await self.event_bus.emit_lint_started()
         self._lint_result = await self.linter.lint(
             self.request.simulation_config,
             self.request.user_requirements,
+            operation="CFD_CODEGEN_RUN",  # Stricter validation
         )
         
         await self.event_bus.emit_lint_result(
@@ -236,7 +299,58 @@ class Orchestrator:
             regime=self._lint_result.detected_regime.value if self._lint_result.detected_regime else None,
             solver=self._lint_result.selected_solver,
             reynolds=self._lint_result.reynolds_number,
+            missing_fields=[m.model_dump() for m in self._lint_result.missing_fields],
+            is_complete=self._lint_result.is_complete,
+            detected_case_type=self._lint_result.detected_case_type,
         )
+        
+        # Step 2.5: ENFORCE COMPLETENESS - Stop if config is incomplete
+        if not self._lint_result.is_complete:
+            logger.warning(f"[CODEGEN] Config incomplete: {len(self._lint_result.missing_fields)} missing fields")
+            for mf in self._lint_result.missing_fields:
+                logger.warning(f"[CODEGEN]   - {mf.field}: {mf.description}")
+            
+            # Emit config_incomplete event
+            await self.event_bus.emit_config_incomplete(
+                missing_fields=[m.model_dump() for m in self._lint_result.missing_fields],
+                suggestions=[
+                    {"field": m.field, "value": m.suggested_value}
+                    for m in self._lint_result.missing_fields if m.suggested_value
+                ],
+                can_lint=True,
+                can_codegen=False,
+            )
+            
+            # Finalize with CONFIG_INCOMPLETE status
+            await self.store.finalize_run(
+                run_id=self.run_id,
+                status=RunStatus.CONFIG_INCOMPLETE,
+                validated_config=self._lint_result.validated_config,
+                result={
+                    "missing_fields": [m.model_dump() for m in self._lint_result.missing_fields],
+                    "lint_result": self._lint_result.model_dump(),
+                },
+            )
+            
+            missing_summary = ", ".join(m.field for m in self._lint_result.missing_fields[:3])
+            if len(self._lint_result.missing_fields) > 3:
+                missing_summary += f" (+{len(self._lint_result.missing_fields) - 3} more)"
+            
+            await self.event_bus.emit_final(
+                status="config_incomplete",
+                validated_config=self._lint_result.validated_config,
+                summary=f"Config incomplete: missing {missing_summary}",
+                error=f"Cannot run codegen: {len(self._lint_result.missing_fields)} required fields missing",
+            )
+            
+            return FinalResult(
+                status=RunStatus.CONFIG_INCOMPLETE,
+                validated_config=self._lint_result.validated_config,
+                summary=f"Config incomplete: {len(self._lint_result.missing_fields)} fields missing",
+                error=f"Missing: {missing_summary}",
+            )
+        
+        logger.info("[CODEGEN] Config is complete, proceeding with code generation")
         
         # Step 3: Planning phase
         planning_result = await self.planner.plan(
@@ -470,12 +584,11 @@ class Orchestrator:
             return self._mock_generate_code(planning_result)
     
     def _build_requirements(self, planning_result: Any) -> str:
-        """Build enhanced requirements string with planning context."""
+        """Build enhanced requirements string with planning context and explicit BCs."""
         parts = [self.request.user_requirements]
         
         # Add validated config context
         if self._lint_result and self._lint_result.validated_config:
-            import json
             parts.append(f"\n\nValidated configuration:\n```json\n{json.dumps(self._lint_result.validated_config, indent=2)}\n```")
         
         # Add planning decisions
@@ -487,6 +600,47 @@ class Orchestrator:
             parts.append(f"Mesh strategy: {planning_result.mesh_strategy}")
         if planning_result.case_type:
             parts.append(f"Case type: {planning_result.case_type}")
+        
+        # Add explicit boundary conditions section for codegen
+        if self._lint_result and self._lint_result.normalized_config:
+            bcs = self._lint_result.normalized_config.boundary_conditions
+            if bcs:
+                parts.append("\n\n## Boundary Conditions (MUST USE THESE):\n")
+                for patch_name, bc in bcs.items():
+                    patch_type = bc.patch_type.value if isinstance(bc.patch_type, BoundaryType) else str(bc.patch_type)
+                    parts.append(f"\n### Patch: {patch_name} (type: {patch_type})")
+                    
+                    if bc.velocity:
+                        vel_vec = bc.velocity.get_velocity_vector()
+                        if vel_vec:
+                            parts.append(f"\n- Velocity (U): type={bc.velocity.type}, value=({vel_vec[0]} {vel_vec[1]} {vel_vec[2]})")
+                        elif bc.velocity.get_magnitude():
+                            parts.append(f"\n- Velocity (U): type={bc.velocity.type}, magnitude={bc.velocity.get_magnitude()} m/s")
+                    
+                    if bc.pressure:
+                        parts.append(f"\n- Pressure (p): type={bc.pressure.type}, value={bc.pressure.value}")
+                    
+                    if bc.temperature:
+                        parts.append(f"\n- Temperature (T): type={bc.temperature.type}, value={bc.temperature.value} K")
+                    
+                    # Wall default
+                    if bc.is_wall() and not bc.velocity:
+                        parts.append(f"\n- Velocity (U): type=noSlip")
+                    
+                    # Outlet default
+                    if bc.is_outlet() and not bc.pressure:
+                        parts.append(f"\n- Pressure (p): type=fixedValue, value=0")
+                
+                # Add fluid properties
+                fluid = self._lint_result.normalized_config.fluid
+                parts.append(f"\n\n## Fluid Properties:")
+                parts.append(f"\n- Fluid: {fluid.name}")
+                parts.append(f"\n- Density (rho): {fluid.density} kg/m³")
+                parts.append(f"\n- Kinematic viscosity (nu): {fluid.kinematic_viscosity} m²/s")
+                
+                # Add Reynolds number if calculated
+                if self._lint_result.reynolds_number:
+                    parts.append(f"\n- Reynolds number: {self._lint_result.reynolds_number:.0f}")
         
         return "".join(parts)
     

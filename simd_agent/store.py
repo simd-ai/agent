@@ -39,6 +39,7 @@ class EventStore:
         user_requirements: str,
         simulation_config: dict[str, Any],
         run_id: UUID | None = None,
+        raw_config: dict[str, Any] | None = None,
     ) -> UUID:
         """Create a new run record.
         
@@ -47,19 +48,26 @@ class EventStore:
             provider: LLM provider name
             prompt_pack: Prompt pack name
             user_requirements: User's requirements text
-            simulation_config: Initial simulation configuration
+            simulation_config: Initial simulation configuration (may be normalized)
             run_id: Optional pre-generated run ID
+            raw_config: Optional raw config as received from frontend (before normalization)
             
         Returns:
             The run ID
         """
         run_id = run_id or uuid4()
         
+        # Store raw_config in result field temporarily if provided
+        # This preserves the original payload for debugging
+        result_data = None
+        if raw_config:
+            result_data = {"raw_config": raw_config}
+        
         async with get_session() as session:
             await session.execute(
                 text("""
-                    INSERT INTO runs (id, op, provider, prompt_pack, user_requirements, simulation_config, status)
-                    VALUES (:id, :op, :provider, :prompt_pack, :user_requirements, :simulation_config, :status)
+                    INSERT INTO runs (id, op, provider, prompt_pack, user_requirements, simulation_config, status, result)
+                    VALUES (:id, :op, :provider, :prompt_pack, :user_requirements, :simulation_config, :status, :result)
                 """),
                 {
                     "id": run_id,
@@ -69,6 +77,7 @@ class EventStore:
                     "user_requirements": user_requirements,
                     "simulation_config": json.dumps(simulation_config),
                     "status": RunStatus.PENDING.value,
+                    "result": json.dumps(result_data) if result_data else None,
                 },
             )
         
@@ -142,6 +151,7 @@ class EventStore:
         validated_config: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
         attempts: int = 0,
+        normalized_config: dict[str, Any] | None = None,
     ) -> None:
         """Finalize a run with final status and results.
         
@@ -151,7 +161,13 @@ class EventStore:
             validated_config: Validated configuration (optional)
             result: Final result data (optional)
             attempts: Total number of attempts
+            normalized_config: Normalized SimulationConfigV1 as dict (optional)
         """
+        # Merge normalized_config into result if provided
+        final_result = result or {}
+        if normalized_config:
+            final_result["normalized_config"] = normalized_config
+        
         async with get_session() as session:
             await session.execute(
                 text("""
@@ -166,7 +182,7 @@ class EventStore:
                     "id": run_id,
                     "status": status.value,
                     "validated_config": json.dumps(validated_config) if validated_config else None,
-                    "result": json.dumps(result) if result else None,
+                    "result": json.dumps(final_result) if final_result else None,
                     "attempts": attempts,
                 },
             )

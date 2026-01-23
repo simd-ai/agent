@@ -78,29 +78,99 @@ ws://localhost:8000/ws/run
 
 ### Client → Server: StartRequest
 
+#### Minimal Example (CFD_LINT)
+
 ```json
 {
   "op": "CFD_LINT",
   "provider": "gemini3",
-  "prompt_pack": "simd",
-  "user_requirements": "Simulate water flow through a pipe with diameter 0.1m and inlet velocity 1 m/s",
+  "user_requirements": "Simulate water flow through a pipe",
   "simulation_config": {
+    "mesh": "mesh-abc123"
+  }
+}
+```
+
+#### Full V1 Example (CFD_CODEGEN_RUN)
+
+```json
+{
+  "op": "CFD_CODEGEN_RUN",
+  "provider": "gemini3",
+  "prompt_pack": "simd",
+  "user_requirements": "Simulate turbulent water flow through a 10cm diameter pipe at 5 m/s inlet velocity. Calculate pressure drop.",
+  "simulation_config": {
+    "mesh": {
+      "mesh_id": "mesh-abc123",
+      "file_name": "pipe.stl",
+      "patches": [
+        { "name": "inlet", "type": "patch", "n_faces": 100 },
+        { "name": "outlet", "type": "patch", "n_faces": 100 },
+        { "name": "wall", "type": "wall", "n_faces": 5000 }
+      ],
+      "check_mesh": {
+        "cells": 50000,
+        "faces": 150000,
+        "points": 52000,
+        "bounding_box": { "min": [0, 0, 0], "max": [1, 0.1, 0.1] },
+        "characteristic_length": 0.1
+      }
+    },
+    "physics": {
+      "flow_regime": "turbulent",
+      "time_scheme": "steady",
+      "compressibility": "incompressible",
+      "heat_transfer": false,
+      "turbulence_model": "kEpsilon"
+    },
+    "solver": {
+      "type": "simpleFoam",
+      "max_iterations": 2000,
+      "convergence_criteria": 1e-6,
+      "write_interval": 100
+    },
+    "fluid": {
+      "name": "water",
+      "density": 1000,
+      "kinematic_viscosity": 1e-6
+    },
     "geometry": {
       "type": "pipe",
       "diameter": 0.1,
       "length": 1.0
     },
-    "inlet": {
-      "velocity": 1.0
+    "boundary_conditions": {
+      "inlet": {
+        "patch_type": "inlet",
+        "velocity": {
+          "type": "fixedValue",
+          "value": [5, 0, 0]
+        },
+        "pressure": {
+          "type": "zeroGradient"
+        }
+      },
+      "outlet": {
+        "patch_type": "outlet",
+        "velocity": {
+          "type": "zeroGradient"
+        },
+        "pressure": {
+          "type": "fixedValue",
+          "value": 0
+        }
+      },
+      "wall": {
+        "patch_type": "wall"
+      }
     },
-    "fluid": {
-      "viscosity": 1e-6,
-      "density": 1000.0
-    }
+    "kpi_targets": [
+      { "name": "pressure_drop", "value": 100, "unit": "Pa" }
+    ]
   },
   "constraints": {
     "max_retries": 3,
-    "timeout_seconds": 300
+    "timeout_seconds": 600
   },
   "metadata": {
     "user_id": "user-123",
@@ -108,6 +178,13 @@ ws://localhost:8000/ws/run
   }
 }
 ```
+
+**Required fields for `CFD_CODEGEN_RUN`:**
+- `mesh.mesh_id` - Mesh identifier
+- `boundary_conditions.inlet` with `velocity` specified
+- `boundary_conditions.outlet`
+
+If these are missing, the backend will emit `config_incomplete` event and stop.
 
 ### Operations
 
@@ -145,6 +222,14 @@ ws://localhost:8000/ws/run
 | `run_succeeded` | Run completed successfully |
 | `run_failed` | Run failed after retries |
 | `simulation_not_clear` | Couldn't determine simulation type |
+
+### Config Validation Events (NEW)
+
+| Type | Description |
+|------|-------------|
+| `config_received` | Config parsed, shows what keys were found |
+| `config_normalized` | Config converted to canonical V1 format |
+| `config_incomplete` | Required fields missing, codegen blocked |
 
 ### Linting Events
 

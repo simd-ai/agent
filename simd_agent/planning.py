@@ -8,9 +8,11 @@ from typing import Any
 
 from simd_agent.event_bus import EventBus
 from simd_agent.models import (
+    BoundaryType,
     FlowRegime,
     LintResult,
     PlanningResult,
+    SimulationConfigV1,
     SubAgentResult,
     WorkItem,
 )
@@ -259,22 +261,63 @@ class SubAgent:
         }
     
     async def _handle_define_boundaries(self) -> dict[str, Any]:
-        """Define boundary conditions."""
+        """Define boundary conditions using actual BC data from config."""
         ctx = await self.shared_context.snapshot()
         case_type = ctx.get("case_type")
         inlet = ctx.get("inlet", {})
         
+        # Get boundary conditions from normalized config
+        boundary_conditions = ctx.get("boundary_conditions", {})
+        
         await self.event_bus.emit_subagent_update(
             self.work_item.id,
             self.work_item.task,
-            "Configuring boundary conditions",
+            f"Configuring {len(boundary_conditions)} boundary conditions",
         )
         
-        # Standard boundary setup
+        # If we have explicit BCs, use them
+        if boundary_conditions:
+            boundaries = {}
+            for patch_name, bc_data in boundary_conditions.items():
+                bc_type = bc_data.get("type", "wall")
+                
+                if bc_type == "inlet" and "velocity" in bc_data:
+                    vel_data = bc_data["velocity"]
+                    boundaries[patch_name] = {
+                        "type": vel_data.get("type", "fixedValue"),
+                        "velocity": vel_data.get("value", [0, 0, 0]),
+                    }
+                elif bc_type == "outlet":
+                    pres_data = bc_data.get("pressure", {})
+                    boundaries[patch_name] = {
+                        "type": pres_data.get("type", "zeroGradient"),
+                        "pressure": pres_data.get("value", 0),
+                    }
+                elif bc_type == "wall":
+                    boundaries[patch_name] = {
+                        "type": "noSlip",
+                    }
+                elif bc_type == "symmetry":
+                    boundaries[patch_name] = {
+                        "type": "symmetry",
+                    }
+                elif bc_type == "empty":
+                    boundaries[patch_name] = {
+                        "type": "empty",
+                    }
+                else:
+                    # Default to wall
+                    boundaries[patch_name] = {
+                        "type": "noSlip",
+                    }
+            
+            return {"boundaries": boundaries, "boundary_conditions": boundary_conditions}
+        
+        # Fallback: Standard boundary setup
         boundaries = {
             "inlet": {
                 "type": "fixedValue",
-                "velocity": inlet.get("velocity", [0, 0, 0]),
+                "velocity": inlet.get("velocity") or inlet.get("magnitude") or [0, 0, 0],
             },
             "outlet": {
                 "type": "zeroGradient",
@@ -362,17 +405,75 @@ class Planner:
         """
         await self.event_bus.emit_planning_started()
         
-        # Initialize shared context with linting results
+        # Extract boundary conditions from normalized config if available
+        boundary_conditions = {}
+        inlet_data = {}
+        normalized_config: SimulationConfigV1 | None = lint_result.normalized_config
+        
+        if normalized_config:
+            # Convert boundary conditions to codegen-friendly format
+            for patch_name, bc in normalized_config.boundary_conditions.items():
+                patch_type = bc.patch_type.value if isinstance(bc.patch_type, BoundaryType) else str(bc.patch_type)
+                bc_data: dict[str, Any] = {"type": patch_type}
+                
+                if bc.velocity:
+                    vel_vec = bc.velocity.get_velocity_vector()
+                    bc_data["velocity"] = {
+                        "type": bc.velocity.type,
+                        "value": vel_vec or bc.velocity.value,
+                        "magnitude": bc.velocity.get_magnitude(),
+                    }
+                    # Track inlet for shared context
+                    if bc.is_inlet():
+                        inlet_data = {
+                            "velocity": vel_vec or bc.velocity.value,
+                            "magnitude": bc.velocity.get_magnitude(),
+                        }
+                
+                if bc.pressure:
+                    bc_data["pressure"] = {
+                        "type": bc.pressure.type,
+                        "value": bc.pressure.value,
+                    }
+                
+                if bc.temperature:
+                    bc_data["temperature"] = {
+                        "type": bc.temperature.type,
+                        "value": bc.temperature.value,
+                    }
+                
+                boundary_conditions[patch_name] = bc_data
+        else:
+            # Fallback to legacy format
+            inlet_data = config.get("inlet", {})
+            boundary_conditions = config.get("boundary_conditions", {})
+        
+        # Determine thermal and transient flags
+        is_thermal = (
+            "temperature" in user_requirements.lower() or 
+            "heat" in user_requirements.lower() or
+            (normalized_config and normalized_config.physics.heat_transfer)
+        )
+        is_transient = (
+            "transient" in user_requirements.lower() or 
+            "unsteady" in user_requirements.lower() or
+            (normalized_config and str(normalized_config.physics.time_scheme.value) == "transient")
+        )
+        
+        # Initialize shared context with linting results and BCs
         shared_context = SharedContext({
             "case_type": lint_result.detected_case_type,
             "regime": lint_result.detected_regime,
             "reynolds_number": lint_result.reynolds_number,
             "validated_config": lint_result.validated_config,
+            "normalized_config": normalized_config.model_dump() if normalized_config else None,
             "user_requirements": user_requirements,
             "geometry": config.get("geometry", {}),
-            "inlet": config.get("inlet", {}),
-            "is_thermal": "temperature" in user_requirements.lower() or "heat" in user_requirements.lower(),
-            "is_transient": "transient" in user_requirements.lower() or "unsteady" in user_requirements.lower(),
+            "inlet": inlet_data,
+            "boundary_conditions": boundary_conditions,  # Full BC data for codegen
+            "is_thermal": is_thermal,
+            "is_transient": is_transient,
+            "fluid": normalized_config.fluid.model_dump() if normalized_config else {},
         })
         
         # Determine which work items to run

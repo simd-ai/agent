@@ -391,7 +391,14 @@ class TestErrorHandling:
             op=Operation.CFD_CODEGEN_RUN,
             provider="mock",
             user_requirements="Pipe flow",
-            simulation_config={"geometry": {"type": "pipe", "diameter": 0.1}},
+            simulation_config={
+                "mesh": {"mesh_id": "error-test"},
+                "geometry": {"type": "pipe", "diameter": 0.1},
+                "boundary_conditions": {
+                    "inlet": {"patch_type": "inlet", "velocity": {"value": [1, 0, 0]}},
+                    "outlet": {"patch_type": "outlet"},
+                },
+            },
         )
         
         store = MagicMock(spec=EventStore)
