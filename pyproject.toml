@@ -26,6 +26,7 @@ dependencies = [
     "meshio>=5.3.5",
     "numpy>=2.0.0",
     "python-multipart==0.0.19",
+    "gmsh>=4.13.0",
 ]
 
 [project.optional-dependencies]

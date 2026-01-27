@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import meshio
 import numpy as np
@@ -17,6 +17,24 @@ from .utils import (
     read_with_pyvista,
     safe_name,
 )
+
+# Lazy import gmsh to avoid import errors if not installed
+_gmsh = None
+
+
+def _get_gmsh():
+    """Lazy-load gmsh module."""
+    global _gmsh
+    if _gmsh is None:
+        try:
+            import gmsh
+            _gmsh = gmsh
+        except ImportError:
+            raise HTTPException(
+                status_code=500,
+                detail="gmsh is not installed. Install with: pip install gmsh",
+            )
+    return _gmsh
 
 
 def convert_gmsh_msh(msh_path: Path) -> Tuple[pv.PolyData, Dict[str, pv.PolyData]]:
@@ -177,3 +195,125 @@ def convert_openfoam_zip(case_zip: Path, work_dir: Path) -> pv.PolyData:
     produced.sort(key=lambda p: p.stat().st_size, reverse=True)
     ds = read_with_pyvista(produced[0])
     return extract_surface_from_any(ds).clean()
+
+
+def convert_step_file(
+    step_path: Path,
+    mesh_size: Optional[float] = None,
+    mesh_size_min: Optional[float] = None,
+    mesh_size_max: Optional[float] = None,
+) -> Tuple[pv.PolyData, Dict[str, pv.PolyData]]:
+    """
+    Convert a STEP/STP CAD file to surface PolyData with optional patch splitting.
+
+    Uses gmsh to import the STEP file via OpenCASCADE and generate a surface mesh.
+    Physical groups from the CAD model (if any) become patches.
+
+    Args:
+        step_path: Path to the .step or .stp file
+        mesh_size: Target mesh element size (auto-computed if not provided)
+        mesh_size_min: Minimum mesh element size
+        mesh_size_max: Maximum mesh element size
+
+    Returns:
+        Tuple of (merged_surface, patches_dict)
+
+    Raises:
+        HTTPException: If conversion fails
+    """
+    gmsh = _get_gmsh()
+
+    # Generate a temporary .msh output path
+    msh_path = step_path.with_suffix(".msh")
+
+    try:
+        gmsh.initialize()
+        gmsh.option.setNumber("General.Terminal", 0)  # Suppress terminal output
+
+        # Import STEP file using OpenCASCADE kernel
+        gmsh.model.add("step_import")
+        
+        try:
+            gmsh.model.occ.importShapes(str(step_path))
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to import STEP file: {str(e)}",
+            )
+
+        # Synchronize to make entities available
+        gmsh.model.occ.synchronize()
+
+        # Get bounding box for auto mesh size computation
+        if mesh_size is None:
+            try:
+                xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(-1, -1)
+                diag = ((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2) ** 0.5
+                mesh_size = diag / 50  # Default: ~50 elements across diagonal
+                if mesh_size_min is None:
+                    mesh_size_min = mesh_size / 10
+                if mesh_size_max is None:
+                    mesh_size_max = mesh_size * 2
+            except Exception:
+                mesh_size = 1.0
+                mesh_size_min = 0.1
+                mesh_size_max = 10.0
+
+        # Set mesh size options
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size_min or mesh_size / 10)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size_max or mesh_size * 2)
+        gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 1)
+        gmsh.option.setNumber("Mesh.MinimumElementsPerTwoPi", 6)
+
+        # Get all surfaces and create physical groups for patches
+        surfaces = gmsh.model.getEntities(dim=2)
+        if not surfaces:
+            raise HTTPException(
+                status_code=400,
+                detail="No surfaces found in STEP file.",
+            )
+
+        # Create physical groups for each surface (patch)
+        for i, (dim, tag) in enumerate(surfaces, start=1):
+            name = f"Surface_{tag}"
+            # Try to get the entity name from STEP file
+            try:
+                entity_name = gmsh.model.getEntityName(dim, tag)
+                if entity_name:
+                    name = safe_name(entity_name)
+            except Exception:
+                pass
+            gmsh.model.addPhysicalGroup(dim, [tag], i, name=name)
+
+        # Generate 2D surface mesh
+        try:
+            gmsh.model.mesh.generate(2)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Mesh generation failed: {str(e)}",
+            )
+
+        # Check if mesh was generated
+        node_tags, _, _ = gmsh.model.mesh.getNodes()
+        if len(node_tags) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Mesh generation produced no nodes.",
+            )
+
+        # Write to MSH format
+        gmsh.write(str(msh_path))
+
+    finally:
+        gmsh.finalize()
+
+    # Use existing MSH converter to process the generated mesh
+    try:
+        surface, patches = convert_gmsh_msh(msh_path)
+    finally:
+        # Cleanup temporary MSH file
+        if msh_path.exists():
+            msh_path.unlink()
+
+    return surface, patches

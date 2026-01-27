@@ -15,6 +15,7 @@ from .config import PUBLIC_BASE_URL, STORAGE_DIR, TMP_DIR
 from .converters import (
     convert_gmsh_msh,
     convert_openfoam_zip,
+    convert_step_file,
     convert_vtk_formats,
 )
 from .utils import (
@@ -38,6 +39,7 @@ async def convert(file: UploadFile = File(...)):
     Accepts:
       - .msh (Gmsh)
       - .vtu, .vtk, .vtp, .stl, .obj (VTK formats)
+      - .step, .stp (STEP CAD files)
       - .zip (OpenFOAM case)
 
     Returns:
@@ -69,6 +71,11 @@ async def convert(file: UploadFile = File(...)):
     try:
         if in_ext == ".msh":
             surface, patches = convert_gmsh_msh(in_path)
+
+        elif in_ext in [".step", ".stp"]:
+            surface, patches = convert_step_file(in_path)
+            # Get array info from the converted surface
+            array_info = get_array_info(surface)
 
         elif in_ext in [".vtu", ".vtk", ".vtp", ".stl", ".obj"]:
             surface = convert_vtk_formats(in_path)
@@ -171,6 +178,7 @@ async def inspect_mesh(file: UploadFile = File(...)):
     Accepts:
       - .msh (Gmsh)
       - .vtu, .vtk, .vtp, .stl, .obj (VTK formats)
+      - .step, .stp (STEP CAD files)
 
     Returns:
         JSON with detailed information about all data arrays in the mesh
@@ -192,7 +200,7 @@ async def inspect_mesh(file: UploadFile = File(...)):
             f.write(chunk)
 
     try:
-        if in_ext not in [".msh", ".vtu", ".vtk", ".vtp", ".stl", ".obj"]:
+        if in_ext not in [".msh", ".vtu", ".vtk", ".vtp", ".stl", ".obj", ".step", ".stp"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unsupported file extension for inspection: {in_ext}",
@@ -201,11 +209,21 @@ async def inspect_mesh(file: UploadFile = File(...)):
         # Run inspection
         info = print_mesh_info(in_path)
 
-        # Also add patch detection info for VTK formats
+        # Also add patch detection info for VTK formats and STEP files
+        detected_patch_array = None
         if in_ext in [".vtu", ".vtk", ".vtp", ".stl", ".obj"]:
             surface = convert_vtk_formats(in_path)
             detected_patch_array = choose_patch_array(surface)
+        elif in_ext in [".step", ".stp"]:
+            surface, patches = convert_step_file(in_path)
+            detected_patch_array = choose_patch_array(surface)
+            info["step_conversion"] = {
+                "num_patches": len(patches),
+                "patch_names": list(patches.keys()),
+            }
 
+        # Add patch detection info if we have a surface
+        if in_ext in [".vtu", ".vtk", ".vtp", ".stl", ".obj", ".step", ".stp"]:
             info["patch_detection"] = {
                 "detected_array": detected_patch_array,
                 "would_split": False,
