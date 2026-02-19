@@ -64,6 +64,12 @@ async def convert(file: UploadFile = File(...)):
                 break
             f.write(chunk)
 
+    # IMPORTANT: Also save original file to storage for simulation use
+    # The original mesh file is needed by the simulation runner for mesh conversion
+    original_mesh_path = out_dir / f"original{in_ext}"
+    shutil.copy(in_path, original_mesh_path)
+    logger.info(f"Saved original mesh file to {original_mesh_path}")
+
     surface: Optional[pv.PolyData] = None
     patches: Dict[str, pv.PolyData] = {}
     array_info: Dict[str, Any] = {}
@@ -161,11 +167,89 @@ async def convert(file: UploadFile = File(...)):
                 "nPoints": int(surface.n_points),
                 "nCells": int(surface.n_cells),
             },
+            # Original mesh file info for simulation
+            "originalMesh": {
+                "fileName": in_name,
+                "format": in_ext.lstrip("."),
+                "storagePath": f"{mesh_id}/original{in_ext}",
+            },
         }
 
     finally:
         # Cleanup temp directory
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@router.get("/{mesh_id}/original")
+async def get_original_mesh(mesh_id: str):
+    """
+    Get the original mesh file for a given mesh ID.
+    
+    This endpoint is used by the orchestrator to retrieve the mesh file
+    for inclusion in the simulation case ZIP.
+    
+    Returns:
+        The original mesh file as bytes
+    """
+    mesh_dir = STORAGE_DIR / mesh_id
+    
+    if not mesh_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Mesh not found: {mesh_id}")
+    
+    # Find the original mesh file (it could have various extensions)
+    original_files = list(mesh_dir.glob("original.*"))
+    
+    if not original_files:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Original mesh file not found for {mesh_id}. "
+                   "This mesh may have been uploaded before original file storage was enabled."
+        )
+    
+    original_path = original_files[0]
+    
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        original_path,
+        media_type="application/octet-stream",
+        filename=original_path.name,
+    )
+
+
+@router.get("/{mesh_id}/info")
+async def get_mesh_info(mesh_id: str):
+    """
+    Get information about a stored mesh.
+    
+    Returns mesh metadata including paths to original and VTP files.
+    """
+    mesh_dir = STORAGE_DIR / mesh_id
+    
+    if not mesh_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Mesh not found: {mesh_id}")
+    
+    # Find files
+    original_files = list(mesh_dir.glob("original.*"))
+    vtp_files = list(mesh_dir.glob("*.vtp"))
+    patch_dir = mesh_dir / "patches"
+    patch_files = list(patch_dir.glob("*.vtp")) if patch_dir.exists() else []
+    
+    original_info = None
+    if original_files:
+        orig = original_files[0]
+        original_info = {
+            "fileName": orig.name,
+            "format": orig.suffix.lstrip("."),
+            "sizeBytes": orig.stat().st_size,
+        }
+    
+    return {
+        "meshId": mesh_id,
+        "originalMesh": original_info,
+        "surfaceVtp": str(vtp_files[0].name) if vtp_files else None,
+        "patchCount": len(patch_files),
+        "storagePath": str(mesh_dir),
+    }
 
 
 @router.post("/debug/inspect")

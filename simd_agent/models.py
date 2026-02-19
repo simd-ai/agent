@@ -574,12 +574,30 @@ class EventTypes:
     CODEGEN_ITERATION = "codegen_iteration"
     CODEGEN_COMPLETE = "codegen_complete"
     
-    # Sandbox
+    # Sandbox (legacy)
     SANDBOX_SUBMITTED = "sandbox_submitted"
     SANDBOX_STATUS = "sandbox_status"
     SANDBOX_LOGS = "sandbox_logs"
     SANDBOX_SUCCEEDED = "sandbox_succeeded"
     SANDBOX_FAILED = "sandbox_failed"
+    
+    # Simulation Server (new)
+    SIM_SUBMITTED = "sim_submitted"
+    SIM_EXTRACT_STARTED = "sim_extract_started"
+    SIM_EXTRACT_COMPLETE = "sim_extract_complete"
+    SIM_MESH_CONVERSION_STARTED = "sim_mesh_conversion_started"
+    SIM_MESH_CONVERSION_COMPLETE = "sim_mesh_conversion_complete"
+    SIM_MESH_CONVERSION_FAILED = "sim_mesh_conversion_failed"
+    SIM_BLOCKMESH_STARTED = "sim_blockmesh_started"
+    SIM_BLOCKMESH_COMPLETE = "sim_blockmesh_complete"
+    SIM_CHECKMESH_STARTED = "sim_checkmesh_started"
+    SIM_CHECKMESH_COMPLETE = "sim_checkmesh_complete"
+    SIM_RUN_STARTED = "sim_run_started"
+    SIM_RUN_PROGRESS = "sim_run_progress"
+    SIM_RUN_LOG = "sim_run_log"
+    SIM_RUN_SUCCEEDED = "sim_run_succeeded"
+    SIM_RUN_FAILED = "sim_run_failed"
+    SIM_ARTIFACTS_READY = "sim_artifacts_ready"
     
     # Self-healing
     ERROR_SUMMARY = "error_summary"

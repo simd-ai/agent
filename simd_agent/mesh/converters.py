@@ -263,7 +263,7 @@ def convert_step_file(
         gmsh.option.setNumber("Mesh.CharacteristicLengthMin", mesh_size_min or mesh_size / 10)
         gmsh.option.setNumber("Mesh.CharacteristicLengthMax", mesh_size_max or mesh_size * 2)
         gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 1)
-        gmsh.option.setNumber("Mesh.MinimumElementsPerTwoPi", 6)
+        gmsh.option.setNumber("Mesh.MinimumElementsPerTwoPi", 64)
 
         # Get all surfaces and create physical groups for patches
         surfaces = gmsh.model.getEntities(dim=2)

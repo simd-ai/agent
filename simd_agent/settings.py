@@ -24,10 +24,20 @@ class Settings(BaseSettings):
         description="Neon Postgres connection URL",
     )
     
-    # Sandbox
+    # Simulation Server (replaces sandbox)
+    simulation_server_url: str = Field(
+        default="https://vernie-unpreservable-supermentally.ngrok-free.dev",
+        description="Base URL for the SIMD Simulation Runner server (OpenFOAM)",
+    )
+    simulation_timeout: int = Field(
+        default=600,
+        description="Timeout in seconds for simulation operations",
+    )
+    
+    # Legacy Sandbox (deprecated - use simulation_server_url)
     sandbox_base_url: str = Field(
         default="https://legal-many-zebra.ngrok-free.app",
-        description="Base URL for the SIMD sandbox execution service",
+        description="[DEPRECATED] Base URL for sandbox - use simulation_server_url instead",
     )
     sandbox_timeout: int = Field(
         default=300,
@@ -48,6 +58,10 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = Field(
         default=None,
         description="Google Gemini API key",
+    )
+    gemini_model: str = Field(
+        default="gemini-3-flash-preview",
+        description="Default Gemini model for code generation",
     )
     grok_api_key: str | None = Field(
         default=None,

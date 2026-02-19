@@ -128,24 +128,55 @@ async def precheck(request: dict[str, Any]):
     structured configuration suggestions, boundary condition hints, and
     interpretation of the user's intent.
     
-    Request:
+    Request (POST /api/precheck):
         {
-            "prompt": "Simulate turbulent flow through a pipe...",
-            "mesh": { ... },  // Optional mesh info
-            "previousConfig": { ... }  // Optional previous config
+            "prompt": "Simulate turbulent water flow through a pipe at 5 m/s",
+            "has_mesh": true,
+            "mesh_info": {
+                "mesh_id": "abc-123",
+                "file_name": "pipe.msh",
+                "patches": [
+                    { "name": "inlet", "type": "patch", "n_cells": 100 },
+                    { "name": "outlet", "type": "patch", "n_cells": 100 },
+                    { "name": "walls", "type": "wall", "n_cells": 5000 }
+                ],
+                "check_mesh": { "cells": 50000, "faces": 150000, "points": 55000 }
+            }
         }
     
     Response:
         {
             "success": true,
-            "suggestedConfig": { ... },
+            "confidence": 0.9,
+            "message": "Detected turbulent pipe flow with water",
+            "suggestedConfig": {
+                "caseType": "internal_pipe_flow",
+                "flowRegime": "turbulent",
+                "timeScheme": "steady",
+                "compressibility": "incompressible",
+                "enableHeatTransfer": false,
+                "gravity": false,
+                "solver": { ... },
+                "fluid": { ... },
+                "turbulence": { ... },
+                "boundaryConditions": { ... }
+            },
             "boundaryHints": { ... },
             "interpretation": { ... },
-            "confidence": { ... },
-            ...
+            "confidenceScores": { ... }
         }
     """
-    from simd_agent.precheck import PrecheckRequest, get_precheck_service
+    from simd_agent.precheck import (
+        PrecheckRequest,
+        PrecheckResponse,
+        SuggestedConfig,
+        SolverSettings,
+        TurbulenceSettings,
+        Interpretation,
+        ConfidenceScores,
+        FLUID_PRESETS,
+        get_precheck_service,
+    )
     
     try:
         # Parse and validate request
@@ -155,64 +186,78 @@ async def precheck(request: dict[str, Any]):
         service = get_precheck_service()
         response = await service.analyze(precheck_request)
         
-        return response.model_dump()
+        # Return with camelCase keys to match frontend expectations
+        return response.model_dump(by_alias=True)
         
     except ValidationError as e:
         logger.warning(f"Invalid precheck request: {e}")
-        return {
-            "success": False,
-            "errors": [f"Invalid request: {e}"],
-            "suggestedConfig": {
-                "flowRegime": "turbulent",
-                "timeScheme": "steady",
-                "compressibility": "incompressible",
-                "enableHeatTransfer": False,
-                "maxIterations": 1000,
-                "convergenceCriteria": 1e-6,
-            },
-            "interpretation": {
-                "summary": "Request validation failed",
-                "simulationType": "Unknown",
-                "keyPhysics": [],
-                "assumptions": [],
-            },
-            "confidence": {
-                "overall": 0.0,
-                "flowRegime": 0.0,
-                "boundaryConditions": 0.0,
-                "physicsSettings": 0.0,
-            },
-            "nextStep": 1,
-            "shouldShowMeshViewer": False,
-        }
+        # Return a minimal valid fallback response
+        fallback = PrecheckResponse(
+            success=False,
+            confidence=0.0,
+            message=f"Request validation failed: {e}",
+            suggested_config=SuggestedConfig(
+                case_type="general",
+                flow_regime="turbulent",
+                time_scheme="steady",
+                compressibility="incompressible",
+                enable_heat_transfer=False,
+                gravity=False,
+                solver=SolverSettings(),
+                fluid=FLUID_PRESETS["air"],
+                turbulence=TurbulenceSettings(model="kOmegaSST"),
+                boundary_conditions={},
+            ),
+            interpretation=Interpretation(
+                summary="Request validation failed",
+                simulation_type="Unknown",
+                key_physics=[],
+                assumptions=[],
+            ),
+            confidence_scores=ConfidenceScores(
+                overall=0.0,
+                flow_regime=0.0,
+                boundary_conditions=0.0,
+                physics_settings=0.0,
+            ),
+            errors=[f"Invalid request: {e}"],
+        )
+        return fallback.model_dump(by_alias=True)
+        
     except Exception as e:
         logger.exception(f"Precheck failed: {e}")
-        return {
-            "success": False,
-            "errors": [f"Internal error: {e}"],
-            "suggestedConfig": {
-                "flowRegime": "turbulent",
-                "timeScheme": "steady",
-                "compressibility": "incompressible",
-                "enableHeatTransfer": False,
-                "maxIterations": 1000,
-                "convergenceCriteria": 1e-6,
-            },
-            "interpretation": {
-                "summary": "Analysis failed due to internal error",
-                "simulationType": "Unknown",
-                "keyPhysics": [],
-                "assumptions": [],
-            },
-            "confidence": {
-                "overall": 0.0,
-                "flowRegime": 0.0,
-                "boundaryConditions": 0.0,
-                "physicsSettings": 0.0,
-            },
-            "nextStep": 1,
-            "shouldShowMeshViewer": False,
-        }
+        # Return a minimal valid fallback response
+        fallback = PrecheckResponse(
+            success=False,
+            confidence=0.0,
+            message=f"Internal error: {e}",
+            suggested_config=SuggestedConfig(
+                case_type="general",
+                flow_regime="turbulent",
+                time_scheme="steady",
+                compressibility="incompressible",
+                enable_heat_transfer=False,
+                gravity=False,
+                solver=SolverSettings(),
+                fluid=FLUID_PRESETS["air"],
+                turbulence=TurbulenceSettings(model="kOmegaSST"),
+                boundary_conditions={},
+            ),
+            interpretation=Interpretation(
+                summary="Analysis failed due to internal error",
+                simulation_type="Unknown",
+                key_physics=[],
+                assumptions=[],
+            ),
+            confidence_scores=ConfidenceScores(
+                overall=0.0,
+                flow_regime=0.0,
+                boundary_conditions=0.0,
+                physics_settings=0.0,
+            ),
+            errors=[f"Internal error: {e}"],
+        )
+        return fallback.model_dump(by_alias=True)
 
 
 @app.websocket("/ws/run")

@@ -41,6 +41,7 @@ class EventBus:
         self._seq = 0
         self._lock = asyncio.Lock()
         self._started_at = datetime.utcnow()
+        self._ws_closed = False  # Track if WebSocket is closed
     
     async def emit(
         self,
@@ -98,16 +99,29 @@ class EventBus:
             except Exception as e:
                 logger.error(f"[EVENT #{seq}] Failed to persist event: {e}")
         
-        # Send via WebSocket
-        try:
-            ws_message = event.to_ws_message()
-            logger.info(f"[EVENT #{seq}] >>> SENDING TO FRONTEND: type={ws_message.get('type')}")
-            await self.websocket.send_json(ws_message)
-            logger.debug(f"[EVENT #{seq}] Sent successfully")
-        except Exception as e:
-            logger.error(f"[EVENT #{seq}] Failed to send event via WebSocket: {e}")
+        # Send via WebSocket (skip if already closed)
+        if not self._ws_closed:
+            try:
+                ws_message = event.to_ws_message()
+                logger.info(f"[EVENT #{seq}] >>> SENDING TO FRONTEND: type={ws_message.get('type')}")
+                await self.websocket.send_json(ws_message)
+                logger.debug(f"[EVENT #{seq}] Sent successfully")
+            except Exception as e:
+                error_msg = str(e)
+                # Detect connection closed errors and mark WS as closed
+                if "close message" in error_msg.lower() or "closed" in error_msg.lower() or not error_msg:
+                    if not self._ws_closed:
+                        logger.warning(f"[EVENT #{seq}] WebSocket closed, will skip future sends")
+                        self._ws_closed = True
+                else:
+                    logger.error(f"[EVENT #{seq}] Failed to send event via WebSocket: {e}")
         
         return event
+    
+    def mark_ws_closed(self):
+        """Mark the WebSocket as closed to prevent further send attempts."""
+        self._ws_closed = True
+        logger.info("[EVENTBUS] WebSocket marked as closed")
     
     async def emit_debug(self, message: str, payload: dict[str, Any] | None = None) -> AgentEvent:
         """Emit a debug-level event."""
@@ -343,11 +357,16 @@ class EventBus:
         iteration: int,
         files_generated: list[str],
     ) -> AgentEvent:
-        """Emit codegen iteration event."""
+        """Emit codegen iteration event.
+        
+        The frontend expects files as objects with a 'path' property:
+        [{"path": "system/controlDict"}, {"path": "0/U"}, ...]
+        """
+        files_as_objects = [{"path": f} for f in files_generated]
         return await self.emit_info(
             EventTypes.CODEGEN_ITERATION,
             f"Generated {len(files_generated)} files",
-            {"iteration": iteration, "files": files_generated},
+            {"iteration": iteration, "files": files_as_objects},
         )
     
     async def emit_codegen_complete(
@@ -447,6 +466,99 @@ class EventBus:
             EventTypes.RETRYING,
             f"Retrying ({attempt}/{max_retries})",
             {"attempt": attempt, "max_retries": max_retries},
+        )
+    
+    # --- Simulation Server Events ---
+    
+    async def emit_sim_submitted(
+        self,
+        sim_run_id: str,
+        mode: str,
+        events_url: str,
+    ) -> AgentEvent:
+        """Emit simulation submitted event."""
+        return await self.emit_info(
+            EventTypes.SIM_SUBMITTED,
+            f"Simulation submitted: {sim_run_id} (mode={mode})",
+            {
+                "sim_run_id": sim_run_id,
+                "mode": mode,
+                "events_url": events_url,
+            },
+        )
+    
+    async def emit_sim_event(
+        self,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any],
+        level: str = "info",
+    ) -> AgentEvent:
+        """Relay a simulation server event to the frontend."""
+        event_level = EventLevel.INFO
+        if level == "warn":
+            event_level = EventLevel.WARN
+        elif level == "error":
+            event_level = EventLevel.ERROR
+        
+        return await self.emit(
+            event_type=event_type,
+            message=message,
+            payload=payload,
+            level=event_level,
+        )
+    
+    async def emit_sim_progress(
+        self,
+        sim_run_id: str,
+        iteration: int,
+        residuals: dict[str, float] | None = None,
+        time_value: float | None = None,
+    ) -> AgentEvent:
+        """Emit simulation progress event."""
+        return await self.emit_info(
+            EventTypes.SIM_RUN_PROGRESS,
+            f"Simulation iteration {iteration}",
+            {
+                "sim_run_id": sim_run_id,
+                "iteration": iteration,
+                "residuals": residuals or {},
+                "time": time_value,
+            },
+        )
+    
+    async def emit_sim_succeeded(
+        self,
+        sim_run_id: str,
+        duration_seconds: float,
+        artifacts: list[dict[str, Any]] | None = None,
+    ) -> AgentEvent:
+        """Emit simulation succeeded event."""
+        return await self.emit_info(
+            EventTypes.SIM_RUN_SUCCEEDED,
+            f"Simulation succeeded in {duration_seconds:.1f}s",
+            {
+                "sim_run_id": sim_run_id,
+                "duration_seconds": duration_seconds,
+                "artifacts": artifacts or [],
+            },
+        )
+    
+    async def emit_sim_failed(
+        self,
+        sim_run_id: str,
+        error: str,
+        exit_code: int | None = None,
+    ) -> AgentEvent:
+        """Emit simulation failed event."""
+        return await self.emit_error(
+            EventTypes.SIM_RUN_FAILED,
+            f"Simulation failed: {error}",
+            {
+                "sim_run_id": sim_run_id,
+                "error": error,
+                "exit_code": exit_code,
+            },
         )
     
     async def emit_simulation_not_clear(self, reason: str) -> AgentEvent:

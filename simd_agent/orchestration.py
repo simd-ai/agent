@@ -1,7 +1,6 @@
 # simd_agent/orchestration.py
 """Main orchestration logic for CFD workflows."""
 
-import asyncio
 import json
 import logging
 from pathlib import Path
@@ -17,16 +16,27 @@ from simd_agent.models import (
     LintResult,
     Operation,
     RunStatus,
-    SandboxState,
     StartRequest,
 )
 from simd_agent.packaging import (
     extract_file_blocks,
     package_from_llm_output,
+    package_simulation_case,
     merge_files,
 )
 from simd_agent.planning import Planner
-from simd_agent.sandbox_client import SandboxClient, SandboxError
+from simd_agent.genai_codegen import (
+    GenAICodeGenerator,
+    validate_generated_files,
+    determine_solver,
+)
+from simd_agent.simulation_server_client import (
+    SimulationServerClient,
+    SimulationServerError,
+    SimRunMode,
+    SimRunStatus,
+    SimRunEvent,
+)
 from simd_agent.settings import get_settings
 from simd_agent.store import EventStore
 
@@ -73,9 +83,9 @@ class Orchestrator:
         # Components (lazily initialized)
         self._linter: CFDLinter | None = None
         self._planner: Planner | None = None
-        self._sandbox: SandboxClient | None = None
+        self._sim_server: SimulationServerClient | None = None
         self._error_summarizer: ErrorSummarizer | None = None
-        self._code_generator: Any = None
+        self._code_generator: GenAICodeGenerator | None = None
         
         # State
         self._iteration = 0
@@ -99,11 +109,11 @@ class Orchestrator:
         return self._planner
     
     @property
-    def sandbox(self) -> SandboxClient:
-        """Get or create the sandbox client."""
-        if self._sandbox is None:
-            self._sandbox = SandboxClient()
-        return self._sandbox
+    def sim_server(self) -> SimulationServerClient:
+        """Get or create the simulation server client."""
+        if self._sim_server is None:
+            self._sim_server = SimulationServerClient()
+        return self._sim_server
     
     @property
     def error_summarizer(self) -> ErrorSummarizer:
@@ -117,23 +127,14 @@ class Orchestrator:
         return self._error_summarizer
     
     async def _init_code_generator(self) -> None:
-        """Initialize the code generator from codegen."""
-        # Use internal mock generator for testing without codegen dependency
-        if self.request.provider == "mock":
-            logger.info("Using internal mock generator for provider='mock'")
-            self._code_generator = MockCodeGenerator()
-            return
-        
+        """Initialize the code generator using Google GenAI."""
         try:
-            from codegen import CodeGenerator
-            
-            self._code_generator = CodeGenerator(
-                provider=self.request.provider,
-                prompt_pack=self.request.prompt_pack,
-            )
-        except ImportError:
-            logger.warning("codegen not available, using mock generator")
-            self._code_generator = MockCodeGenerator()
+            # Use Google GenAI directly for code generation
+            self._code_generator = GenAICodeGenerator()
+            logger.info("[ORCHESTRATOR] Initialized GenAI code generator")
+        except Exception as e:
+            logger.error(f"[ORCHESTRATOR] Failed to initialize GenAI code generator: {e}")
+            raise OrchestrationError(f"Failed to initialize code generator: {e}")
     
     async def run(self) -> FinalResult:
         """Execute the requested operation.
@@ -171,7 +172,7 @@ class Orchestrator:
                 return await self._run_lint()
             elif self.request.op == Operation.CFD_CODEGEN_RUN:
                 logger.info("[ORCHESTRATOR] Running CFD_CODEGEN_RUN operation...")
-                return await self._run_codegen_and_sandbox()
+                return await self._run_codegen_and_simulate()
             else:
                 raise OrchestrationError(f"Unknown operation: {self.request.op}")
         except Exception as e:
@@ -184,8 +185,8 @@ class Orchestrator:
                 retries=self._retries,
             )
         finally:
-            if self._sandbox:
-                await self._sandbox.close()
+            if self._sim_server:
+                await self._sim_server.close()
     
     async def _run_lint(self) -> FinalResult:
         """Run the CFD linting operation."""
@@ -265,8 +266,8 @@ class Orchestrator:
             summary=f"Linting complete: {len(lint_result.issues)} issues",
         )
     
-    async def _run_codegen_and_sandbox(self) -> FinalResult:
-        """Run the full codegen + sandbox workflow with self-healing."""
+    async def _run_codegen_and_simulate(self) -> FinalResult:
+        """Run the full code generation and simulation workflow with self-healing."""
         max_retries = self.request.constraints.max_retries
         
         # Step 1: Detect simulation type
@@ -359,12 +360,26 @@ class Orchestrator:
             config=self._lint_result.validated_config,
         )
         
+        # Determine correct solver (no buoyancy)
+        solver = determine_solver(self._lint_result.validated_config)
+        # Override planner's solver if it picked a buoyant one
+        if planning_result.solver and planning_result.solver in ("buoyantSimpleFoam", "buoyantPimpleFoam"):
+            logger.info(f"[CODEGEN] Overriding planner solver {planning_result.solver} → {solver}")
+        elif planning_result.solver and planning_result.solver in ("simpleFoam", "pimpleFoam"):
+            solver = planning_result.solver
+        
+        logger.info(f"[CODEGEN] Using solver: {solver}")
+        
+        # Get mesh_id from simulation config
+        mesh_config = self.request.simulation_config.get("mesh", {})
+        mesh_id = mesh_config.get("mesh_id") or mesh_config.get("meshId")
+        
         # Step 4: Self-healing loop
         while self._retries <= max_retries:
             self._iteration += 1
             
             try:
-                # Generate code
+                # ── Generate code ──
                 await self.event_bus.emit_codegen_started(self._iteration)
                 
                 code_result = await self._generate_code(planning_result)
@@ -377,6 +392,18 @@ class Orchestrator:
                 if self._current_files and self._retries > 0:
                     files = merge_files(self._current_files, files)
                 
+                # ── Post-generation validation ──
+                logger.info(f"[CODEGEN] Validating {len(files)} generated files...")
+                files, validation_issues = validate_generated_files(
+                    files, solver, self._lint_result.validated_config
+                )
+                
+                validation_errors = [i for i in validation_issues if i.severity == "error"]
+                if validation_errors:
+                    logger.warning(f"[CODEGEN] Validation found {len(validation_errors)} errors (auto-fixed where possible)")
+                    for vi in validation_errors:
+                        logger.warning(f"[CODEGEN]   {vi}")
+                
                 self._current_files = files
                 
                 await self.event_bus.emit_codegen_iteration(
@@ -384,26 +411,37 @@ class Orchestrator:
                     list(files.keys()),
                 )
                 
-                # Package case
-                solver = planning_result.solver or "simpleFoam"
-                zip_bytes, file_list, warnings = package_from_llm_output(
-                    code_result,
-                    solver=solver,
-                )
+                # ── Package case with mesh ──
+                if mesh_id:
+                    logger.info(f"[CODEGEN] Packaging with mesh: {mesh_id}")
+                    zip_bytes, file_list, warnings = package_simulation_case(
+                        generated_files=files,
+                        mesh_id=mesh_id,
+                        solver=solver,
+                    )
+                else:
+                    logger.info("[CODEGEN] No mesh_id provided, using generated mesh")
+                    zip_bytes, file_list, warnings = package_from_llm_output(
+                        code_result,
+                        solver=solver,
+                    )
                 
                 await self.event_bus.emit_codegen_complete(
                     self._iteration,
                     len(zip_bytes),
                 )
                 
-                # Submit to sandbox
-                sandbox_result = await self._run_in_sandbox(zip_bytes)
+                # ── Submit to simulation server (TEST mode) ──
+                sim_result = await self._run_on_sim_server(
+                    zip_bytes,
+                    mode=SimRunMode.TEST,
+                )
                 
-                if sandbox_result["success"]:
-                    # Success!
-                    artifacts = sandbox_result.get("artifacts", [])
+                if sim_result["success"]:
+                    # Test passed!
+                    artifacts = sim_result.get("artifacts", [])
                     await self.event_bus.emit_run_succeeded(
-                        f"Case executed successfully after {self._iteration} iteration(s)",
+                        f"Case validated successfully after {self._iteration} iteration(s)",
                         artifacts,
                     )
                     
@@ -425,7 +463,7 @@ class Orchestrator:
                         artifacts=artifacts,
                         iterations=self._iteration,
                         retries=self._retries,
-                        summary=f"Case executed successfully",
+                        summary="Case validated successfully",
                         case_type=case_type,
                         solver=solver,
                     )
@@ -440,51 +478,110 @@ class Orchestrator:
                         solver=solver,
                     )
                 
-                # Sandbox failed - check if we can retry
+                # ── Simulation failed — prepare for retry ──
+                sim_error = sim_result.get("error", "Unknown error")
+                sim_logs = sim_result.get("logs", "")
+                sim_exit_code = sim_result.get("exit_code")
+                sim_stderr = sim_result.get("stderr", "")
+                
+                # ── RAW PRINT of the simulation error for visibility ──
+                print("\n" + "=" * 70)
+                print("🔴 SIMULATION SERVER ERROR (will attempt self-healing)")
+                print("=" * 70)
+                print(f"  Iteration: {self._iteration}")
+                print(f"  Exit code: {sim_exit_code}")
+                print(f"  Error: {sim_error}")
+                if sim_stderr:
+                    print(f"\n  --- STDERR / OpenFOAM Error ---")
+                    for line in sim_stderr.split("\n")[-30:]:  # Last 30 lines
+                        print(f"  {line}")
+                elif sim_logs:
+                    # If no stderr collected, show last part of logs
+                    print(f"\n  --- Last log lines ---")
+                    for line in sim_logs.split("\n")[-20:]:
+                        print(f"  {line}")
+                print("=" * 70)
+                print(f"  Files sent: {list(self._current_files.keys())}")
+                print("=" * 70 + "\n")
+                
                 if self._retries >= max_retries:
                     break
                 
                 self._retries += 1
                 
-                # Summarize error
-                error_summary = await self.error_summarizer.summarize(
-                    sandbox_result["logs"],
-                    sandbox_result.get("exit_code"),
-                    self._current_files,
-                )
+                logger.warning(f"[CODEGEN] Simulation failed (attempt {self._retries}/{max_retries}): {sim_error}")
                 
-                await self.event_bus.emit_error_summary(
-                    error_summary.root_cause,
-                    error_summary.actionable_changes,
-                    error_summary.affected_files,
-                )
-                
-                # Store error for context in next iteration
+                # Store error for context in next LLM call
                 self._previous_errors.append({
                     "iteration": self._iteration,
-                    "root_cause": error_summary.root_cause,
-                    "changes": error_summary.actionable_changes,
+                    "source": "simulation_server",
+                    "error": sim_error,
+                    "details": sim_logs[-3000:] if sim_logs else "",
+                    "stderr": sim_stderr[:2000] if sim_stderr else "",
+                    "exit_code": sim_exit_code,
                 })
                 
                 await self.event_bus.emit_retrying(self._retries, max_retries)
                 
-            except SandboxError as e:
-                logger.error(f"Sandbox error: {e}")
+            except SimulationServerError as e:
+                print("\n" + "=" * 70)
+                print("🔴 SIMULATION SERVER CONNECTION ERROR")
+                print("=" * 70)
+                print(f"  Iteration: {self._iteration}")
+                print(f"  Error: {e}")
+                print("=" * 70 + "\n")
+                
+                logger.error(f"Simulation server error: {e}")
                 if self._retries >= max_retries:
                     break
                 self._retries += 1
+                
+                self._previous_errors.append({
+                    "iteration": self._iteration,
+                    "source": "simulation_server_connection",
+                    "error": str(e),
+                    "details": str(e),
+                })
+                
+                await self.event_bus.emit_retrying(self._retries, max_retries)
+            
+            except OrchestrationError as e:
+                print("\n" + "=" * 70)
+                print("🔴 ORCHESTRATION ERROR")
+                print("=" * 70)
+                print(f"  Iteration: {self._iteration}")
+                print(f"  Error: {e}")
+                print("=" * 70 + "\n")
+                
+                logger.error(f"Orchestration error: {e}")
+                if self._retries >= max_retries:
+                    break
+                self._retries += 1
+                
+                self._previous_errors.append({
+                    "iteration": self._iteration,
+                    "source": "orchestrator",
+                    "error": str(e),
+                    "details": "",
+                })
+                
                 await self.event_bus.emit_retrying(self._retries, max_retries)
         
         # Max retries exceeded
+        last_error = self._previous_errors[-1]["error"] if self._previous_errors else "Unknown"
         await self.event_bus.emit_run_failed(
-            f"Failed after {max_retries} retries"
+            f"Failed after {max_retries} retries. Last error: {last_error}"
         )
         
         await self.store.finalize_run(
             run_id=self.run_id,
             status=RunStatus.FAILED,
             validated_config=self._lint_result.validated_config if self._lint_result else None,
-            result={"error": "Max retries exceeded", "iterations": self._iteration},
+            result={
+                "error": f"Max retries exceeded. Last: {last_error}",
+                "iterations": self._iteration,
+                "errors": self._previous_errors,
+            },
             attempts=self._iteration,
         )
         
@@ -494,14 +591,14 @@ class Orchestrator:
             iterations=self._iteration,
             retries=self._retries,
             summary=f"Failed after {max_retries} retries",
-            error="Max retries exceeded",
+            error=last_error,
         )
         
         return FinalResult(
             status=RunStatus.FAILED,
             iterations=self._iteration,
             retries=self._retries,
-            error="Max retries exceeded",
+            error=f"Max retries exceeded. Last: {last_error}",
         )
     
     def _detect_simulation_type(self) -> str | None:
@@ -541,47 +638,38 @@ class Orchestrator:
         return None
     
     async def _generate_code(self, planning_result: Any) -> str:
-        """Generate OpenFOAM case code using codegen."""
-        try:
-            from codegen import GenerationContext
-            
-            # Build enhanced requirements with planning context
-            enhanced_requirements = self._build_requirements(planning_result)
-            
-            # Check if we're retrying after a failure
-            if self._previous_errors and self._current_files:
-                # Use codefix task for retries
-                last_error = self._previous_errors[-1]
-                previous_code = "\n\n".join(
-                    f"```file:{path}\n{content}\n```"
-                    for path, content in self._current_files.items()
-                )
-                
-                context = GenerationContext(
-                    task="codefix",
-                    domain="openfoam",
-                    requirements=enhanced_requirements,
-                    previous_code=previous_code,
-                    sandbox_error=last_error.get("root_cause", "Unknown error"),
-                    sandbox_logs="\n".join(
-                        change.get("description", "")
-                        for change in last_error.get("changes", [])
-                    ),
-                )
-            else:
-                # Initial generation
-                context = GenerationContext(
-                    task="codegen",
-                    domain="openfoam",
-                    requirements=enhanced_requirements,
-                )
-            
-            # codegen.generate() is synchronous, run in thread to avoid blocking
-            result = await asyncio.to_thread(self._code_generator.generate, context)
-            return result.final_text
-        except ImportError:
-            # Fallback to mock
-            return self._mock_generate_code(planning_result)
+        """Generate OpenFOAM case code using Google GenAI directly."""
+        # Build enhanced requirements with planning context
+        requirements = self._build_requirements(planning_result)
+        
+        # Get validated config
+        validated_config = {}
+        if self._lint_result and self._lint_result.validated_config:
+            validated_config = self._lint_result.validated_config
+        
+        # Use the solver determined in _run_codegen_and_simulate (no buoyancy)
+        solver = determine_solver(validated_config)
+        case_type = planning_result.case_type or "pipe_flow"
+        
+        # Handle retries — pass sim server errors directly to the LLM
+        previous_errors = None
+        previous_files = None
+        if self._previous_errors:
+            previous_errors = self._previous_errors
+            if self._current_files:
+                previous_files = self._current_files
+        
+        # Generate using GenAI
+        result = await self._code_generator.generate(
+            requirements=requirements,
+            validated_config=validated_config,
+            solver=solver,
+            case_type=case_type,
+            previous_errors=previous_errors,
+            previous_files=previous_files,
+        )
+        
+        return result
     
     def _build_requirements(self, planning_result: Any) -> str:
         """Build enhanced requirements string with planning context and explicit BCs."""
@@ -715,6 +803,11 @@ interpolationSchemes
 snGradSchemes
 {{
     default         corrected;
+}}
+
+wallDist
+{{
+    method meshWave;
 }}
 ```
 
@@ -921,65 +1014,174 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
 ```
 '''
     
-    async def _run_in_sandbox(self, zip_bytes: bytes) -> dict[str, Any]:
-        """Submit case to sandbox and wait for completion."""
-        # Submit
-        submit_result = await self.sandbox.submit_run(
-            zip_bytes,
-            run_script="run.sh",
-            metadata={"run_id": str(self.run_id), "iteration": self._iteration},
-        )
-        sandbox_run_id = submit_result.run_id
+    async def _run_on_sim_server(
+        self,
+        zip_bytes: bytes,
+        mode: SimRunMode = SimRunMode.TEST,
+    ) -> dict[str, Any]:
+        """Submit case to simulation server and stream events.
         
-        await self.event_bus.emit_sandbox_submitted(sandbox_run_id)
+        Events from the simulation server are relayed to the frontend via WebSocket.
         
-        # Wait for completion with status updates
-        async def on_status(status):
-            await self.event_bus.emit_sandbox_status(status.state.value, sandbox_run_id)
+        Args:
+            zip_bytes: OpenFOAM case as ZIP bytes
+            mode: TEST for 1 iteration validation, FULL for complete run
+            
+        Returns:
+            Dict with success, sim_run_id, artifacts, logs, exit_code, etc.
+        """
+        logs_collected: list[str] = []
+        stderr_collected: list[str] = []
+        
+        # Event callback to relay sim server events to frontend
+        async def on_sim_event(event: SimRunEvent):
+            logger.info(f"[SIM_SERVER] Event: {event.type} - {event.message}")
+            
+            # Collect logs — check both payload.line and message
+            if event.type == "run_log":
+                line = event.payload.get("line", event.message)
+                logs_collected.append(line)
+                # Collect stderr lines separately for error context
+                if event.payload.get("stream") == "stderr" or event.level in ("error", "warn"):
+                    stderr_collected.append(line)
+                # Catch ALL OpenFOAM fatal errors (FOAM FATAL ERROR, FOAM FATAL IO ERROR, etc.)
+                line_upper = line.upper()
+                if any(pattern in line_upper for pattern in [
+                    "FOAM FATAL", "FOAM EXITING", "CANNOT FIND FILE",
+                    "NOT CONSTRAINT TYPE", "PATCH TYPE", "DIMENSIONS MISMATCH",
+                    "UNKNOWN PATCHFIELD", "ENTRY NOT FOUND",
+                ]):
+                    stderr_collected.append(line)
+            
+            # Also collect the message itself for non-log events with errors
+            if event.level == "error" and event.type != "run_log":
+                stderr_collected.append(f"[{event.type}] {event.message}")
+            
+            # Collect error info from failed events
+            if event.type in ("run_failed", "mesh_conversion_failed", "blockmesh_failed", "checkmesh_failed"):
+                stderr_text = event.payload.get("stderr", "")
+                if stderr_text:
+                    stderr_collected.append(stderr_text)
+                # Also grab stdout — some errors appear there
+                stdout_text = event.payload.get("stdout", "")
+                if stdout_text and "FOAM FATAL" in stdout_text.upper():
+                    stderr_collected.append(stdout_text)
+            
+            # Map simulation server event types to our event types
+            event_type_map = {
+                "extract_started": "sim_extract_started",
+                "extract_complete": "sim_extract_complete",
+                "mesh_conversion_started": "mesh_conversion_started",
+                "mesh_conversion_complete": "mesh_conversion_complete",
+                "mesh_conversion_failed": "mesh_conversion_failed",
+                "mesh_log": "mesh_log",
+                "blockmesh_started": "blockmesh_started",
+                "blockmesh_complete": "blockmesh_complete",
+                "blockmesh_failed": "blockmesh_failed",
+                "checkmesh_started": "checkmesh_started",
+                "checkmesh_complete": "checkmesh_complete",
+                "run_started": "sim_run_started",
+                "run_progress": "sim_run_progress",
+                "run_log": "sim_run_log",
+                "run_succeeded": "sim_run_succeeded",
+                "run_failed": "sim_run_failed",
+                "artifacts_ready": "sim_artifacts_ready",
+            }
+            
+            # Skip verbose mesh_log events
+            if event.type == "mesh_log" and not event.payload.get("important"):
+                return
+            
+            mapped_type = event_type_map.get(event.type, event.type)
+            
+            await self.event_bus.emit_sim_event(
+                event_type=mapped_type,
+                message=event.message,
+                payload=event.payload,
+                level=event.level,
+            )
         
         try:
-            final_status = await self.sandbox.wait_for_completion(
-                sandbox_run_id,
-                on_status=on_status,
+            # Submit to simulation server
+            submit_response = await self.sim_server.submit_run(
+                zip_bytes,
+                mode=mode,
+                run_id=f"{self.run_id}-iter{self._iteration}",
             )
-        except SandboxError as e:
-            return {"success": False, "error": str(e), "logs": ""}
-        
-        # Get logs
-        logs = await self.sandbox.get_logs(sandbox_run_id)
-        truncated_logs = self.error_summarizer.truncate_logs(logs)
-        
-        await self.event_bus.emit_sandbox_logs(
-            sandbox_run_id,
-            truncated_logs,
-            len(logs.split("\n")) > self.settings.max_log_lines_in_event,
-        )
-        
-        if final_status.state == SandboxState.SUCCEEDED:
-            # Get artifacts
-            artifacts_resp = await self.sandbox.get_artifacts(sandbox_run_id)
-            artifacts = [a.model_dump() for a in artifacts_resp.artifacts]
+            sim_run_id = submit_response.run_id
             
-            await self.event_bus.emit_sandbox_succeeded(sandbox_run_id, artifacts)
-            
-            return {
-                "success": True,
-                "sandbox_run_id": sandbox_run_id,
-                "artifacts": artifacts,
-                "logs": logs,
-            }
-        else:
-            await self.event_bus.emit_sandbox_failed(
-                sandbox_run_id,
-                final_status.exit_code,
-                truncated_logs,
+            await self.event_bus.emit_sim_submitted(
+                sim_run_id=sim_run_id,
+                mode=mode.value,
+                events_url=submit_response.events_url,
             )
             
+            # Stream events and wait for completion
+            all_events: list[SimRunEvent] = []
+            final_event: SimRunEvent | None = None
+            
+            async for event in self.sim_server.stream_events(sim_run_id, on_event=on_sim_event):
+                all_events.append(event)
+                
+                if event.type in ("run_succeeded", "run_failed"):
+                    final_event = event
+                if event.type == "artifacts_ready":
+                    break
+            
+            # Get final status
+            final_status = await self.sim_server.get_status(sim_run_id)
+            logs = "\n".join(logs_collected)
+            stderr = "\n".join(stderr_collected)
+            
+            if final_status.status == SimRunStatus.SUCCEEDED:
+                artifacts = await self.sim_server.get_artifacts(sim_run_id)
+                artifacts_list = [a.model_dump() for a in artifacts]
+                
+                await self.event_bus.emit_sim_succeeded(
+                    sim_run_id=sim_run_id,
+                    duration_seconds=final_status.duration_seconds or 0.0,
+                    artifacts=artifacts_list,
+                )
+                
+                return {
+                    "success": True,
+                    "sim_run_id": sim_run_id,
+                    "artifacts": artifacts_list,
+                    "logs": logs,
+                    "duration_seconds": final_status.duration_seconds,
+                }
+            else:
+                # Build comprehensive error message for self-healing
+                error_msg = final_status.error or "Simulation failed"
+                if final_event and final_event.payload.get("stderr"):
+                    stderr = final_event.payload.get("stderr", "")[:2000]
+                
+                await self.event_bus.emit_sim_failed(
+                    sim_run_id=sim_run_id,
+                    error=error_msg,
+                    exit_code=final_status.exit_code,
+                )
+                
+                return {
+                    "success": False,
+                    "sim_run_id": sim_run_id,
+                    "exit_code": final_status.exit_code,
+                    "logs": logs,
+                    "error": error_msg,
+                    "stderr": stderr,
+                }
+                
+        except SimulationServerError as e:
+            logger.error(f"[SIM_SERVER] Error: {e}")
+            await self.event_bus.emit_sim_failed(
+                sim_run_id="unknown",
+                error=str(e),
+            )
             return {
                 "success": False,
-                "sandbox_run_id": sandbox_run_id,
-                "exit_code": final_status.exit_code,
-                "logs": logs,
+                "error": str(e),
+                "logs": "\n".join(logs_collected),
+                "stderr": "\n".join(stderr_collected),
             }
 
 
@@ -1007,3 +1209,641 @@ writeInterval 10;
 ```
 '''
         return result
+
+
+class OpenFOAMCaseGenerator:
+    """Generate complete OpenFOAM case files from validated configuration.
+    
+    This generator creates proper OpenFOAM case structure without requiring
+    the external codegen library. It uses the validated configuration from
+    the linting/planning phases.
+    """
+    
+    def generate(self, context: Any) -> Any:
+        """Generate OpenFOAM case files.
+        
+        Args:
+            context: GenerationContext with requirements and config
+            
+        Returns:
+            Result object with final_text containing file blocks
+        """
+        class Result:
+            final_text = ""
+            extracted_code_blocks = []
+        
+        result = Result()
+        
+        # Extract configuration from context
+        requirements = getattr(context, 'requirements', '')
+        
+        # Parse validated config from requirements (it's embedded as JSON)
+        config = self._parse_config(requirements)
+        
+        # Generate all files
+        files = []
+        
+        # Detect solver and settings
+        solver = self._detect_solver(config)
+        heat_transfer = config.get('physics', {}).get('heat_transfer', False)
+        
+        # System files
+        files.append(self._generate_control_dict(config, solver))
+        files.append(self._generate_fv_schemes(config, solver))
+        files.append(self._generate_fv_solution(config, solver))
+        
+        # Constant files
+        files.append(self._generate_transport_properties(config))
+        files.append(self._generate_turbulence_properties(config))
+        if heat_transfer:
+            files.append(self._generate_thermophysical_properties(config))
+        
+        # Initial condition files (0 directory)
+        files.append(self._generate_U(config))
+        files.append(self._generate_p(config, solver))
+        if heat_transfer:
+            files.append(self._generate_T(config))
+        
+        # Turbulence fields
+        turb_model = config.get('physics', {}).get('turbulence_model', 'kOmegaSST')
+        if turb_model not in ['laminar', None]:
+            if 'kOmega' in turb_model or 'SST' in turb_model:
+                files.append(self._generate_k(config))
+                files.append(self._generate_omega(config))
+            elif 'kEpsilon' in turb_model:
+                files.append(self._generate_k(config))
+                files.append(self._generate_epsilon(config))
+            files.append(self._generate_nut(config))
+        
+        result.final_text = "\n\n".join(files)
+        return result
+    
+    def _parse_config(self, requirements: str) -> dict:
+        """Extract validated config from requirements string."""
+        import json
+        import re
+        
+        # Try to find JSON block in requirements
+        json_match = re.search(r'```json\s*(.*?)\s*```', requirements, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+        
+        # Return default config if not found
+        return {
+            'physics': {'heat_transfer': False, 'turbulence_model': 'kOmegaSST'},
+            'solver': {'max_iterations': 1000},
+            'boundary_conditions': {},
+            'fluid': {'density': 1000, 'kinematic_viscosity': 1e-6},
+        }
+    
+    def _detect_solver(self, config: dict) -> str:
+        """Detect appropriate OpenFOAM solver (no buoyancy)."""
+        physics = config.get('physics', {})
+        time_scheme = physics.get('time_scheme', 'steady')
+        
+        # No buoyant solvers — simplify
+        return 'simpleFoam' if time_scheme == 'steady' else 'pimpleFoam'
+    
+    def _foam_header(self, class_name: str, object_name: str, location: str = "") -> str:
+        """Generate FoamFile header."""
+        loc = f'    location    "{location}";\n' if location else ""
+        return f'''FoamFile
+{{
+    version     2.0;
+    format      ascii;
+    class       {class_name};
+{loc}    object      {object_name};
+}}'''
+    
+    def _generate_control_dict(self, config: dict, solver: str) -> str:
+        """Generate system/controlDict."""
+        solver_config = config.get('solver', {})
+        max_iter = solver_config.get('max_iterations', 1000)
+        
+        return f'''```file:system/controlDict
+{self._foam_header("dictionary", "controlDict")}
+
+application     {solver};
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+endTime         {max_iter};
+deltaT          1;
+writeControl    timeStep;
+writeInterval   100;
+purgeWrite      0;
+writeFormat     ascii;
+writePrecision  8;
+writeCompression off;
+timeFormat      general;
+timePrecision   6;
+runTimeModifiable true;
+
+functions
+{{
+}}
+```'''
+    
+    def _generate_fv_schemes(self, config: dict, solver: str) -> str:
+        """Generate system/fvSchemes."""
+        heat_transfer = config.get('physics', {}).get('heat_transfer', False)
+        
+        div_schemes = '''    div(phi,U)      bounded Gauss linearUpwind grad(U);
+    div(phi,k)      bounded Gauss upwind;
+    div(phi,omega)  bounded Gauss upwind;
+    div(phi,epsilon) bounded Gauss upwind;
+    div((nuEff*dev2(T(grad(U))))) Gauss linear;'''
+        
+        if heat_transfer:
+            div_schemes += '''
+    div(phi,h)      bounded Gauss upwind;
+    div(phi,K)      bounded Gauss upwind;'''
+        
+        return f'''```file:system/fvSchemes
+{self._foam_header("dictionary", "fvSchemes")}
+
+ddtSchemes
+{{
+    default         steadyState;
+}}
+
+gradSchemes
+{{
+    default         Gauss linear;
+    grad(U)         cellLimited Gauss linear 1;
+}}
+
+divSchemes
+{{
+    default         none;
+{div_schemes}
+}}
+
+laplacianSchemes
+{{
+    default         Gauss linear corrected;
+}}
+
+interpolationSchemes
+{{
+    default         linear;
+}}
+
+snGradSchemes
+{{
+    default         corrected;
+}}
+
+wallDist
+{{
+    method meshWave;
+}}
+```'''
+    
+    def _generate_fv_solution(self, config: dict, solver: str) -> str:
+        """Generate system/fvSolution."""
+        solver_config = config.get('solver', {})
+        convergence = solver_config.get('convergence_criteria', 1e-5)
+        heat_transfer = config.get('physics', {}).get('heat_transfer', False)
+        
+        extra_solvers = ""
+        extra_residuals = ""
+        extra_relax = ""
+        
+        if heat_transfer:
+            extra_solvers = '''
+    h
+    {
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-8;
+        relTol          0.01;
+    }'''
+            extra_residuals = f'''
+        h               {convergence};'''
+            extra_relax = '''
+        h               0.7;'''
+        
+        return f'''```file:system/fvSolution
+{self._foam_header("dictionary", "fvSolution")}
+
+solvers
+{{
+    p
+    {{
+        solver          GAMG;
+        tolerance       1e-8;
+        relTol          0.01;
+        smoother        GaussSeidel;
+        nPreSweeps      0;
+        nPostSweeps     2;
+        cacheAgglomeration true;
+        nCellsInCoarsestLevel 10;
+        agglomerator    faceAreaPair;
+        mergeLevels     1;
+    }}
+
+    "(U|k|omega|epsilon)"
+    {{
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-8;
+        relTol          0.01;
+    }}{extra_solvers}
+}}
+
+SIMPLE
+{{
+    nNonOrthogonalCorrectors 0;
+    consistent      yes;
+    
+    residualControl
+    {{
+        p               {convergence};
+        U               {convergence};
+        k               {convergence};
+        omega           {convergence};
+        epsilon         {convergence};{extra_residuals}
+    }}
+}}
+
+relaxationFactors
+{{
+    fields
+    {{
+        p               0.3;
+    }}
+    equations
+    {{
+        U               0.7;
+        k               0.7;
+        omega           0.7;
+        epsilon         0.7;{extra_relax}
+    }}
+}}
+```'''
+    
+    def _generate_transport_properties(self, config: dict) -> str:
+        """Generate constant/transportProperties."""
+        fluid = config.get('fluid', {})
+        nu = fluid.get('kinematic_viscosity', 1e-6)
+        
+        return f'''```file:constant/transportProperties
+{self._foam_header("dictionary", "transportProperties")}
+
+transportModel  Newtonian;
+nu              [0 2 -1 0 0 0 0] {nu};
+```'''
+    
+    def _generate_turbulence_properties(self, config: dict) -> str:
+        """Generate constant/turbulenceProperties."""
+        physics = config.get('physics', {})
+        turb_model = physics.get('turbulence_model', 'kOmegaSST')
+        
+        if turb_model in ['laminar', None]:
+            sim_type = "laminar"
+            model_content = ""
+        else:
+            sim_type = "RAS"
+            model_content = f'''
+RAS
+{{
+    RASModel        {turb_model};
+    turbulence      on;
+    printCoeffs     on;
+}}'''
+        
+        return f'''```file:constant/turbulenceProperties
+{self._foam_header("dictionary", "turbulenceProperties")}
+
+simulationType  {sim_type};{model_content}
+```'''
+    
+    def _generate_thermophysical_properties(self, config: dict) -> str:
+        """Generate constant/thermophysicalProperties for heat transfer."""
+        fluid = config.get('fluid', {})
+        rho = fluid.get('density', 1000)
+        Cp = fluid.get('specific_heat', 4182)
+        k_thermal = fluid.get('thermal_conductivity', 0.6)
+        mu = fluid.get('dynamic_viscosity', 1e-3)
+        
+        return f'''```file:constant/thermophysicalProperties
+{self._foam_header("dictionary", "thermophysicalProperties")}
+
+thermoType
+{{
+    type            heRhoThermo;
+    mixture         pureMixture;
+    transport       const;
+    thermo          hConst;
+    equationOfState rhoConst;
+    specie          specie;
+    energy          sensibleEnthalpy;
+}}
+
+mixture
+{{
+    specie
+    {{
+        molWeight       28.9;
+    }}
+    equationOfState
+    {{
+        rho             {rho};
+    }}
+    thermodynamics
+    {{
+        Cp              {Cp};
+        Hf              0;
+    }}
+    transport
+    {{
+        mu              {mu};
+        Pr              {Cp * mu / k_thermal if k_thermal > 0 else 0.7};
+    }}
+}}
+```'''
+    
+    def _generate_U(self, config: dict) -> str:
+        """Generate 0/U velocity field."""
+        bcs = config.get('boundary_conditions', {})
+        
+        bc_entries = []
+        for patch_name, bc in bcs.items():
+            vel = bc.get('velocity', {})
+            vel_type = vel.get('type', 'zeroGradient')
+            vel_value = vel.get('value')
+            
+            if vel_type == 'noSlip':
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            noSlip;
+    }}''')
+            elif vel_type == 'fixedValue' and vel_value:
+                if isinstance(vel_value, list) and len(vel_value) >= 3:
+                    bc_entries.append(f'''    {patch_name}
+    {{
+        type            fixedValue;
+        value           uniform ({vel_value[0]} {vel_value[1]} {vel_value[2]});
+    }}''')
+                else:
+                    bc_entries.append(f'''    {patch_name}
+    {{
+        type            fixedValue;
+        value           uniform ({vel_value} 0 0);
+    }}''')
+            else:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            zeroGradient;
+    }}''')
+        
+        return f'''```file:0/U
+{self._foam_header("volVectorField", "U", "0")}
+
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (0 0 0);
+
+boundaryField
+{{
+{chr(10).join(bc_entries)}
+}}
+```'''
+    
+    def _generate_p(self, config: dict, solver: str) -> str:
+        """Generate 0/p pressure field."""
+        bcs = config.get('boundary_conditions', {})
+        
+        # Always use p (no buoyant solvers)
+        field_name = "p"
+        
+        bc_entries = []
+        for patch_name, bc in bcs.items():
+            pressure = bc.get('pressure', {})
+            p_type = pressure.get('type', 'zeroGradient')
+            p_value = pressure.get('value', 0)
+            
+            if p_type == 'fixedValue':
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            fixedValue;
+        value           uniform {p_value};
+    }}''')
+            else:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            zeroGradient;
+    }}''')
+        
+        return f'''```file:0/{field_name}
+{self._foam_header("volScalarField", field_name, "0")}
+
+dimensions      [0 2 -2 0 0 0 0];
+
+internalField   uniform 0;
+
+boundaryField
+{{
+{chr(10).join(bc_entries)}
+}}
+```'''
+    
+    def _generate_T(self, config: dict) -> str:
+        """Generate 0/T temperature field."""
+        bcs = config.get('boundary_conditions', {})
+        fluid = config.get('fluid', {})
+        T_ref = fluid.get('temperature', 300)
+        
+        bc_entries = []
+        for patch_name, bc in bcs.items():
+            temp = bc.get('temperature', {})
+            T_type = temp.get('type', 'zeroGradient')
+            T_value = temp.get('value', T_ref)
+            
+            if T_type == 'fixedValue':
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            fixedValue;
+        value           uniform {T_value};
+    }}''')
+            else:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            zeroGradient;
+    }}''')
+        
+        return f'''```file:0/T
+{self._foam_header("volScalarField", "T", "0")}
+
+dimensions      [0 0 0 1 0 0 0];
+
+internalField   uniform {T_ref};
+
+boundaryField
+{{
+{chr(10).join(bc_entries)}
+}}
+```'''
+    
+    def _generate_k(self, config: dict) -> str:
+        """Generate 0/k turbulent kinetic energy field."""
+        bcs = config.get('boundary_conditions', {})
+        
+        bc_entries = []
+        for patch_name, bc in bcs.items():
+            k_bc = bc.get('k', {})
+            k_type = k_bc.get('type', 'zeroGradient')
+            k_value = k_bc.get('value', 0.1)
+            
+            if k_type == 'fixedValue':
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            fixedValue;
+        value           uniform {k_value};
+    }}''')
+            elif 'WallFunction' in k_type:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            {k_type};
+        value           uniform {k_value};
+    }}''')
+            else:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            zeroGradient;
+    }}''')
+        
+        return f'''```file:0/k
+{self._foam_header("volScalarField", "k", "0")}
+
+dimensions      [0 2 -2 0 0 0 0];
+
+internalField   uniform 0.1;
+
+boundaryField
+{{
+{chr(10).join(bc_entries)}
+}}
+```'''
+    
+    def _generate_omega(self, config: dict) -> str:
+        """Generate 0/omega specific dissipation rate field."""
+        bcs = config.get('boundary_conditions', {})
+        
+        bc_entries = []
+        for patch_name, bc in bcs.items():
+            omega_bc = bc.get('omega', {})
+            omega_type = omega_bc.get('type', 'zeroGradient')
+            omega_value = omega_bc.get('value', 1)
+            
+            if omega_type == 'fixedValue':
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            fixedValue;
+        value           uniform {omega_value};
+    }}''')
+            elif 'WallFunction' in omega_type:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            {omega_type};
+        value           uniform {omega_value};
+    }}''')
+            else:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            zeroGradient;
+    }}''')
+        
+        return f'''```file:0/omega
+{self._foam_header("volScalarField", "omega", "0")}
+
+dimensions      [0 0 -1 0 0 0 0];
+
+internalField   uniform 1;
+
+boundaryField
+{{
+{chr(10).join(bc_entries)}
+}}
+```'''
+    
+    def _generate_epsilon(self, config: dict) -> str:
+        """Generate 0/epsilon turbulent dissipation field."""
+        bcs = config.get('boundary_conditions', {})
+        
+        bc_entries = []
+        for patch_name, bc in bcs.items():
+            eps_bc = bc.get('epsilon', {})
+            eps_type = eps_bc.get('type', 'zeroGradient')
+            eps_value = eps_bc.get('value', 0.01)
+            
+            if eps_type == 'fixedValue':
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            fixedValue;
+        value           uniform {eps_value};
+    }}''')
+            elif 'WallFunction' in eps_type:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            {eps_type};
+        value           uniform {eps_value};
+    }}''')
+            else:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            zeroGradient;
+    }}''')
+        
+        return f'''```file:0/epsilon
+{self._foam_header("volScalarField", "epsilon", "0")}
+
+dimensions      [0 2 -3 0 0 0 0];
+
+internalField   uniform 0.01;
+
+boundaryField
+{{
+{chr(10).join(bc_entries)}
+}}
+```'''
+    
+    def _generate_nut(self, config: dict) -> str:
+        """Generate 0/nut turbulent viscosity field."""
+        bcs = config.get('boundary_conditions', {})
+        
+        bc_entries = []
+        for patch_name, bc in bcs.items():
+            nut_bc = bc.get('nut', {})
+            nut_type = nut_bc.get('type', 'calculated')
+            nut_value = nut_bc.get('value', 0)
+            
+            if 'WallFunction' in nut_type:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            {nut_type};
+        value           uniform {nut_value};
+    }}''')
+            else:
+                bc_entries.append(f'''    {patch_name}
+    {{
+        type            calculated;
+        value           uniform 0;
+    }}''')
+        
+        return f'''```file:0/nut
+{self._foam_header("volScalarField", "nut", "0")}
+
+dimensions      [0 2 -1 0 0 0 0];
+
+internalField   uniform 0;
+
+boundaryField
+{{
+{chr(10).join(bc_entries)}
+}}
+```'''

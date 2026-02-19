@@ -400,10 +400,8 @@ class CFDLinter:
         is_transient = config.physics.time_scheme == TimeScheme.TRANSIENT
         is_thermal = config.physics.heat_transfer or case_type == "heat_transfer"
         
-        # Determine recommended solver
-        if is_thermal:
-            recommended_solver = "buoyantPimpleFoam" if is_transient else "buoyantSimpleFoam"
-        elif is_transient:
+        # Determine recommended solver (no buoyancy for now)
+        if is_transient:
             recommended_solver = "pimpleFoam"
         else:
             recommended_solver = "simpleFoam"
@@ -683,9 +681,17 @@ class CFDLinter:
             "mesh_resolution": "medium",
         }
         
-        # Add mesh info
+        # Add mesh info — include full mesh data with patch types for codegen
         if config.mesh:
-            validated["mesh"] = config.mesh.mesh_id
+            validated["mesh_id"] = config.mesh.mesh_id
+            validated["mesh"] = {
+                "mesh_id": config.mesh.mesh_id,
+                "file_name": config.mesh.file_name,
+                "patches": [
+                    {"name": p.name, "type": p.type, "n_faces": p.n_faces}
+                    for p in config.mesh.patches
+                ],
+            }
         
         # Add geometry
         if config.geometry:
