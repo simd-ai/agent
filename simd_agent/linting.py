@@ -670,12 +670,23 @@ class CFDLinter:
         turb_model: str | None,
     ) -> dict[str, Any]:
         """Build validated config dict for backward compatibility."""
+        # For steady-state solvers the relevant iteration count is
+        # solver.max_iterations; solver.end_time is a transient-only field
+        # (defaults to None).  We expose both so the codegen layer can pick
+        # whichever is set and fall back gracefully.
+        _max_iter = config.solver.max_iterations  # e.g. 500 from frontend
+        _end_time = config.solver.end_time or _max_iter or 1000
+
         validated = {
             "solver": solver or config.solver.type,
             "turbulence_model": turb_model or config.physics.turbulence_model or "kEpsilon",
             "time_stepping": config.physics.time_scheme.value,
             "write_interval": config.solver.write_interval,
-            "end_time": config.solver.end_time or 1000,
+            # max_iterations: the value the user explicitly set (or default 1000)
+            "max_iterations": _max_iter,
+            # end_time: for transient sims this is the physical end-time; for
+            # steady it mirrors max_iterations so the LLM always has a value.
+            "end_time": _end_time,
             "viscosity": config.fluid.kinematic_viscosity,
             "density": config.fluid.density,
             "mesh_resolution": "medium",

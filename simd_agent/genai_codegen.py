@@ -6,6 +6,7 @@ Includes post-generation validation to catch inconsistencies before
 sending to the simulation server.
 """
 
+import copy
 import json
 import logging
 import os
@@ -66,6 +67,11 @@ def validate_generated_files(
     # Get expected patch names from config
     bcs = config.get("boundary_conditions", {})
     expected_patches = set(bcs.keys())
+    
+    # Normalize: replace any "front_and_back" (snake_case artifact) with "frontAndBack"
+    if "front_and_back" in expected_patches:
+        expected_patches.discard("front_and_back")
+        expected_patches.add("frontAndBack")
     
     # Get physics
     physics = config.get("physics", {})
@@ -170,15 +176,28 @@ def validate_generated_files(
     mesh_patches_list = mesh_info.get("patches", []) if isinstance(mesh_info, dict) else []
     
     # ── Check 3c: Auto-add frontAndBack (empty) to 0/* files for 2D meshes ──
-    # If mesh has a frontAndBack patch of type empty, ensure all 0/* files include it.
-    # This is critical for 2D simulations from Gmsh.
+    # If mesh has a frontAndBack patch, ensure all 0/* files include it with type empty.
+    # frontAndBack is ALWAYS empty in 2D OpenFOAM simulations — regardless of what
+    # the mesh config says the type is (it might incorrectly say "patch").
     mesh_has_front_and_back = False
+    front_and_back_name = "frontAndBack"  # Canonical name
     if mesh_patches_list:
         for mp in mesh_patches_list:
             mp_name = mp.get("name", "") if isinstance(mp, dict) else getattr(mp, "name", "")
-            mp_type = mp.get("type", "") if isinstance(mp, dict) else getattr(mp, "type", "")
-            if mp_name.lower() == "frontandback" and mp_type == "empty":
+            name_lower = mp_name.lower().replace("_", "")
+            if name_lower in ("frontandback", "frontback"):
                 mesh_has_front_and_back = True
+                front_and_back_name = mp_name  # Use the actual name from mesh
+                break
+    
+    # Also check boundary_conditions keys for frontAndBack
+    if not mesh_has_front_and_back:
+        bcs = config.get("boundary_conditions", {})
+        for bc_name in bcs:
+            name_lower = bc_name.lower().replace("_", "")
+            if name_lower in ("frontandback", "frontback"):
+                mesh_has_front_and_back = True
+                front_and_back_name = "frontAndBack"  # Use canonical name
                 break
     
     if mesh_has_front_and_back:
@@ -224,14 +243,26 @@ def validate_generated_files(
     # ── Check 4b: Constraint type vs mesh patch type ──
     # 'empty' and 'symmetry' BCs can only be used if the mesh patch is actually that type.
     # If the mesh has a patch of type 'patch' or 'wall', using 'empty' or 'symmetry' will crash.
+    # EXCEPTION: frontAndBack is ALWAYS empty (2D constraint) — override any incorrect mesh type.
     if mesh_patches_list:
         # Build a map of patch_name -> mesh_type
         mesh_patch_types = {}
         for mp in mesh_patches_list:
             if isinstance(mp, dict):
-                mesh_patch_types[mp.get("name", "")] = mp.get("type", "patch")
+                mp_name = mp.get("name", "")
+                mp_type = mp.get("type", "patch")
             elif hasattr(mp, "name"):
-                mesh_patch_types[mp.name] = mp.type
+                mp_name = mp.name
+                mp_type = mp.type
+            else:
+                continue
+            
+            # Force well-known constraint patches to their correct type
+            name_lower = mp_name.lower().replace("_", "")
+            if name_lower in ("frontandback", "frontback", "defaultfaces"):
+                mp_type = "empty"
+            
+            mesh_patch_types[mp_name] = mp_type
         
         # Check all 0/* files for constraint type mismatches
         constraint_types = {"empty", "symmetry", "wedge", "cyclic", "processor"}
@@ -448,7 +479,52 @@ class GenAICodeGenerator:
         case_type: str,
     ) -> str:
         system_prompt = self._codegen_prompt
-        
+
+        # ── Strip irrelevant turbulence fields from boundary conditions ──
+        # The precheck service computes BOTH epsilon and omega values and puts
+        # them in every patch's BC even when only one is used by the solver.
+        # Sending the unused field to the LLM causes it to generate a spurious
+        # 0/epsilon (for kOmegaSST) or 0/omega (for kEpsilon) file.
+        turb_model = (
+            validated_config.get("physics", {}).get("turbulence_model") or ""
+        )
+        config_for_llm = copy.deepcopy(validated_config)
+        bcs = config_for_llm.get("boundary_conditions", {})
+        if isinstance(bcs, dict):
+            is_komega = "kOmega" in turb_model or "SST" in turb_model
+            is_kepsilon = "kEpsilon" in turb_model or "Epsilon" in turb_model
+            for patch_bc in bcs.values():
+                if not isinstance(patch_bc, dict):
+                    continue
+                turb = patch_bc.get("turbulence") if isinstance(patch_bc.get("turbulence"), dict) else patch_bc
+                if is_komega:
+                    # kOmegaSST uses k + omega; strip epsilon
+                    turb.pop("epsilon", None)
+                elif is_kepsilon:
+                    # kEpsilon uses k + epsilon; strip omega
+                    turb.pop("omega", None)
+
+        # ── Extract endTime for explicit injection into controlDict rule ──
+        # Priority order:
+        # 1. "end_time" top-level — set by linting._build_validated_config from
+        #    config.solver.end_time (parsed from frontend's camelCase "endTime").
+        #    This already falls back to max_iterations, so it is the single
+        #    source of truth for both steady and transient runs.
+        # 2. solver dict "endTime" / "end_time" (raw simulation_config, pre-linting)
+        # 3. "max_iterations" top-level (linting fallback when end_time is unset)
+        # 4. Hard default of 1000
+        solver_raw = config_for_llm.get("solver", {})
+        solver_cfg = solver_raw if isinstance(solver_raw, dict) else {}
+        max_iterations = (
+            config_for_llm.get("end_time")              # linting output (preferred)
+            or solver_cfg.get("endTime")                # raw camelCase from frontend
+            or solver_cfg.get("end_time")               # raw snake_case
+            or config_for_llm.get("max_iterations")     # linting fallback
+            or solver_cfg.get("max_iterations")         # raw simulation_config
+            or solver_cfg.get("maxIterations")
+            or 1000
+        )
+
         # Build mesh patch type info for the LLM
         mesh_patch_info = ""
         mesh_data = validated_config.get("mesh", {})
@@ -518,7 +594,7 @@ Generate a complete OpenFOAM case for the following simulation.
 
 ## Validated Configuration
 ```json
-{json.dumps(validated_config, indent=2, default=str)}
+{json.dumps(config_for_llm, indent=2, default=str)}
 ```
 
 ## Selected Solver: {solver}
@@ -535,6 +611,8 @@ Generate a complete OpenFOAM case for the following simulation.
 8. NEVER use `type symmetry;` unless the mesh patch type is `symmetry` or `symmetryPlane`
 9. Do NOT invent patch names like `front_and_back` — only use patches from the config
 10. If using a turbulence model (kOmegaSST, kEpsilon, etc.), fvSchemes MUST include: wallDist {{ method meshWave; }}
+11. controlDict MUST use `startFrom startTime; startTime 0;` — NEVER `startFrom latestTime`
+12. controlDict `endTime` MUST be exactly `{max_iterations}` — taken from `solver.max_iterations` in the config above
 
 Generate the OpenFOAM case files now:"""
         
@@ -558,7 +636,7 @@ Generate the OpenFOAM case files now:"""
         errors_str = "\n".join([
             f"- [{e.get('source', 'unknown')}] {e.get('error', 'Unknown error')}"
             + (f"\n  Details: {e.get('details', '')}" if e.get('details') else "")
-            + (f"\n  Stderr: {e.get('stderr', '')[:2000]}" if e.get('stderr') else "")
+            + (f"\n  Stderr:\n{e.get('stderr', '')}" if e.get('stderr') else "")
             for e in previous_errors
         ])
         

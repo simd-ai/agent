@@ -130,12 +130,29 @@ def normalize_mesh(raw: Any) -> MeshInfoV1 | None:
     
     # Parse patches
     patches = []
+    # Use ORIGINAL patches (before deep_convert_keys) to preserve patch names
+    raw_patches_orig = raw.get("patches", [])
     raw_patches = mesh_data.get("patches", [])
-    for p in raw_patches:
+    for i, p in enumerate(raw_patches):
         if isinstance(p, dict):
+            # Get the original patch name (before camel_to_snake conversion)
+            orig_p = raw_patches_orig[i] if i < len(raw_patches_orig) and isinstance(raw_patches_orig[i], dict) else p
+            p_name = orig_p.get("name", p.get("name", "unknown"))
+            
+            # Accept "patch_type", "patchType", or "type" for the patch type
+            p_type = (
+                p.get("patch_type") or p.get("type", "patch")
+            )
+            
+            # FORCE constraint patch types based on well-known names
+            # frontAndBack is ALWAYS empty in 2D OpenFOAM simulations
+            name_lower = p_name.lower().replace("_", "")
+            if name_lower in ("frontandback", "frontback", "defaultfaces"):
+                p_type = "empty"
+            
             patches.append(MeshPatchV1(
-                name=p.get("name", "unknown"),
-                type=p.get("type", "patch"),
+                name=p_name,
+                type=p_type,
                 n_faces=p.get("n_faces") or p.get("n_cells") or 0,
             ))
     
@@ -371,8 +388,52 @@ def infer_patch_type(patch_name: str) -> BoundaryType:
 
 
 def normalize_boundary_condition(raw: dict[str, Any], patch_name: str) -> BoundaryConditionV1:
-    """Normalize a single boundary condition."""
+    """Normalize a single boundary condition.
+    
+    Handles two formats:
+    1. Semantic: {"patch_type": "wall", "velocity": {"type": "noSlip"}, "pressure": {...}}
+    2. Per-field: {"U": {"type": "empty"}, "p": {"type": "empty"}, ...}
+    """
     data = deep_convert_keys(raw, camel_to_snake)
+    
+    # Detect per-field format (keys are field names like U, p, T, k, omega, nut)
+    field_names = {"u", "p", "t", "k", "omega", "nut", "epsilon"}
+    data_keys_lower = {k.lower() for k in data.keys()}
+    if data_keys_lower & field_names and not data.get("patch_type") and not data.get("velocity"):
+        # Per-field format — infer patch type from the field BCs
+        # If all fields have type "empty", it's an empty patch
+        all_types = set()
+        for k, v in data.items():
+            if isinstance(v, dict) and "type" in v:
+                all_types.add(v["type"].lower())
+        
+        if all_types == {"empty"}:
+            return BoundaryConditionV1(patch_type=BoundaryType.EMPTY)
+        if all_types == {"symmetry"}:
+            return BoundaryConditionV1(patch_type=BoundaryType.SYMMETRY)
+        
+        # Mixed types — try to extract velocity/pressure/temperature from field names
+        vel_data = data.get("u") or data.get("U")
+        pres_data = data.get("p")
+        temp_data = data.get("t") or data.get("T")
+        
+        # Rebuild in semantic format and recurse
+        semantic = {}
+        if vel_data and isinstance(vel_data, dict):
+            semantic["velocity"] = vel_data
+        if pres_data and isinstance(pres_data, dict):
+            semantic["pressure"] = pres_data
+        if temp_data and isinstance(temp_data, dict):
+            semantic["temperature"] = temp_data
+        
+        # Extract turbulence fields
+        for turb_key in ["k", "epsilon", "omega", "nut"]:
+            turb_data = data.get(turb_key)
+            if isinstance(turb_data, dict):
+                semantic[turb_key] = turb_data
+        
+        if semantic:
+            return normalize_boundary_condition(semantic, patch_name)
     
     # Determine patch type
     patch_type_raw = data.get("patch_type") or data.get("type") or data.get("suggested_type")
@@ -547,6 +608,25 @@ def normalize_config(raw_config: dict[str, Any]) -> tuple[SimulationConfigV1, st
     config = deep_convert_keys(raw_config, camel_to_snake)
     if raw_config != config:
         transformations.append("converted_camel_to_snake")
+    
+    # IMPORTANT: Restore original boundary_conditions keys.
+    # deep_convert_keys converts "frontAndBack" → "front_and_back", but these
+    # are OpenFOAM patch names (identifiers), not API field names.
+    # We must preserve the original patch names exactly.
+    raw_bcs = raw_config.get("boundary_conditions") or raw_config.get("boundaryConditions") or {}
+    if isinstance(raw_bcs, dict) and raw_bcs:
+        # Replace the snake_case-converted BC dict with original keys
+        converted_bcs = config.get("boundary_conditions", {})
+        if isinstance(converted_bcs, dict):
+            restored_bcs = {}
+            # Map snake_case keys back to original keys
+            orig_keys = list(raw_bcs.keys())
+            conv_keys = list(converted_bcs.keys())
+            for orig_key, conv_key in zip(orig_keys, conv_keys):
+                restored_bcs[orig_key] = converted_bcs[conv_key]
+            config["boundary_conditions"] = restored_bcs
+            if restored_bcs != converted_bcs:
+                transformations.append("restored_original_patch_names")
     
     # Normalize mesh
     mesh = normalize_mesh(config.get("mesh"))

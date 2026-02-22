@@ -233,10 +233,10 @@ class SimulationServerClient:
     
     async def get_status(self, run_id: str) -> SimRunInfo:
         """Get the current status of a simulation run.
-        
+
         Args:
             run_id: The simulation run ID
-            
+
         Returns:
             SimRunInfo with current status
         """

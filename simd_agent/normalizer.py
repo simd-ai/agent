@@ -82,6 +82,20 @@ def normalize_config(
     # First, convert all keys to snake_case
     config = deep_convert_keys(raw_config, camel_to_snake)
     
+    # IMPORTANT: Restore original boundary_conditions keys.
+    # deep_convert_keys converts "frontAndBack" → "front_and_back", but these
+    # are OpenFOAM patch names (identifiers), not API field names.
+    raw_bcs = raw_config.get("boundary_conditions") or raw_config.get("boundaryConditions") or {}
+    if isinstance(raw_bcs, dict) and raw_bcs:
+        converted_bcs = config.get("boundary_conditions", {})
+        if isinstance(converted_bcs, dict):
+            restored_bcs = {}
+            orig_keys = list(raw_bcs.keys())
+            conv_keys = list(converted_bcs.keys())
+            for orig_key, conv_key in zip(orig_keys, conv_keys):
+                restored_bcs[orig_key] = converted_bcs[conv_key]
+            config["boundary_conditions"] = restored_bcs
+    
     logger.debug(f"Normalizing config with keys: {list(config.keys())}")
     
     # Normalize mesh
@@ -157,9 +171,22 @@ def _normalize_mesh(config: dict[str, Any]) -> MeshInfoV1 | None:
     
     for p in raw_patches:
         if isinstance(p, dict):
+            p_name = p.get("name", "unknown")
+            # Accept "patch_type", "patchType", or "type" for the patch type
+            p_type = (
+                p.get("patch_type") or p.get("patchType") or
+                p.get("type", "patch")
+            )
+            
+            # FORCE constraint patch types based on well-known names
+            # frontAndBack is ALWAYS empty in 2D OpenFOAM simulations
+            name_lower = p_name.lower().replace("_", "")
+            if name_lower in ("frontandback", "frontback", "defaultfaces"):
+                p_type = "empty"
+            
             patches.append(MeshPatchV1(
-                name=p.get("name", "unknown"),
-                type=p.get("type", "patch"),
+                name=p_name,
+                type=p_type,
                 n_faces=p.get("n_faces") or p.get("nFaces") or p.get("n_cells") or p.get("nCells") or 0,
             ))
         elif isinstance(p, str):

@@ -1,8 +1,11 @@
 # simd_agent/orchestration.py
 """Main orchestration logic for CFD workflows."""
 
+import io
 import json
 import logging
+import re
+import zipfile
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -370,9 +373,15 @@ class Orchestrator:
         
         logger.info(f"[CODEGEN] Using solver: {solver}")
         
-        # Get mesh_id from simulation config
-        mesh_config = self.request.simulation_config.get("mesh", {})
-        mesh_id = mesh_config.get("mesh_id") or mesh_config.get("meshId")
+        # Get mesh_id from simulation config.
+        # simulation_config["mesh"] can be a dict or a bare mesh-ID string.
+        mesh_raw = self.request.simulation_config.get("mesh", {})
+        mesh_config = mesh_raw if isinstance(mesh_raw, dict) else {}
+        mesh_id = (
+            mesh_config.get("mesh_id")
+            or mesh_config.get("meshId")
+            or (mesh_raw if isinstance(mesh_raw, str) else None)
+        )
         
         # Step 4: Self-healing loop
         while self._retries <= max_retries:
@@ -392,6 +401,22 @@ class Orchestrator:
                 if self._current_files and self._retries > 0:
                     files = merge_files(self._current_files, files)
                 
+                # ── Codegen debug report — show endTime from generated controlDict ──
+                _ctrl = files.get("system/controlDict", "")
+                _end_time_match = re.search(r"endTime\s+([\d.eE+\-]+)", _ctrl)
+                _start_from_match = re.search(r"startFrom\s+(\S+?)\s*;", _ctrl)
+                _start_time_match = re.search(r"startTime\s+([\d.eE+\-]+)", _ctrl)
+                _vconfig = self._lint_result.validated_config if self._lint_result else {}
+                print("=" * 70)
+                print("🕐 CONTROLDICT / ENDTIME REPORT")
+                print(f"  Iteration              : {self._iteration}")
+                print(f"  validated_config.max_iterations: {_vconfig.get('max_iterations', '<not set>')}")
+                print(f"  validated_config.end_time      : {_vconfig.get('end_time', '<not set>')}")
+                print(f"  LLM-generated endTime  : {_end_time_match.group(1) if _end_time_match else '⚠️  NOT FOUND in controlDict'}")
+                print(f"  LLM-generated startFrom: {_start_from_match.group(1) if _start_from_match else '⚠️  NOT FOUND'}")
+                print(f"  LLM-generated startTime: {_start_time_match.group(1) if _start_time_match else '⚠️  NOT FOUND'}")
+                print("=" * 70)
+
                 # ── Post-generation validation ──
                 logger.info(f"[CODEGEN] Validating {len(files)} generated files...")
                 files, validation_issues = validate_generated_files(
@@ -425,58 +450,125 @@ class Orchestrator:
                         code_result,
                         solver=solver,
                     )
-                
+
+                # ── ZIP debug report ─────────────────────────────────────────
+                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as _zf:
+                    _zip_names = _zf.namelist()
+                _has_msh    = any(n.endswith((".msh", ".cas", ".cgns", ".unv", ".neu")) for n in _zip_names)
+                _has_poly   = any("polyMesh" in n for n in _zip_names)
+                _has_block  = any(n.endswith("blockMeshDict") for n in _zip_names)
+                _mesh_in_zip = _has_msh or _has_poly or _has_block
+
+                _raw_mesh_val = self.request.simulation_config.get("mesh", "<not set>")
+                print("=" * 70)
+                print("📦 ZIP PACKAGE REPORT")
+                print(f"  mesh_id extracted : {mesh_id!r}")
+                print(f"  simulation_config['mesh'] raw value: {_raw_mesh_val!r}")
+                print(f"  ZIP size          : {len(zip_bytes):,} bytes")
+                print(f"  ZIP file count    : {len(_zip_names)}")
+                print(f"  Files in ZIP      : {_zip_names}")
+                print(f"  Has .msh/.cas/etc : {_has_msh}")
+                print(f"  Has polyMesh/     : {_has_poly}")
+                print(f"  Has blockMeshDict : {_has_block}")
+                print(f"  ✅ Mesh present    : {_mesh_in_zip}")
+                print("=" * 70)
+
+                # ── Fail-fast if mesh_id was provided but mesh is missing ───
+                # package_simulation_case silently drops the mesh when storage
+                # lookup fails.  Catch this here so we don't waste all 3 retry
+                # slots submitting a ZIP that the sim server will reject with 400.
+                if mesh_id and not _mesh_in_zip:
+                    raise OrchestrationError(
+                        f"Mesh '{mesh_id}' not found in storage — the ZIP contains "
+                        "no mesh source (no .msh file, no polyMesh/, no blockMeshDict). "
+                        "Check that the mesh was uploaded successfully and the mesh_id "
+                        "sent by the frontend matches the upload response's 'meshId'."
+                    )
+
                 await self.event_bus.emit_codegen_complete(
                     self._iteration,
                     len(zip_bytes),
                 )
                 
-                # ── Submit to simulation server (TEST mode) ──
+                # ── Submit to simulation server (TEST mode — 1 iteration) ──
+                # TEST mode is used here for fast validation during the self-healing
+                # loop; the server patches controlDict to endTime=1 so errors are
+                # caught cheaply.  On success we immediately run the full simulation.
                 sim_result = await self._run_on_sim_server(
                     zip_bytes,
                     mode=SimRunMode.TEST,
                 )
                 
                 if sim_result["success"]:
-                    # Test passed!
-                    artifacts = sim_result.get("artifacts", [])
-                    await self.event_bus.emit_run_succeeded(
-                        f"Case validated successfully after {self._iteration} iteration(s)",
-                        artifacts,
+                    # ── TEST passed → automatically run the FULL simulation ──
+                    # The generated controlDict already has the correct endTime
+                    # (from validated_config.solver.max_iterations).  FULL mode
+                    # lets the solver run to that endTime without any patching.
+                    logger.info(
+                        f"[CODEGEN] Test validation passed (iter {self._iteration}). "
+                        "Starting full simulation run..."
                     )
-                    
-                    await self.store.finalize_run(
-                        run_id=self.run_id,
-                        status=RunStatus.SUCCEEDED,
-                        validated_config=self._lint_result.validated_config,
-                        result={
-                            "artifacts": artifacts,
-                            "iterations": self._iteration,
-                            "solver": solver,
-                        },
-                        attempts=self._iteration,
+                    await self.event_bus.emit(
+                        "full_run_started",
+                        message="Test validation passed — starting full simulation",
+                        payload={"solver": solver, "iteration": self._iteration},
                     )
-                    
-                    await self.event_bus.emit_final(
-                        status="succeeded",
-                        validated_config=self._lint_result.validated_config,
-                        artifacts=artifacts,
-                        iterations=self._iteration,
-                        retries=self._retries,
-                        summary="Case validated successfully",
-                        case_type=case_type,
-                        solver=solver,
+
+                    full_result = await self._run_on_sim_server(
+                        zip_bytes,
+                        mode=SimRunMode.FULL,
                     )
-                    
-                    return FinalResult(
-                        status=RunStatus.SUCCEEDED,
-                        validated_config=self._lint_result.validated_config,
-                        artifacts=[],
-                        iterations=self._iteration,
-                        retries=self._retries,
-                        case_type=case_type,
-                        solver=solver,
-                    )
+
+                    artifacts = full_result.get("artifacts", [])
+
+                    if full_result["success"]:
+                        await self.event_bus.emit_run_succeeded(
+                            f"Simulation completed after {self._iteration} codegen iteration(s)",
+                            artifacts,
+                        )
+
+                        await self.store.finalize_run(
+                            run_id=self.run_id,
+                            status=RunStatus.SUCCEEDED,
+                            validated_config=self._lint_result.validated_config,
+                            result={
+                                "artifacts": artifacts,
+                                "iterations": self._iteration,
+                                "solver": solver,
+                            },
+                            attempts=self._iteration,
+                        )
+
+                        await self.event_bus.emit_final(
+                            status="succeeded",
+                            validated_config=self._lint_result.validated_config,
+                            artifacts=artifacts,
+                            iterations=self._iteration,
+                            retries=self._retries,
+                            summary="Simulation completed successfully",
+                            case_type=case_type,
+                            solver=solver,
+                        )
+
+                        return FinalResult(
+                            status=RunStatus.SUCCEEDED,
+                            validated_config=self._lint_result.validated_config,
+                            artifacts=artifacts,
+                            iterations=self._iteration,
+                            retries=self._retries,
+                            case_type=case_type,
+                            solver=solver,
+                        )
+                    else:
+                        # Full run failed even though test passed.
+                        # Treat it like a normal simulation failure and let
+                        # the self-healing loop try to fix it.
+                        logger.warning(
+                            "[CODEGEN] Full simulation failed after test passed: "
+                            f"{full_result.get('error')}"
+                        )
+                        # Fall through to the failure-handling block below
+                        sim_result = full_result
                 
                 # ── Simulation failed — prepare for retry ──
                 sim_error = sim_result.get("error", "Unknown error")
@@ -511,13 +603,17 @@ class Orchestrator:
                 
                 logger.warning(f"[CODEGEN] Simulation failed (attempt {self._retries}/{max_retries}): {sim_error}")
                 
-                # Store error for context in next LLM call
+                # Store error for context in next LLM call.
+                # The new simulation server emits solver output via the
+                # run_failed payload's "stderr" key rather than run_log events,
+                # so sim_logs may be empty.  Fall back to sim_stderr so the LLM
+                # always gets the actual OpenFOAM error text.
                 self._previous_errors.append({
                     "iteration": self._iteration,
                     "source": "simulation_server",
                     "error": sim_error,
-                    "details": sim_logs[-3000:] if sim_logs else "",
-                    "stderr": sim_stderr[:2000] if sim_stderr else "",
+                    "details": sim_logs[-3000:] if sim_logs else sim_stderr[-3000:],
+                    "stderr": sim_stderr[:5000] if sim_stderr else "",
                     "exit_code": sim_exit_code,
                 })
                 
@@ -697,6 +793,15 @@ class Orchestrator:
                 for patch_name, bc in bcs.items():
                     patch_type = bc.patch_type.value if isinstance(bc.patch_type, BoundaryType) else str(bc.patch_type)
                     parts.append(f"\n### Patch: {patch_name} (type: {patch_type})")
+                    
+                    # Empty/symmetry constraint patches — ALL fields must use this type
+                    if patch_type == "empty":
+                        parts.append(f"\n- **ALL fields** (U, p, T, k, omega, nut, epsilon): type=empty")
+                        parts.append(f"\n  (This is a constraint patch — every field file MUST have `{patch_name} {{ type empty; }}`)")
+                        continue
+                    if patch_type == "symmetry":
+                        parts.append(f"\n- **ALL fields**: type=symmetry")
+                        continue
                     
                     if bc.velocity:
                         vel_vec = bc.velocity.get_velocity_vector()
@@ -1151,10 +1256,10 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
                     "duration_seconds": final_status.duration_seconds,
                 }
             else:
-                # Build comprehensive error message for self-healing
+                # Build comprehensive error message for self-healing.
+                # NOTE: stderr is already fully accumulated via on_sim_event →
+                # stderr_collected, so do NOT overwrite it here.
                 error_msg = final_status.error or "Simulation failed"
-                if final_event and final_event.payload.get("stderr"):
-                    stderr = final_event.payload.get("stderr", "")[:2000]
                 
                 await self.event_bus.emit_sim_failed(
                     sim_run_id=sim_run_id,
@@ -1184,31 +1289,6 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
                 "stderr": "\n".join(stderr_collected),
             }
 
-
-class MockCodeGenerator:
-    """Mock code generator for testing without codegen."""
-    
-    def generate(self, context: Any) -> Any:
-        """Generate mock result."""
-        class MockResult:
-            final_text = ""
-            extracted_code_blocks = []
-        
-        result = MockResult()
-        # Return minimal OpenFOAM case
-        result.final_text = '''```file:system/controlDict
-FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }
-application simpleFoam;
-startFrom startTime;
-startTime 0;
-stopAt endTime;
-endTime 100;
-deltaT 1;
-writeControl timeStep;
-writeInterval 10;
-```
-'''
-        return result
 
 
 class OpenFOAMCaseGenerator:

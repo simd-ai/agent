@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 
 # --- Enums ---
@@ -146,14 +146,40 @@ class PhysicsV1(BaseModel):
 
 
 class SolverV1(BaseModel):
-    """Solver settings."""
+    """Solver settings.
+
+    The frontend sends camelCase keys (endTime, deltaT, maxIterations) while the
+    rest of the codebase uses snake_case.  AliasChoices lets Pydantic accept
+    either spelling; populate_by_name=True means the Python attribute name also
+    works (useful for internal construction and tests).
+    """
     type: str = Field(default="simpleFoam", description="OpenFOAM solver application")
-    max_iterations: int = Field(default=1000, gt=0, description="Maximum iterations")
-    convergence_criteria: float = Field(default=1e-6, gt=0, description="Convergence residual")
-    end_time: float | None = Field(default=None, gt=0, description="End time (transient)")
-    delta_t: float | None = Field(default=None, gt=0, description="Time step (transient)")
-    write_interval: int = Field(default=100, gt=0, description="Write interval")
-    
+    max_iterations: int = Field(
+        default=1000, gt=0,
+        validation_alias=AliasChoices("max_iterations", "maxIterations"),
+        description="Maximum iterations",
+    )
+    convergence_criteria: float = Field(
+        default=1e-6, gt=0,
+        validation_alias=AliasChoices("convergence_criteria", "convergenceCriteria"),
+        description="Convergence residual",
+    )
+    end_time: float | None = Field(
+        default=None, gt=0,
+        validation_alias=AliasChoices("end_time", "endTime"),
+        description="End time — physical seconds for transient, iteration count for steady",
+    )
+    delta_t: float | None = Field(
+        default=None, gt=0,
+        validation_alias=AliasChoices("delta_t", "deltaT"),
+        description="Time step (transient)",
+    )
+    write_interval: int = Field(
+        default=100, gt=0,
+        validation_alias=AliasChoices("write_interval", "writeInterval"),
+        description="Write interval",
+    )
+
     class Config:
         populate_by_name = True
 

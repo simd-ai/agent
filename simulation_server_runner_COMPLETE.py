@@ -5,6 +5,7 @@ COPY THIS TO YOUR SIMULATION SERVER's app/runner.py
 """
 
 import asyncio
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,152 @@ from app.openfoam import (
     patch_control_dict_for_test,
 )
 
+
+# ── Boundary-type fix helpers ────────────────────────────────────────────────
+
+_WALL_RE     = re.compile(r'wall',                                     re.IGNORECASE)
+_EMPTY_RE    = re.compile(r'(frontandback|front_and_back|frontback|front|back|side|empty)', re.IGNORECASE)
+_SYMMETRY_RE = re.compile(r'symmetr',                                  re.IGNORECASE)
+
+_FOAM_KEYWORDS = {
+    "FoamFile", "version", "format", "class", "location", "object", "arch", "note",
+}
+
+
+def _patch_target(name: str) -> Tuple[str, Optional[str]]:
+    """Return (openfoam_type, inGroups_label) for a given patch name.
+
+    Heuristics (case-insensitive):
+      name contains "wall"                       → wall,     "wall"
+      name contains front/back/side/empty etc.   → empty,    "empty"
+      name contains "symmetr"                    → symmetry, "symmetry"
+      anything else                              → patch,    None
+    """
+    n = name.lower()
+    if _WALL_RE.search(n):
+        return "wall", "wall"
+    if _EMPTY_RE.search(n):
+        return "empty", "empty"
+    if _SYMMETRY_RE.search(n):
+        return "symmetry", "symmetry"
+    return "patch", None
+
+
+def fix_boundary_types(boundary_file: Path) -> int:
+    """Correct patch types in ``constant/polyMesh/boundary`` after gmshToFoam.
+
+    ``gmshToFoam`` (and most OpenFOAM mesh converters) write every patch with::
+
+        type            patch;
+        physicalType    patch;
+
+    OpenFOAM requires proper types for walls and 2-D empty patches, e.g.::
+
+        wall
+        {
+            type            wall;
+            inGroups        1(wall);
+            nFaces          …;
+            startFace       …;
+        }
+        frontAndBack
+        {
+            type            empty;
+            inGroups        1(empty);
+            nFaces          …;
+            startFace       …;
+        }
+
+    This function rewrites the boundary file in-place using a line-by-line
+    state machine so it handles arbitrary whitespace safely.
+
+    Returns the number of patches whose ``type`` was changed.
+    """
+    if not boundary_file.exists():
+        return 0
+
+    text = boundary_file.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    out: list = []
+    i = 0
+    fixes = 0
+
+    while i < len(lines):
+        raw = lines[i]
+        tok = raw.strip()
+
+        # A patch-name line is a bare identifier (no digits, parens, slashes …)
+        # immediately followed by a line that is just "{".
+        if (
+            tok
+            and re.fullmatch(r"[A-Za-z_]\w*", tok)
+            and tok not in _FOAM_KEYWORDS
+            and i + 1 < len(lines)
+            and lines[i + 1].strip() == "{"
+        ):
+            patch_name = tok
+            target_type, ingroups = _patch_target(patch_name)
+
+            # Emit patch-name line and opening brace unchanged
+            out.append(raw)
+            out.append(lines[i + 1])
+            i += 2
+
+            # Collect body lines until the closing "}"
+            body: list = []
+            while i < len(lines) and lines[i].strip() != "}":
+                body.append(lines[i])
+                i += 1
+            closing = lines[i] if i < len(lines) else "}\n"
+            i += 1
+
+            # Determine whether the file already has the correct type
+            old_type: Optional[str] = None
+            for bl in body:
+                m = re.match(r"\s*type\s+(\w+)\s*;", bl)
+                if m:
+                    old_type = m.group(1)
+                    break
+
+            needs_fix = (
+                old_type != target_type
+                or any(re.match(r"\s*physicalType\s", bl) for bl in body)
+            )
+
+            if needs_fix:
+                new_body: list = []
+                for bl in body:
+                    # Drop physicalType — it's a Gmsh artefact, not needed by OpenFOAM
+                    if re.match(r"\s*physicalType\s", bl):
+                        continue
+                    # Drop any existing inGroups — we'll re-add the correct one
+                    if re.match(r"\s*inGroups\s", bl):
+                        continue
+                    # Replace the type line and insert inGroups right after it
+                    if re.match(r"\s*type\s+", bl):
+                        indent = re.match(r"^(\s*)", bl).group(1)
+                        new_body.append(f"{indent}type            {target_type};\n")
+                        if ingroups:
+                            new_body.append(f"{indent}inGroups        1({ingroups});\n")
+                        continue
+                    new_body.append(bl)
+                body = new_body
+                fixes += 1
+
+            out.extend(body)
+            out.append(closing)
+            continue
+
+        out.append(raw)
+        i += 1
+
+    if fixes:
+        boundary_file.write_text("".join(out), encoding="utf-8")
+
+    return fixes
+
+
+# ── Mesh-file detection ──────────────────────────────────────────────────────
 
 def detect_mesh_file(case_dir: Path) -> Tuple[Optional[Path], Optional[str]]:
     """
@@ -198,8 +345,19 @@ async def run_simulation(run_id: str, case_dir: Path, mode: RunMode):
                     "had_warnings": exit_code != 0,
                 }
             )
-            
-            # ─── Post-mesh-conversion fixes ───
+
+            # ─── Fix boundary types (gmshToFoam sets everything to "patch") ───
+            boundary_file = poly_mesh_dir / "boundary"
+            n_fixed = fix_boundary_types(boundary_file)
+            if n_fixed:
+                emit_event(
+                    run_id, "boundary_types_fixed",
+                    f"Fixed boundary types for {n_fixed} patch(es) "
+                    "(wall → type wall, frontAndBack → type empty, etc.)",
+                    payload={"patches_fixed": n_fixed},
+                )
+
+            # ─── Post-mesh-conversion fixes (optional shell script) ───────────
             # Run fix_mesh_setup.sh if it exists (fixes boundary types, wallDist, etc.)
             fix_script = case_dir / "fix_mesh_setup.sh"
             if fix_script.exists():

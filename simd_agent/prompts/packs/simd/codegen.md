@@ -129,7 +129,7 @@ Place it at the end of fvSchemes, after `snGradSchemes`. Without this, OpenFOAM 
 2. **Patch Names**: Use the EXACT patch names from the validated_config — these match the mesh.
 3. **Physical Values**: Use values from the validated_config (density, viscosity, etc.).
 4. **Conservative Settings**: Use relaxation factors 0.3 for p, 0.7 for U/k/omega/epsilon.
-5. **Short Runtime**: Set endTime for validation (100-1000 iterations for steady).
+5. **End Time**: Set `endTime` to the value of `solver.max_iterations` from the validated_config. Always use `startFrom startTime; startTime 0;` in controlDict.
 6. **Dimensions**: Always include correct OpenFOAM dimensions arrays.
 
 ## Pressure Dimensions
