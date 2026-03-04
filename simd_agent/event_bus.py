@@ -344,31 +344,106 @@ class EventBus:
             },
         )
     
-    async def emit_codegen_started(self, iteration: int) -> AgentEvent:
-        """Emit codegen started event."""
+    async def emit_codegen_started(
+        self,
+        iteration: int,
+        patching_files: list[str] | None = None,
+    ) -> AgentEvent:
+        """Emit codegen started event.
+
+        Args:
+            iteration: Current generation iteration number.
+            patching_files: If set, this is a targeted patch run — only these
+                files will be re-generated.  The frontend should show a diff
+                indicator instead of a full-replace spinner.
+        """
+        mode = "patch" if patching_files else "full"
         return await self.emit_info(
             EventTypes.CODEGEN_STARTED,
-            f"Code generation started (iteration {iteration})",
-            {"iteration": iteration},
+            f"Code generation started (iteration {iteration}, mode={mode})",
+            {
+                "iteration": iteration,
+                "mode": mode,
+                "patching_files": patching_files or [],
+            },
         )
-    
+
     async def emit_codegen_iteration(
         self,
         iteration: int,
         files_generated: list[str],
+        patching_files: list[str] | None = None,
     ) -> AgentEvent:
         """Emit codegen iteration event.
-        
+
         The frontend expects files as objects with a 'path' property:
         [{"path": "system/controlDict"}, {"path": "0/U"}, ...]
+
+        Args:
+            patching_files: If set, only these files were re-generated this
+                iteration.  The frontend must update *only* these files in its
+                file list rather than replacing everything.
         """
         files_as_objects = [{"path": f} for f in files_generated]
+        mode = "patch" if patching_files else "full"
         return await self.emit_info(
             EventTypes.CODEGEN_ITERATION,
-            f"Generated {len(files_generated)} files",
-            {"iteration": iteration, "files": files_as_objects},
+            f"Generated {len(files_generated)} files (mode={mode})",
+            {
+                "iteration": iteration,
+                "mode": mode,
+                "patching_files": patching_files or [],
+                "files": files_as_objects,
+            },
         )
-    
+
+    async def emit_file_generating(
+        self,
+        path: str,
+        iteration: int,
+        mode: str = "full",
+    ) -> AgentEvent:
+        """Emit event when a single file's LLM call starts.
+
+        Args:
+            mode: "full" for initial/error-recovery generation,
+                  "patch" when only specific files are being updated.
+        """
+        return await self.emit_info(
+            EventTypes.FILE_GENERATING,
+            f"Generating {path}…",
+            {"path": path, "iteration": iteration, "mode": mode, "status": "generating"},
+        )
+
+    async def emit_file_generated(
+        self,
+        path: str,
+        content: str,
+        iteration: int,
+        char_count: int,
+        mode: str = "full",
+    ) -> AgentEvent:
+        """Emit event when a single file has been generated (with content).
+
+        Args:
+            mode: "full" for initial/error-recovery generation,
+                  "patch" when only specific files are being updated.
+                  The frontend uses this to decide whether to diff-update or
+                  full-replace the file card.
+        """
+        return await self.emit_info(
+            EventTypes.FILE_GENERATED,
+            f"Generated {path} ({char_count} chars)",
+            {
+                "path": path,
+                "content": content,
+                "iteration": iteration,
+                "char_count": char_count,
+                "mode": mode,
+                "status": "generated",
+            },
+        )
+
     async def emit_codegen_complete(
         self,
         iteration: int,

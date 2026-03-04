@@ -1,6 +1,7 @@
 # simd_agent/db.py
 """Async database engine and session management using SQLAlchemy 2.0."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -178,9 +179,23 @@ async def init_db() -> None:
 
 
 async def close_db() -> None:
-    """Close database connections."""
+    """Close database connections.
+
+    Uses a short timeout so that a slow or unreachable remote DB (e.g. Neon)
+    during Ctrl+C shutdown doesn't block the process for 60 seconds and print
+    a noisy TimeoutError traceback.  Any connection that can't be closed within
+    the timeout is abandoned — the OS will clean it up.
+    """
     global _engine, _session_factory
     if _engine is not None:
-        await _engine.dispose()
-        _engine = None
-        _session_factory = None
+        try:
+            await asyncio.wait_for(_engine.dispose(), timeout=3.0)
+        except (asyncio.TimeoutError, Exception):
+            # Best-effort: force the pool closed without waiting for TCP teardown
+            try:
+                _engine.sync_engine.pool.dispose()
+            except Exception:
+                pass
+        finally:
+            _engine = None
+            _session_factory = None

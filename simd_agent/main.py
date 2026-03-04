@@ -5,15 +5,18 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
-from simd_agent.db import close_db, init_db
+# DB persistence disabled — frontend handles its own storage
+# from simd_agent.db import close_db, init_db
 
 # Try to import mesh module (may fail on some Python versions due to VTK compatibility)
 MESH_ENABLED = False
@@ -26,14 +29,13 @@ except ImportError as e:
     STORAGE_DIR = None
 from simd_agent.event_bus import EventBus
 from simd_agent.models import (
-    AgentEvent,
-    EventLevel,
     EventTypes,
     RunStatus,
     StartRequest,
 )
 from simd_agent.orchestration import Orchestrator
 from simd_agent.settings import get_settings
+from simd_agent.simulation_server_client import SimulationServerClient, SimulationServerError
 from simd_agent.store import EventStore
 
 # Configure logging
@@ -61,9 +63,12 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown
+    # Shutdown — best-effort, never let DB close errors surface as tracebacks
     logger.info("Shutting down simd_agent service...")
-    await close_db()
+    try:
+        await close_db()
+    except Exception as e:
+        logger.debug(f"DB close suppressed during shutdown: {e}")
 
 
 # Create FastAPI app
@@ -104,6 +109,7 @@ async def root() -> dict[str, Any]:
     endpoints = {
         "websocket": "/ws/run",
         "precheck": "/api/precheck",
+        "precheck_stream": "/ws/precheck",
         "runs": "/runs/{run_id}",
         "events": "/runs/{run_id}/events",
     }
@@ -181,7 +187,13 @@ async def precheck(request: dict[str, Any]):
     try:
         # Parse and validate request
         precheck_request = PrecheckRequest(**request)
-        
+
+        # Human-friendly prompt validation (empty prompt without mesh, etc.)
+        validation_error = precheck_request.validate_prompt()
+        if validation_error:
+            service = get_precheck_service()
+            return service._create_friendly_error_response(validation_error).model_dump(by_alias=True)
+
         # Get precheck service and analyze
         service = get_precheck_service()
         response = await service.analyze(precheck_request)
@@ -260,6 +272,85 @@ async def precheck(request: dict[str, Any]):
         return fallback.model_dump(by_alias=True)
 
 
+@app.websocket("/ws/precheck")
+async def websocket_precheck(websocket: WebSocket):
+    """WebSocket endpoint for streaming precheck analysis with thinking.
+
+    Protocol
+    --------
+    1. Client connects.
+    2. Client sends PrecheckRequest JSON as the first message.
+    3. Server streams a sequence of typed event messages:
+
+       {"type": "start"}
+       {"type": "thought",        "text": "<incremental reasoning text>"}   # streamed live
+       {"type": "spec_generating"}                                            # once
+       {"type": "spec",           "data": {<PrecheckResponse camelCase>}}    # once
+       {"type": "done"}
+
+       On error:
+       {"type": "error", "message": "<description>"}
+       {"type": "done"}
+
+    4. Server closes connection after "done".
+    """
+    from simd_agent.precheck import get_precheck_service
+    from simd_agent.precheck_models import PrecheckRequest
+
+    await websocket.accept()
+    logger.info("[WS/precheck] New connection accepted")
+    print("[WS/precheck] ✓ WebSocket accepted — waiting for request JSON...", flush=True)
+
+    try:
+        # ── Receive request (30 s timeout) ───────────────────────────────────
+        try:
+            data = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
+            print(f"[WS/precheck] ✓ Request received — prompt={str(data.get('prompt',''))[:80]!r}", flush=True)
+        except asyncio.TimeoutError:
+            print("[WS/precheck] ✗ Timeout: client never sent request JSON", flush=True)
+            await websocket.send_json({"type": "error", "message": "Timeout waiting for request"})
+            await websocket.send_json({"type": "done"})
+            await websocket.close(code=1008)
+            return
+
+        try:
+            request = PrecheckRequest(**data)
+            print(f"[WS/precheck] ✓ PrecheckRequest parsed OK — has_mesh={request.has_mesh}", flush=True)
+        except Exception as e:
+            print(f"[WS/precheck] ✗ PrecheckRequest parse failed: {e}", flush=True)
+            await websocket.send_json({"type": "error", "message": f"Invalid request: {e}"})
+            await websocket.send_json({"type": "done"})
+            await websocket.close(code=1003)
+            return
+
+        # ── Stream events from the service ───────────────────────────────────
+        print("[WS/precheck] → Calling analyze_stream...", flush=True)
+        service = get_precheck_service()
+        async for event in service.analyze_stream(request):
+            etype = event.get("type")
+            if etype != "thought":  # skip noisy streaming text
+                print(f"[WS/precheck]   event={etype}", flush=True)
+            await websocket.send_json(event)
+            if etype == "done":
+                break
+        print("[WS/precheck] ✓ Stream complete", flush=True)
+
+    except WebSocketDisconnect:
+        logger.info("[WS/precheck] Client disconnected")
+    except Exception as e:
+        logger.exception(f"[WS/precheck] Unhandled error: {e}")
+        try:
+            await websocket.send_json({"type": "error", "message": str(e)})
+            await websocket.send_json({"type": "done"})
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @app.websocket("/ws/run")
 async def websocket_run(websocket: WebSocket):
     """WebSocket endpoint for CFD workflow execution.
@@ -304,7 +395,7 @@ async def websocket_run(websocket: WebSocket):
         logger.info(f"[WS]   provider: {data.get('provider')}")
         logger.info(f"[WS]   prompt_pack: {data.get('prompt_pack')}")
         logger.info(f"[WS]   user_requirements: {data.get('user_requirements', '')}")
-        logger.info(f"[WS]   simulation_config:")
+        logger.info("[WS]   simulation_config:")
         sim_config = data.get('simulation_config', {})
         for key, value in sim_config.items():
             if isinstance(value, dict):
@@ -487,6 +578,309 @@ async def get_run_events(run_id: str) -> dict[str, Any]:
     events = await store.get_events(run_uuid)
     
     return {"events": [e.model_dump() for e in events]}
+
+
+# ── Local VTK cache ──────────────────────────────────────────────────────────
+# VTPs are downloaded from the simulation server ONCE per run and stored here.
+# All subsequent frontend requests are served directly from local disk —
+# no DB lookup, no HTTP round-trip to the sim server, no RAM buffering.
+
+# Per-run download locks prevent concurrent coroutines from double-downloading.
+_vtk_download_locks: dict[str, asyncio.Lock] = {}
+
+
+def _vtk_local_dir(run_id: str) -> Path:
+    """Return the local cache directory for a run's VTP files."""
+    return Path(get_settings().vtk_cache_dir) / run_id
+
+
+def _get_download_lock(run_id: str) -> asyncio.Lock:
+    if run_id not in _vtk_download_locks:
+        _vtk_download_locks[run_id] = asyncio.Lock()
+    return _vtk_download_locks[run_id]
+
+
+async def _resolve_sim_run_id(run_id: str) -> str:
+    """Look up the simulation server run ID from the agent database.
+
+    Raises HTTPException(404) if the run or its sim_run_id is not found.
+    """
+    try:
+        run_uuid = UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid run ID format")
+
+    store = EventStore()
+    run = await store.get_run(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    result_data: dict = {}
+    if run.result:
+        try:
+            result_data = json.loads(run.result) if isinstance(run.result, str) else run.result
+        except Exception:
+            pass
+
+    sim_run_id: str | None = result_data.get("sim_run_id")
+    if not sim_run_id:
+        raise HTTPException(
+            status_code=404,
+            detail="No simulation run ID stored — was the simulation successful?",
+        )
+    return sim_run_id
+
+
+async def _ensure_vtk_cached(run_id: str) -> dict:
+    """Download all VTP files from the sim server once and store locally.
+
+    Workflow
+    --------
+    1. Resolve sim_run_id from the agent DB (one query, then never again).
+    2. Fetch GET /api/run/{sim_run_id}/vtk-timesteps/index.json from sim server.
+       The sim server triggers precompute on-demand if not already done.
+    3. Download surface.vtp + every timestep VTP listed in the index.
+    4. Write a local index.json with URLs rewritten to this agent's endpoints.
+
+    All subsequent calls return the cached local index instantly.
+
+    Returns the local index dict:
+        {
+            "run_id": str,
+            "total": int,
+            "fields": [...],
+            "surface_vtp": "/api/runs/{run_id}/vtk/surface.vtp",
+            "timesteps": [
+                {"time": 0.1, "filename": "t_0_1.vtp",
+                 "vtp_url": "/api/runs/{run_id}/vtk-timestep/0.1/surface.vtp"},
+                ...
+            ]
+        }
+    """
+    local_dir = _vtk_local_dir(run_id)
+    local_index_path = local_dir / "index.json"
+
+    # Fast path: already cached
+    if local_index_path.exists():
+        return json.loads(local_index_path.read_text())
+
+    async with _get_download_lock(run_id):
+        # Double-check after acquiring lock (another coroutine may have filled it)
+        if local_index_path.exists():
+            return json.loads(local_index_path.read_text())
+
+        sim_run_id = await _resolve_sim_run_id(run_id)
+        settings = get_settings()
+
+        ts_dir = local_dir / "timesteps"
+        ts_dir.mkdir(parents=True, exist_ok=True)
+
+        sim = SimulationServerClient(base_url=settings.simulation_server_url)
+        try:
+            # ── 1. Fetch the precomputed index (triggers sim-server precompute) ──
+            logger.info(f"[VTK_CACHE] Fetching index for run {run_id} (sim={sim_run_id})")
+            sim_index = await sim.get_precomputed_index(sim_run_id)
+
+            # ── 2. Download surface.vtp ───────────────────────────────────────
+            logger.info(f"[VTK_CACHE] Downloading surface.vtp for {run_id}")
+            surface_bytes = await sim.download_surface_vtp(sim_run_id)
+            (local_dir / "surface.vtp").write_bytes(surface_bytes)
+
+            # ── 3. Download each timestep VTP ─────────────────────────────────
+            local_timesteps: list[dict] = []
+            for ts in sim_index.get("timesteps", []):
+                filename: str = ts["filename"]
+                logger.info(f"[VTK_CACHE] Downloading {filename}")
+                vtp_bytes = await sim.download_precomputed_vtp(sim_run_id, filename)
+                (ts_dir / filename).write_bytes(vtp_bytes)
+                local_timesteps.append({
+                    "time": float(ts["time"]),
+                    "filename": filename,
+                    "vtp_url": f"/api/runs/{run_id}/vtk-timestep/{ts['time']}/surface.vtp",
+                })
+
+            # ── 4. Write local index ──────────────────────────────────────────
+            local_index = {
+                "run_id": run_id,
+                "sim_run_id": sim_run_id,
+                "total": len(local_timesteps),
+                "fields": sim_index.get("fields", []),
+                "surface_vtp": f"/api/runs/{run_id}/vtk/surface.vtp",
+                "timesteps": local_timesteps,
+            }
+            local_index_path.write_text(json.dumps(local_index))
+            logger.info(
+                f"[VTK_CACHE] Cached {len(local_timesteps)} VTPs for run {run_id} "
+                f"→ {local_dir}"
+            )
+            return local_index
+
+        except SimulationServerError as e:
+            raise HTTPException(status_code=502, detail=f"Simulation server error: {e}")
+        finally:
+            await sim.close()
+
+
+# ── VTK Results ──────────────────────────────────────────────────────────────
+
+@app.get("/api/runs/{run_id}/vtk-results")
+async def get_vtk_results(run_id: str, request: Request) -> dict[str, Any]:
+    """Download all VTPs from sim server (once) and return field metadata.
+
+    On first call this downloads every timestep VTP and the surface VTP to
+    the local cache.  Subsequent calls return instantly from the local index.
+
+    Response contract (matches frontend ResultViewer):
+        {
+            "run_id":  str,
+            "time":    float,   # latest simulation time
+            "vtp_url": str,     # absolute URL to surface.vtp on this agent
+            "fields":  [{...}]
+        }
+    """
+    local_index = await _ensure_vtk_cached(run_id)
+
+    base = str(request.base_url).rstrip("/")
+    timesteps = local_index.get("timesteps", [])
+    latest_time = timesteps[-1]["time"] if timesteps else 0.0
+
+    return {
+        "run_id": run_id,
+        "time": float(latest_time),
+        "vtp_url": f"{base}/api/runs/{run_id}/vtk/surface.vtp",
+        "fields": local_index.get("fields", []),
+    }
+
+
+@app.get("/api/runs/{run_id}/vtk/surface.vtp")
+async def serve_surface_vtp(run_id: str):
+    """Serve the surface VTP from local cache — pure FileResponse, zero proxying."""
+    local_path = _vtk_local_dir(run_id) / "surface.vtp"
+
+    if not local_path.exists():
+        # Trigger cache fill if this endpoint is hit before vtk-results
+        await _ensure_vtk_cached(run_id)
+
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail="surface.vtp not in local cache")
+
+    return FileResponse(
+        str(local_path),
+        media_type="application/xml",
+        headers={
+            "Content-Disposition": 'inline; filename="surface.vtp"',
+            "Cache-Control": "public, max-age=86400",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+# ── Timesteps ────────────────────────────────────────────────────────────────
+
+@app.get("/api/runs/{run_id}/timesteps")
+async def get_timesteps(run_id: str, request: Request) -> dict[str, Any]:
+    """Return sorted timestep list from local cache.
+
+    Triggers the one-time VTP download if not already cached.
+
+    Response:
+        {
+            "run_id": str,
+            "total": int,
+            "fields": [...],
+            "timesteps": [{"time": 0.1, "vtp_url": "http://.../vtk-timestep/0.1/surface.vtp"}, ...]
+        }
+    """
+    local_index = await _ensure_vtk_cached(run_id)
+
+    base = str(request.base_url).rstrip("/")
+    timesteps = [
+        {
+            "time": ts["time"],
+            "vtp_url": f"{base}/api/runs/{run_id}/vtk-timestep/{ts['time']}/surface.vtp",
+        }
+        for ts in sorted(local_index.get("timesteps", []), key=lambda t: t["time"])
+    ]
+    return {
+        "run_id": run_id,
+        "total": local_index.get("total", len(timesteps)),
+        "fields": local_index.get("fields", []),
+        "timesteps": timesteps,
+    }
+
+
+# ── Per-timestep VTP ─────────────────────────────────────────────────────────
+
+@app.get("/api/runs/{run_id}/vtk-timestep/{time_str}/surface.vtp")
+async def serve_timestep_vtp(run_id: str, time_str: str):
+    """Serve a timestep VTP from local cache — pure FileResponse, zero proxying."""
+    filename = f"t_{time_str.replace('.', '_')}.vtp"
+    local_path = _vtk_local_dir(run_id) / "timesteps" / filename
+
+    if not local_path.exists():
+        # Trigger cache fill then retry
+        await _ensure_vtk_cached(run_id)
+
+    if not local_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"{filename} not in local cache — call /vtk-results first",
+        )
+
+    return FileResponse(
+        str(local_path),
+        media_type="application/xml",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "public, max-age=86400",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+# ── Playback SSE ─────────────────────────────────────────────────────────────
+
+@app.get("/api/runs/{run_id}/playback")
+async def playback_sse(run_id: str, request: Request):
+    """SSE playback stream built entirely from local cache.
+
+    No sim-server calls, no RAM buffering, no pyvista.
+    All VTPs are already on disk; this just emits URL pointers.
+
+    Events:
+        {"type": "playback_start",  "total_frames": N, "fields": [...]}
+        {"type": "frame",           "frame_index": i, "time": 0.1,
+                                    "vtp_url": "http://.../vtk-timestep/0.1/surface.vtp"}
+        {"type": "playback_done"}
+    """
+    local_index = await _ensure_vtk_cached(run_id)
+    base = str(request.base_url).rstrip("/")
+
+    timesteps = sorted(local_index.get("timesteps", []), key=lambda t: t["time"])
+    fields = local_index.get("fields", [])
+
+    async def _stream():
+        yield f"data: {json.dumps({'type': 'playback_start', 'total_frames': len(timesteps), 'fields': fields})}\n\n"
+        for i, ts in enumerate(timesteps):
+            event = {
+                "type": "frame",
+                "frame_index": i,
+                "total_frames": len(timesteps),
+                "time": ts["time"],
+                "vtp_url": f"{base}/api/runs/{run_id}/vtk-timestep/{ts['time']}/surface.vtp",
+            }
+            yield f"data: {json.dumps(event)}\n\n"
+        yield f"data: {json.dumps({'type': 'playback_done'})}\n\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":

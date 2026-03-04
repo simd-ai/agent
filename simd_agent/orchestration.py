@@ -15,6 +15,7 @@ from simd_agent.event_bus import EventBus
 from simd_agent.linting import CFDLinter
 from simd_agent.models import (
     BoundaryType,
+    EventLevel,
     FinalResult,
     LintResult,
     Operation,
@@ -33,6 +34,8 @@ from simd_agent.genai_codegen import (
     validate_generated_files,
     determine_solver,
 )
+from simd_agent.solver_selector import SolverSelector
+from simd_agent.code_verifier import CodeVerifier
 from simd_agent.simulation_server_client import (
     SimulationServerClient,
     SimulationServerError,
@@ -96,6 +99,10 @@ class Orchestrator:
         self._current_files: dict[str, str] = {}
         self._lint_result: LintResult | None = None
         self._previous_errors: list[dict[str, Any]] = []
+        self._selected_solver: str | None = None  # set by SolverSelector in phase 1
+        # Incremental generation state
+        self._accumulated_files: dict[str, str] = {}   # grows across retries
+        self._missing_files_for_patch: list[str] = []  # set by verifier → drives patch prompt
     
     @property
     def linter(self) -> CFDLinter:
@@ -133,7 +140,7 @@ class Orchestrator:
         """Initialize the code generator using Google GenAI."""
         try:
             # Use Google GenAI directly for code generation
-            self._code_generator = GenAICodeGenerator()
+            self._code_generator = GenAICodeGenerator(event_bus=self.event_bus)
             logger.info("[ORCHESTRATOR] Initialized GenAI code generator")
         except Exception as e:
             logger.error(f"[ORCHESTRATOR] Failed to initialize GenAI code generator: {e}")
@@ -363,15 +370,37 @@ class Orchestrator:
             config=self._lint_result.validated_config,
         )
         
-        # Determine correct solver (no buoyancy)
-        solver = determine_solver(self._lint_result.validated_config)
-        # Override planner's solver if it picked a buoyant one
-        if planning_result.solver and planning_result.solver in ("buoyantSimpleFoam", "buoyantPimpleFoam"):
-            logger.info(f"[CODEGEN] Overriding planner solver {planning_result.solver} → {solver}")
-        elif planning_result.solver and planning_result.solver in ("simpleFoam", "pimpleFoam"):
-            solver = planning_result.solver
-        
-        logger.info(f"[CODEGEN] Using solver: {solver}")
+        # ── Phase 1: LLM-assisted solver selection ───────────────────────
+        await self.event_bus.emit(
+            "solver_selection_started",
+            message="Selecting the best solver based on simulation physics…",
+            payload={"iteration": self._iteration},
+        )
+        try:
+            selector = SolverSelector()
+            solver = await selector.select(
+                user_requirements=self.request.user_requirements,
+                simulation_config=self.request.simulation_config,
+                validated_config=self._lint_result.validated_config,
+            )
+        except Exception as _sel_exc:
+            logger.warning(f"[CODEGEN] SolverSelector failed ({_sel_exc}), using heuristic fallback")
+            solver = determine_solver(self._lint_result.validated_config)
+
+        self._selected_solver = solver
+        logger.info(f"[CODEGEN] Solver selected: {solver}")
+
+        await self.event_bus.emit(
+            "solver_selected",
+            message=f"Solver selected: {solver}",
+            payload={
+                "solver": solver,
+                "iteration": self._iteration,
+                "heat_transfer": self._lint_result.validated_config.get("heat_transfer", False),
+                "time_stepping":  self._lint_result.validated_config.get("time_stepping", "steady"),
+                "compressibility": self._lint_result.validated_config.get("compressibility", "incompressible"),
+            },
+        )
         
         # Get mesh_id from simulation config.
         # simulation_config["mesh"] can be a dict or a bare mesh-ID string.
@@ -388,18 +417,35 @@ class Orchestrator:
             self._iteration += 1
             
             try:
+                # Snapshot before reset so emit_codegen_iteration can report it
+                _current_patch_files = list(self._missing_files_for_patch)
+
                 # ── Generate code ──
-                await self.event_bus.emit_codegen_started(self._iteration)
-                
-                code_result = await self._generate_code(planning_result)
-                files = extract_file_blocks(code_result)
-                
-                if not files:
+                await self.event_bus.emit_codegen_started(
+                    self._iteration,
+                    patching_files=_current_patch_files or None,
+                )
+
+                code_result = await self._generate_code(
+                    planning_result,
+                    missing_files=self._missing_files_for_patch or None,
+                )
+                new_files = extract_file_blocks(code_result)
+
+                if not new_files and not self._accumulated_files:
                     raise OrchestrationError("Code generation produced no files")
-                
-                # Merge with previous files if retrying
-                if self._current_files and self._retries > 0:
-                    files = merge_files(self._current_files, files)
+
+                # Merge newly-generated files into the accumulator.
+                # New files ALWAYS overwrite stale ones from previous iterations.
+                if new_files:
+                    self._accumulated_files.update(new_files)
+                files = dict(self._accumulated_files)
+
+                # Reset patch list — will be repopulated if verifier finds gaps again
+                self._missing_files_for_patch = []
+
+                # Legacy compat: keep _current_files in sync
+                self._current_files = files
                 
                 # ── Codegen debug report — show endTime from generated controlDict ──
                 _ctrl = files.get("system/controlDict", "")
@@ -417,6 +463,23 @@ class Orchestrator:
                 print(f"  LLM-generated startTime: {_start_time_match.group(1) if _start_time_match else '⚠️  NOT FOUND'}")
                 print("=" * 70)
 
+                # ── Print all generated file contents for debugging ──
+                print("\n" + "=" * 70)
+                print("📄 GENERATED FILE CONTENTS")
+                print("=" * 70)
+                for _fpath in sorted(files.keys()):
+                    _fcontent = files[_fpath]
+                    print(f"\n{'─'*60}")
+                    print(f"📁 {_fpath}  ({len(_fcontent)} chars)")
+                    print(f"{'─'*60}")
+                    # Print first 80 lines max to avoid flooding logs
+                    _lines = _fcontent.splitlines()
+                    for _ln in _lines[:80]:
+                        print(f"  {_ln}")
+                    if len(_lines) > 80:
+                        print(f"  ... ({len(_lines) - 80} more lines)")
+                print("\n" + "=" * 70)
+
                 # ── Post-generation validation ──
                 logger.info(f"[CODEGEN] Validating {len(files)} generated files...")
                 files, validation_issues = validate_generated_files(
@@ -430,10 +493,121 @@ class Orchestrator:
                         logger.warning(f"[CODEGEN]   {vi}")
                 
                 self._current_files = files
-                
+
+                # ── Super-model verification (quality gate) ──────────────────
+                # Uses gemini_super_model to independently check consistency:
+                # solver vs physics, patch coverage, endTime, field completeness.
+                # Critical issues feed back into the self-healing loop.
+                # Warnings are surfaced as events but don't block submission.
+                await self.event_bus.emit(
+                    "codegen_verification_started",
+                    message=f"Verifying generated case (iteration {self._iteration})",
+                    payload={"iteration": self._iteration, "file_count": len(files)},
+                )
+                try:
+                    verifier = CodeVerifier()
+                    verification = await verifier.verify(
+                        files=files,
+                        user_requirements=self.request.user_requirements,
+                        validated_config=self._lint_result.validated_config,
+                        solver=solver,
+                    )
+                except Exception as _ve:
+                    logger.warning(f"[VERIFY] Verifier failed (non-fatal): {_ve}")
+                    verification = None
+
+                _ver_payload: dict[str, Any] = {
+                    "iteration": self._iteration,
+                    "passed": True,
+                    "issues": [],
+                    "summary": "Verification skipped (verifier unavailable)",
+                }
+                if verification:
+                    _ver_payload = {
+                        "iteration": self._iteration,
+                        "passed": verification.passed,
+                        "summary": verification.summary,
+                        "issues": [
+                            {
+                                "severity": i.severity,
+                                "category": i.category,
+                                "message": i.message,
+                                "fix_suggestion": i.fix_suggestion,
+                            }
+                            for i in verification.issues
+                        ],
+                    }
+                    print("=" * 70)
+                    print("🔍 CODE VERIFICATION REPORT")
+                    print(f"  Iteration : {self._iteration}")
+                    print(f"  Passed    : {verification.passed}")
+                    print(f"  Summary   : {verification.summary}")
+                    for _vi in verification.issues:
+                        _icon = "🔴" if _vi.severity == "critical" else ("⚠️ " if _vi.severity == "warning" else "ℹ️ ")
+                        print(f"  {_icon} [{_vi.category}] {_vi.message}")
+                        if _vi.fix_suggestion:
+                            print(f"      → {_vi.fix_suggestion}")
+                    print("=" * 70)
+
+                await self.event_bus.emit(
+                    "codegen_verification_complete",
+                    message=_ver_payload["summary"],
+                    level=EventLevel.ERROR if not _ver_payload["passed"] else EventLevel.INFO,
+                    payload=_ver_payload,
+                )
+
+                # If critical issues were found, raise so the self-healing loop
+                # regenerates with the verification findings as error context.
+                if verification and not verification.passed:
+                    critical_issues = [i for i in verification.issues if i.severity == "critical"]
+                    critical_msgs = "\n".join(
+                        f"- [{i.category}] {i.message}"
+                        + (f"\n  Fix: {i.fix_suggestion}" if i.fix_suggestion else "")
+                        for i in critical_issues
+                    )
+
+                    # ── Collect missing files for incremental patch generation ──
+                    # Categories that map to a specific missing file path:
+                    _MISSING_FILE_CATEGORIES = {
+                        "missing_system_dicts",
+                        "missing_fields",
+                        "missing_constant_dicts",
+                        "missing_p_rgh",
+                        "missing_gravity",
+                    }
+                    _missing: list[str] = []
+                    _non_missing_critical: list = []
+                    for ci in critical_issues:
+                        if ci.category in _MISSING_FILE_CATEGORIES and ci.fix_suggestion:
+                            # Extract the file path from the fix suggestion or message
+                            # e.g. "Generate 'system/controlDict' with …" → system/controlDict
+                            path_match = re.search(r"['\"`]([^'\"` ]+/[^'\"` ]+)['\"`]", ci.message)
+                            if path_match:
+                                _missing.append(path_match.group(1))
+                            else:
+                                _non_missing_critical.append(ci)
+                        else:
+                            _non_missing_critical.append(ci)
+
+                    if _missing:
+                        # Deduplicate while preserving order
+                        seen: set[str] = set()
+                        self._missing_files_for_patch = [
+                            f for f in _missing if not (f in seen or seen.add(f))  # type: ignore[func-returns-value]
+                        ]
+                        logger.info(
+                            f"[CODEGEN] Missing files identified — patch generation: "
+                            f"{self._missing_files_for_patch}"
+                        )
+
+                    raise OrchestrationError(
+                        f"Code verification found critical issues:\n{critical_msgs}"
+                    )
+
                 await self.event_bus.emit_codegen_iteration(
                     self._iteration,
                     list(files.keys()),
+                    patching_files=_current_patch_files or None,
                 )
                 
                 # ── Package case with mesh ──
@@ -497,8 +671,16 @@ class Orchestrator:
                 sim_result = await self._run_on_sim_server(
                     zip_bytes,
                     mode=SimRunMode.TEST,
+                    n_cores=1,   # always serial for test/dry-run
                 )
-                
+
+                import json as _json
+                print("\n" + "=" * 70)
+                print(f"[SimServer] TEST run result (iteration {self._iteration})")
+                print("=" * 70)
+                print(_json.dumps(sim_result, indent=2, default=str))
+                print("=" * 70 + "\n")
+
                 if sim_result["success"]:
                     # ── TEST passed → automatically run the FULL simulation ──
                     # The generated controlDict already has the correct endTime
@@ -517,7 +699,14 @@ class Orchestrator:
                     full_result = await self._run_on_sim_server(
                         zip_bytes,
                         mode=SimRunMode.FULL,
+                        n_cores=12,
                     )
+
+                    print("\n" + "=" * 70)
+                    print(f"[SimServer] FULL run result (iteration {self._iteration})")
+                    print("=" * 70)
+                    print(_json.dumps(full_result, indent=2, default=str))
+                    print("=" * 70 + "\n")
 
                     artifacts = full_result.get("artifacts", [])
 
@@ -535,6 +724,8 @@ class Orchestrator:
                                 "artifacts": artifacts,
                                 "iterations": self._iteration,
                                 "solver": solver,
+                                # Store sim_run_id so the VTK endpoint can retrieve it
+                                "sim_run_id": full_result.get("sim_run_id"),
                             },
                             attempts=self._iteration,
                         )
@@ -733,28 +924,39 @@ class Orchestrator:
         
         return None
     
-    async def _generate_code(self, planning_result: Any) -> str:
-        """Generate OpenFOAM case code using Google GenAI directly."""
+    async def _generate_code(
+        self,
+        planning_result: Any,
+        missing_files: list[str] | None = None,
+    ) -> str:
+        """Generate OpenFOAM case code using Google GenAI directly.
+
+        Args:
+            planning_result: Output from the planning phase.
+            missing_files: If provided, use a patch prompt to generate ONLY these
+                           files instead of the full codegen or fix prompt.
+        """
         # Build enhanced requirements with planning context
         requirements = self._build_requirements(planning_result)
-        
+
         # Get validated config
         validated_config = {}
         if self._lint_result and self._lint_result.validated_config:
             validated_config = self._lint_result.validated_config
-        
-        # Use the solver determined in _run_codegen_and_simulate (no buoyancy)
-        solver = determine_solver(validated_config)
+
+        # Use the solver already selected by SolverSelector in phase 1.
+        # Fall back to heuristic only if called before selection (shouldn't happen).
+        solver = self._selected_solver or determine_solver(validated_config)
         case_type = planning_result.case_type or "pipe_flow"
-        
-        # Handle retries — pass sim server errors directly to the LLM
+
+        # ── Route to the right prompt ─────────────────────────────────────────
+        # Priority: patch (missing files) > fix (sim errors) > full codegen
         previous_errors = None
-        previous_files = None
-        if self._previous_errors:
+        previous_files = self._accumulated_files if self._accumulated_files else None
+
+        if not missing_files and self._previous_errors:
             previous_errors = self._previous_errors
-            if self._current_files:
-                previous_files = self._current_files
-        
+
         # Generate using GenAI
         result = await self._code_generator.generate(
             requirements=requirements,
@@ -763,8 +965,10 @@ class Orchestrator:
             case_type=case_type,
             previous_errors=previous_errors,
             previous_files=previous_files,
+            missing_files=missing_files,
+            iteration=self._iteration,
         )
-        
+
         return result
     
     def _build_requirements(self, planning_result: Any) -> str:
@@ -837,301 +1041,20 @@ class Orchestrator:
         
         return "".join(parts)
     
-    def _mock_generate_code(self, planning_result: Any) -> str:
-        """Generate mock OpenFOAM case for testing."""
-        solver = planning_result.solver or "simpleFoam"
-        
-        return f'''```file:system/controlDict
-FoamFile
-{{
-    version     2.0;
-    format      ascii;
-    class       dictionary;
-    object      controlDict;
-}}
-
-application     {solver};
-startFrom       startTime;
-startTime       0;
-stopAt          endTime;
-endTime         1000;
-deltaT          1;
-writeControl    timeStep;
-writeInterval   100;
-purgeWrite      0;
-writeFormat     ascii;
-writePrecision  6;
-writeCompression off;
-timeFormat      general;
-timePrecision   6;
-runTimeModifiable true;
-```
-
-```file:system/fvSchemes
-FoamFile
-{{
-    version     2.0;
-    format      ascii;
-    class       dictionary;
-    object      fvSchemes;
-}}
-
-ddtSchemes
-{{
-    default         steadyState;
-}}
-
-gradSchemes
-{{
-    default         Gauss linear;
-}}
-
-divSchemes
-{{
-    default         none;
-    div(phi,U)      bounded Gauss linearUpwind grad(U);
-    div(phi,k)      bounded Gauss upwind;
-    div(phi,epsilon) bounded Gauss upwind;
-    div((nuEff*dev2(T(grad(U))))) Gauss linear;
-}}
-
-laplacianSchemes
-{{
-    default         Gauss linear corrected;
-}}
-
-interpolationSchemes
-{{
-    default         linear;
-}}
-
-snGradSchemes
-{{
-    default         corrected;
-}}
-
-wallDist
-{{
-    method meshWave;
-}}
-```
-
-```file:system/fvSolution
-FoamFile
-{{
-    version     2.0;
-    format      ascii;
-    class       dictionary;
-    object      fvSolution;
-}}
-
-solvers
-{{
-    p
-    {{
-        solver          GAMG;
-        tolerance       1e-06;
-        relTol          0.1;
-        smoother        GaussSeidel;
-    }}
-
-    U
-    {{
-        solver          smoothSolver;
-        smoother        GaussSeidel;
-        tolerance       1e-05;
-        relTol          0.1;
-    }}
-}}
-
-SIMPLE
-{{
-    nNonOrthogonalCorrectors 0;
-    consistent      yes;
-    residualControl
-    {{
-        p               1e-4;
-        U               1e-4;
-    }}
-}}
-
-relaxationFactors
-{{
-    fields
-    {{
-        p               0.3;
-    }}
-    equations
-    {{
-        U               0.7;
-    }}
-}}
-```
-
-```file:system/blockMeshDict
-FoamFile
-{{
-    version     2.0;
-    format      ascii;
-    class       dictionary;
-    object      blockMeshDict;
-}}
-
-scale   1;
-
-vertices
-(
-    (0 0 0)
-    (1 0 0)
-    (1 0.1 0)
-    (0 0.1 0)
-    (0 0 0.1)
-    (1 0 0.1)
-    (1 0.1 0.1)
-    (0 0.1 0.1)
-);
-
-blocks
-(
-    hex (0 1 2 3 4 5 6 7) (20 10 1) simpleGrading (1 1 1)
-);
-
-boundary
-(
-    inlet
-    {{
-        type patch;
-        faces
-        (
-            (0 4 7 3)
-        );
-    }}
-    outlet
-    {{
-        type patch;
-        faces
-        (
-            (1 2 6 5)
-        );
-    }}
-    walls
-    {{
-        type wall;
-        faces
-        (
-            (0 1 5 4)
-            (3 7 6 2)
-        );
-    }}
-    frontAndBack
-    {{
-        type empty;
-        faces
-        (
-            (0 3 2 1)
-            (4 5 6 7)
-        );
-    }}
-);
-```
-
-```file:0/U
-FoamFile
-{{
-    version     2.0;
-    format      ascii;
-    class       volVectorField;
-    object      U;
-}}
-
-dimensions      [0 1 -1 0 0 0 0];
-
-internalField   uniform (0 0 0);
-
-boundaryField
-{{
-    inlet
-    {{
-        type            fixedValue;
-        value           uniform (1 0 0);
-    }}
-    outlet
-    {{
-        type            zeroGradient;
-    }}
-    walls
-    {{
-        type            noSlip;
-    }}
-    frontAndBack
-    {{
-        type            empty;
-    }}
-}}
-```
-
-```file:0/p
-FoamFile
-{{
-    version     2.0;
-    format      ascii;
-    class       volScalarField;
-    object      p;
-}}
-
-dimensions      [0 2 -2 0 0 0 0];
-
-internalField   uniform 0;
-
-boundaryField
-{{
-    inlet
-    {{
-        type            zeroGradient;
-    }}
-    outlet
-    {{
-        type            fixedValue;
-        value           uniform 0;
-    }}
-    walls
-    {{
-        type            zeroGradient;
-    }}
-    frontAndBack
-    {{
-        type            empty;
-    }}
-}}
-```
-
-```file:constant/transportProperties
-FoamFile
-{{
-    version     2.0;
-    format      ascii;
-    class       dictionary;
-    object      transportProperties;
-}}
-
-transportModel  Newtonian;
-nu              [0 2 -1 0 0 0 0] 1e-06;
-```
-'''
-    
     async def _run_on_sim_server(
         self,
         zip_bytes: bytes,
         mode: SimRunMode = SimRunMode.TEST,
+        n_cores: int = 12,
     ) -> dict[str, Any]:
         """Submit case to simulation server and stream events.
-        
+
         Events from the simulation server are relayed to the frontend via WebSocket.
-        
+
         Args:
             zip_bytes: OpenFOAM case as ZIP bytes
             mode: TEST for 1 iteration validation, FULL for complete run
-            
+
         Returns:
             Dict with success, sim_run_id, artifacts, logs, exit_code, etc.
         """
@@ -1150,11 +1073,17 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
                 if event.payload.get("stream") == "stderr" or event.level in ("error", "warn"):
                     stderr_collected.append(line)
                 # Catch ALL OpenFOAM fatal errors (FOAM FATAL ERROR, FOAM FATAL IO ERROR, etc.)
+                # NOTE: OpenFOAM writes errors and stack traces to STDOUT, not stderr.
                 line_upper = line.upper()
                 if any(pattern in line_upper for pattern in [
                     "FOAM FATAL", "FOAM EXITING", "CANNOT FIND FILE",
                     "NOT CONSTRAINT TYPE", "PATCH TYPE", "DIMENSIONS MISMATCH",
                     "UNKNOWN PATCHFIELD", "ENTRY NOT FOUND",
+                    # FPE / crash signals
+                    "FLOATING POINT", "SEGMENTATION FAULT", "SIGFPE", "SIGABRT",
+                    "STACK TRACE", "[STACK TRACE]",
+                    # Division by zero / bad fields
+                    "DIVIDE", "OVERFLOW", "UNDERFLOW", "NAN", "INF",
                 ]):
                     stderr_collected.append(line)
             
@@ -1167,12 +1096,123 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
                 stderr_text = event.payload.get("stderr", "")
                 if stderr_text:
                     stderr_collected.append(stderr_text)
-                # Also grab stdout — some errors appear there
+                # Always include stdout tail from run_failed — OpenFOAM writes
+                # FATAL errors, FPE stack traces, and "Floating point exception"
+                # to stdout, not stderr. runner.py now ships last 100 lines.
                 stdout_text = event.payload.get("stdout", "")
-                if stdout_text and "FOAM FATAL" in stdout_text.upper():
-                    stderr_collected.append(stdout_text)
+                if stdout_text:
+                    # Filter to include any line that looks like an error/trace
+                    useful_lines = []
+                    in_trace = False
+                    for ln in stdout_text.splitlines():
+                        lu = ln.upper()
+                        if any(p in lu for p in [
+                            "FOAM FATAL", "FOAM EXITING", "FOAM WARNING",
+                            "FLOATING POINT", "SEGMENTATION", "STACK TRACE",
+                            "[STACK TRACE]", "#1 ", "#2 ", "#3 ",
+                            "DIVIDE", "OVERFLOW", "NAN", "INF",
+                            "ERROR", "EXCEPTION", "CANNOT FIND",
+                        ]):
+                            in_trace = True
+                        if in_trace:
+                            useful_lines.append(ln)
+                    if useful_lines:
+                        stderr_collected.append("\n".join(useful_lines))
+                    elif stdout_text.strip():
+                        # No obvious error lines, but send last 50 lines anyway
+                        stderr_collected.append("\n".join(stdout_text.splitlines()[-50:]))
             
-            # Map simulation server event types to our event types
+            # Silently drop decompose/reconstruct events — frontend doesn't need them.
+            # The simulation server handles MPI decomposition internally; we only
+            # care about the actual solver progress and final result.
+            _IGNORED_EVENT_TYPES = {
+                "decompose_started", "decompose_complete", "decompose_failed",
+                "decompose_log",
+                "reconstruct_started", "reconstruct_complete", "reconstruct_failed",
+                "reconstruct_log",
+            }
+            if event.type in _IGNORED_EVENT_TYPES:
+                return
+
+            # Skip verbose mesh_log events
+            if event.type == "mesh_log" and not event.payload.get("important"):
+                return
+
+            # ── run_progress / run_progress_batch → sim_progress ────────────
+            if event.type in ("run_progress", "run_progress_batch") and mode == SimRunMode.FULL:
+                import json as _j
+                raw_items: list[dict] = (
+                    event.payload.get("items", [])
+                    if event.type == "run_progress_batch"
+                    else [event.payload]
+                )
+
+                def _build_sim_progress(p: dict) -> dict:
+                    """Normalise one parsed time-step into the frontend contract."""
+                    residuals_raw = p.get("residuals", {})
+
+                    # Accept {field: scalar} (old) or {field: {initial,final,iters}} (new)
+                    residuals: dict = {}
+                    for field, val in residuals_raw.items():
+                        if isinstance(val, dict):
+                            residuals[field] = {
+                                "initial": float(val.get("initial", 0)),
+                                "final":   float(val.get("final", val.get("initial", 0))),
+                                "iters":   int(val.get("iters", 1)),
+                            }
+                        else:
+                            residuals[field] = {
+                                "initial": float(val),
+                                "final":   float(val),
+                                "iters":   1,
+                            }
+
+                    courant_raw = p.get("courant")
+                    courant = (
+                        {"mean": float(courant_raw["mean"]), "max": float(courant_raw["max"])}
+                        if isinstance(courant_raw, dict) else None
+                    )
+
+                    cont_raw = p.get("continuity")
+                    continuity = (
+                        {
+                            "local":      float(cont_raw["local"]),
+                            "global":     float(cont_raw["global"]),
+                            "cumulative": float(cont_raw["cumulative"]),
+                        }
+                        if isinstance(cont_raw, dict) else None
+                    )
+
+                    exec_raw = p.get("execution")
+                    execution = (
+                        {
+                            "stepSeconds":  float(exec_raw.get("stepSeconds", exec_raw.get("step_seconds", 0))),
+                            "clockSeconds": float(exec_raw.get("clockSeconds", exec_raw.get("clock_seconds", 0))),
+                            "label":        exec_raw.get("label", ""),
+                        }
+                        if isinstance(exec_raw, dict) else None
+                    )
+
+                    return {
+                        "iteration":  int(p.get("iteration", 0)),
+                        "simTime":    float(p.get("time", p.get("simTime", 0))),
+                        "fields":     list(p.get("fields", list(residuals.keys()))),
+                        "residuals":  residuals,
+                        "courant":    courant,
+                        "continuity": continuity,
+                        "execution":  execution,
+                    }
+
+                built = [_build_sim_progress(p) for p in raw_items]
+                await self.event_bus.emit_sim_event(
+                    event_type="sim_progress_batch",
+                    message=f"{len(built)} step(s)",
+                    payload={"items": built},
+                    level=event.level,
+                )
+                return
+
+            # Map all other simulation server event types
             event_type_map = {
                 "extract_started": "sim_extract_started",
                 "extract_complete": "sim_extract_complete",
@@ -1186,23 +1226,31 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
                 "checkmesh_started": "checkmesh_started",
                 "checkmesh_complete": "checkmesh_complete",
                 "run_started": "sim_run_started",
-                "run_progress": "sim_run_progress",
                 "run_log": "sim_run_log",
                 "run_succeeded": "sim_run_succeeded",
                 "run_failed": "sim_run_failed",
                 "artifacts_ready": "sim_artifacts_ready",
+                # Test-mode watchdog result (rc=-9 SIGKILL is expected, not an error)
+                "run_test_passed": "sim_test_passed",
             }
-            
-            # Skip verbose mesh_log events
-            if event.type == "mesh_log" and not event.payload.get("important"):
-                return
-            
+
             mapped_type = event_type_map.get(event.type, event.type)
-            
+
+            # Strip processor* files from artifacts_ready payload
+            payload = event.payload
+            if event.type == "artifacts_ready" and "artifacts" in payload:
+                payload = {
+                    **payload,
+                    "artifacts": [
+                        a for a in payload["artifacts"]
+                        if not str(a.get("path", a.get("name", ""))).startswith("processor")
+                    ],
+                }
+
             await self.event_bus.emit_sim_event(
                 event_type=mapped_type,
                 message=event.message,
-                payload=event.payload,
+                payload=payload,
                 level=event.level,
             )
         
@@ -1212,6 +1260,7 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
                 zip_bytes,
                 mode=mode,
                 run_id=f"{self.run_id}-iter{self._iteration}",
+                n_cores=n_cores,
             )
             sim_run_id = submit_response.run_id
             
@@ -1223,31 +1272,62 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
             
             # Stream events and wait for completion
             all_events: list[SimRunEvent] = []
-            final_event: SimRunEvent | None = None
-            
+            test_passed_payload: dict | None = None   # set when run_test_passed arrives
+
             async for event in self.sim_server.stream_events(sim_run_id, on_event=on_sim_event):
                 all_events.append(event)
-                
-                if event.type in ("run_succeeded", "run_failed"):
-                    final_event = event
+
+                # ── Raw simulation data print ──────────────────────────────────
+                if event.type in ("run_log", "run_progress", "run_progress_batch",
+                                  "run_started", "run_succeeded", "run_failed",
+                                  "run_test_passed"):
+                    print("=" * 70)
+                    print(f"[SIM RAW] type={event.type}  level={event.level}  seq={event.seq}")
+                    print(f"[SIM RAW] message: {event.message}")
+                    print("=" * 70)
+
+                # ── Terminal conditions ────────────────────────────────────────
+                if event.type == "run_test_passed":
+                    # Watchdog confirmed ≥5 iterations; SIGKILL (rc=-9) is expected.
+                    test_passed_payload = event.payload
+                    break   # no artifacts_ready will follow — exit stream now
+
                 if event.type == "artifacts_ready":
-                    break
-            
-            # Get final status
-            final_status = await self.sim_server.get_status(sim_run_id)
+                    break   # full run completed normally
+
             logs = "\n".join(logs_collected)
             stderr = "\n".join(stderr_collected)
-            
+
+            # ── TEST mode: success is determined by run_test_passed, not rc ──
+            if test_passed_payload is not None:
+                iterations_seen = test_passed_payload.get("iterations_observed", 0)
+                duration = test_passed_payload.get("duration_seconds", 0.0)
+                print(f"[SIM] Test passed — {iterations_seen} iterations in {duration:.1f}s")
+                return {
+                    "success": True,
+                    "test_passed": True,
+                    "sim_run_id": sim_run_id,
+                    "iterations_observed": iterations_seen,
+                    "duration_seconds": duration,
+                    "logs": logs,
+                    "artifacts": [],
+                }
+
+            # ── FULL mode: check final status and collect artifacts ───────────
+            final_status = await self.sim_server.get_status(sim_run_id)
+
             if final_status.status == SimRunStatus.SUCCEEDED:
                 artifacts = await self.sim_server.get_artifacts(sim_run_id)
-                artifacts_list = [a.model_dump() for a in artifacts]
-                
+                artifacts_list = [
+                    a.model_dump() for a in artifacts
+                    if not (a.path or a.name or "").startswith("processor")
+                ]
+                print(f"[SIM] Succeeded — {len(artifacts_list)} artifacts")
                 await self.event_bus.emit_sim_succeeded(
                     sim_run_id=sim_run_id,
                     duration_seconds=final_status.duration_seconds or 0.0,
                     artifacts=artifacts_list,
                 )
-                
                 return {
                     "success": True,
                     "sim_run_id": sim_run_id,
@@ -1256,17 +1336,12 @@ nu              [0 2 -1 0 0 0 0] 1e-06;
                     "duration_seconds": final_status.duration_seconds,
                 }
             else:
-                # Build comprehensive error message for self-healing.
-                # NOTE: stderr is already fully accumulated via on_sim_event →
-                # stderr_collected, so do NOT overwrite it here.
                 error_msg = final_status.error or "Simulation failed"
-                
                 await self.event_bus.emit_sim_failed(
                     sim_run_id=sim_run_id,
                     error=error_msg,
                     exit_code=final_status.exit_code,
                 )
-                
                 return {
                     "success": False,
                     "sim_run_id": sim_run_id,
@@ -1413,7 +1488,7 @@ stopAt          endTime;
 endTime         {max_iter};
 deltaT          1;
 writeControl    timeStep;
-writeInterval   100;
+writeInterval   1;
 purgeWrite      0;
 writeFormat     ascii;
 writePrecision  8;

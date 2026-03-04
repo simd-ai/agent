@@ -1,146 +1,135 @@
-# OpenFOAM Case Generation Prompt
+# OpenFOAM Case Generation — General Rules
 
-You are generating a complete OpenFOAM case. Create all necessary files for a working simulation.
+> **Target version: OpenFOAM v2406** — all generated files MUST be valid for OpenFOAM v2406 (openfoam.com release). Use v2406 syntax, keyword names, and dictionary structure throughout.
 
-## CRITICAL: Output Format
+You are generating a complete OpenFOAM simulation case.
+The solver has already been selected for you — it is provided in the task below.
 
-**You MUST output each file using this exact format:**
+> **Pressure field type, dimensions, and controlDict timing rules are defined
+> in the solver-specific pack loaded in section G below. Follow those — do NOT
+> invent or override them here.**
+
+---
+
+## A) Output format (CRITICAL — violations break the parser)
+
+Every file MUST use this EXACT format:
 
 ```file:relative/path/to/file
-<complete file content>
+<complete file content here>
 ```
 
-For example:
+- No other code blocks between files.
+- No language tags (`cpp`, `python`, etc.) — ONLY `file:path`.
+- No explanatory text between files.
 
-```file:system/controlDict
-FoamFile
-{
-    version     2.0;
-    format      ascii;
-    class       dictionary;
-    object      controlDict;
-}
+---
 
-application     simpleFoam;
-...
-```
+## B) Solver is already chosen — do NOT change it
 
-**Do NOT include any other code blocks or explanatory text between files.**
-**Do NOT use language identifiers like ```cpp or ```python - only use ```file:path**
+The selected solver is stated explicitly in the task.
+- `application` in `system/controlDict` MUST match it exactly.
+- Do NOT invent a different solver.
 
-## Solver Selection (CRITICAL)
+---
 
-You MUST select the solver based on these rules:
-- **Steady-state incompressible flow** → `simpleFoam`
-- **Transient incompressible flow** → `pimpleFoam`
+## C) Mesh patches are the source of truth — NO HALLUCINATION
 
-**Do NOT use buoyantSimpleFoam or buoyantPimpleFoam** — buoyancy is not supported yet.
-Even if heat transfer is mentioned, use `simpleFoam` (steady) or `pimpleFoam` (transient).
+- Use EXACT patch names from `simulation_config.mesh.patches[].name`.
+- Names are CASE-SENSITIVE.
+- NEVER invent names like `front_and_back` (underscore) if the mesh has `frontAndBack` (camelCase).
+- Every patch must appear in EVERY `0/*` field file.
 
-## File Consistency Rules (CRITICAL — violations cause crashes)
+---
 
-1. The `application` field in `system/controlDict` determines which solver runs.
-2. `simpleFoam` reads the file `0/p` — you MUST generate `0/p`, NOT `0/p_rgh`.
-3. `pimpleFoam` reads the file `0/p` — you MUST generate `0/p`, NOT `0/p_rgh`.
-4. Every field file in `0/` must list ALL patch names from the mesh. Missing patches = crash.
-5. Patch names must be IDENTICAL across ALL files (case-sensitive).
-6. Do NOT generate `constant/thermophysicalProperties` or `constant/g` — not needed without buoyancy.
+## D) 2D meshes — frontAndBack constraint patch
 
-## Required Files
+If the mesh has a patch with type `empty` (commonly `frontAndBack`):
+- In EVERY `0/*` file that patch MUST be: `{ type empty; }`.
+- For velocity `0/U`, out-of-plane component must be zero.
 
-Generate ALL of these files:
+---
 
-### system/ directory
-1. `system/controlDict` — Simulation control
-2. `system/fvSchemes` — Discretization schemes
-3. `system/fvSolution` — Solver settings
+## E) Constraint type matching (violations = instant crash)
 
-**Do NOT generate blockMeshDict — we use an external mesh file converted by the simulation server.**
+| Mesh patch type | Allowed BC type in `0/*` files |
+|-----------------|-------------------------------|
+| `empty` | ONLY `type empty;` |
+| `symmetry` / `symmetryPlane` | ONLY `type symmetry;` |
+| `patch` | `fixedValue`, `zeroGradient`, `noSlip`, etc. — NEVER `empty` or `symmetry` |
+| `wall` | `noSlip` for U, wall functions for turbulence — NEVER `empty` |
 
-### 0/ directory (initial conditions)
-4. `0/U` — Velocity field
-5. `0/p` — Pressure field (ALWAYS `p`, never `p_rgh`)
-6. `0/k` — Turbulent kinetic energy (if turbulent)
-7. `0/omega` — Specific dissipation rate (if kOmegaSST)
-8. `0/epsilon` — Turbulent dissipation (if kEpsilon)
-9. `0/nut` — Turbulent viscosity (if turbulent)
-10. `0/T` — Temperature field (only if heat_transfer is true in config)
+---
 
-### constant/ directory
-11. `constant/transportProperties` — Fluid properties (nu)
-12. `constant/turbulenceProperties` — Turbulence model settings (if turbulent)
+## F) External mesh — do NOT generate blockMeshDict
 
-## Boundary Condition Rules
+The mesh has already been converted from `.msh` to OpenFOAM format using `gmshToFoam`.
+The `constant/polyMesh/` directory is therefore already populated.
+Do NOT generate `constant/polyMesh/*` or `system/blockMeshDict`.
 
-Use the EXACT boundary condition types and values from the validated_config.
+---
 
-For each patch in `boundary_conditions`:
-- **inlet**: Use the exact velocity, pressure, turbulence values from config
-- **outlet**: Use the exact pressure, velocity types from config
-- **wall**: Use `noSlip` for U, wall functions for turbulence fields
-- **symmetry**: Use `type symmetry;` for ALL fields — BUT ONLY if the mesh patch type is `symmetry` or `symmetryPlane`
-- **empty**: Use `type empty;` for ALL fields — BUT ONLY if the mesh patch type is `empty`
+## G) Solver-specific requirements
 
-**CRITICAL: Do NOT invent patch names.** Only use patch names that are explicitly listed in the `boundary_conditions` or `mesh.patches` configuration. In particular:
-- Do **NOT** generate a `front_and_back` patch (with underscores). This does not exist in the mesh.
-- The correct 2D patch name is `frontAndBack` (camelCase) — only include it if it appears in the config.
+The task below includes a **Solver Instructions** section loaded specifically
+for the chosen solver.  Follow those instructions for:
+- required files (including which pressure field: `p` or `p_rgh`, its dimensions, and what NOT to generate)
+- `controlDict` timing rules (steady-state iteration count vs transient physical time)
+- fvSchemes and fvSolution templates
+- special files (thermophysicalProperties, g, alpha, T)
 
-## 2D Simulations (CRITICAL)
+---
 
-For 2D simulations (meshes created in Gmsh for 2D geometries):
-- The mesh will have a `frontAndBack` patch of type `empty` after conversion with `gmshToFoam`.
-- You **MUST** include `frontAndBack` with `type empty;` in ALL `0/*` field files (U, p, T, k, omega, nut, epsilon).
-- If the mesh patches include `frontAndBack`, it MUST appear in every field file or OpenFOAM will crash.
-- A post-mesh-conversion fix script will also ensure this, but include it in generated code for correctness.
-
-## CRITICAL: Constraint Type Matching (violations = instant crash)
-
-OpenFOAM constraint types (`empty`, `symmetry`, `wedge`, `cyclic`) MUST match the mesh patch type.
-- If mesh says patch type is `patch` → you CANNOT use `type empty;` or `type symmetry;`. Use `zeroGradient` instead.
-- If mesh says patch type is `wall` → use wall BCs (`noSlip`, wall functions). NEVER `empty`.
-- If mesh says patch type is `empty` → you MUST use `type empty;`.
-- If mesh says patch type is `symmetry` → you MUST use `type symmetry;`.
-
-The mesh patch types are provided in the validated configuration under `mesh.patches`.
-
-For `0/T` (temperature field):
-- Only generate if `heat_transfer: true` in the physics config
-- Use `fixedValue` with the temperature from boundary_conditions
-- Use `zeroGradient` for outlets
-- For walls with specified temperature, use `fixedValue`
-
-## fvSchemes: wallDist (CRITICAL for turbulent models)
-
-If the simulation uses a turbulence model (kOmegaSST, kEpsilon, etc.), you **MUST** include a `wallDist` sub-dictionary in `system/fvSchemes`:
-
-```
-wallDist
-{
-    method meshWave;
-}
-```
-
-Place it at the end of fvSchemes, after `snGradSchemes`. Without this, OpenFOAM will crash with:
-`Entry 'method' not found in dictionary "system/fvSchemes/wallDist"`
-
-## Guidelines
-
-1. **Correct Syntax**: Use proper OpenFOAM dictionary syntax with semicolons and braces.
-2. **Patch Names**: Use the EXACT patch names from the validated_config — these match the mesh.
-3. **Physical Values**: Use values from the validated_config (density, viscosity, etc.).
-4. **Conservative Settings**: Use relaxation factors 0.3 for p, 0.7 for U/k/omega/epsilon.
-5. **End Time**: Set `endTime` to the value of `solver.max_iterations` from the validated_config. Always use `startFrom startTime; startTime 0;` in controlDict.
-6. **Dimensions**: Always include correct OpenFOAM dimensions arrays.
-
-## Pressure Dimensions
-
-For `simpleFoam` and `pimpleFoam` (incompressible solvers):
-- Pressure dimensions: `[0 2 -2 0 0 0 0]` (kinematic pressure, m²/s²)
-
-## If Retrying After Error
+## H) Self-healing retry rules
 
 When `previous_errors` is provided:
-1. Read the error carefully — especially "cannot find file" errors
-2. Check that ALL files referenced by the solver exist in `0/`
-3. Check that ALL patch names match across files
-4. Apply conservative settings if divergence occurred
+
+1. Read every error carefully — especially "cannot find file" messages.
+2. Verify ALL files referenced by the solver exist in `0/`.
+3. Check ALL patch names are consistent across files.
+4. If error mentions `not constraint type 'empty'` → mesh patch is `patch` type, NOT `empty`. Replace `type empty` with `zeroGradient`.
+5. If error mentions `not constraint type 'symmetry'` → use `zeroGradient` instead.
+6. If error mentions `wallDist` → add `wallDist { method meshWave; }` to fvSchemes.
+7. If error mentions `nutkWallFunction` / "patch type for patch wall must be wall" → wall BCs are OK; boundary fix script handles mesh type.
+8. Use conservative relaxation if divergence occurred.
+9. **Exit code 136 / Floating Point Exception (SIGFPE) in `DICPreconditioner::calcReciprocalD` or `DICSmoother`**: This crash means the GAMG pressure solver's coarsened matrix diagonal went to zero or negative (i.e., the solution already diverged). Do ALL of the following:
+   - Switch GAMG `smoother` from `DIC` to `GaussSeidel` in `fvSolution/solvers/p` and `pFinal`.
+   - Reduce `nOuterCorrectors` to 1 and `nCorrectors` to 1 in the PIMPLE block.
+   - Tighten relaxation: `p 0.2`, `rho 0.05`, `U 0.5`, equations `0.5`.
+   - If `equationOfState rhoConst` is used and inlet T < 200 K or ΔT between inlet and wall > 100 K, switch to `icoPolynomial` (cryogenic) — `rhoConst` is FORBIDDEN for cryogenic conditions (see solver-specific rules).
+   - Add or tighten `limitTemperature` in `constant/fvOptions` to prevent negative-T divergence that destabilizes the matrix.
+10. **Massive Courant number (Co >> 1, e.g. 1e10 or larger) with Euler ddt**: The solution completely diverged before the crash. In addition to the fixes in rule 9, switch `controlDict` to use adjustable time-stepping: set `adjustTimeStep yes; maxCo 0.5; deltaT 1e-5;`. This prevents one bad time-step from blowing up the entire run.
+11. **"Negative initial temperature" / "Negative Temperature" errors**: The energy field diverged to unphysical values. Fix: ensure `limitTemperature` in `constant/fvOptions` uses the actual min/max range of your thermal BCs (not 1/100000). If using `rhoConst` with a cold fluid and hot wall, switch EOS as in rule 9.
+
+---
+
+## I) General coding guidelines
+
+1. Correct OpenFOAM dictionary syntax: semicolons everywhere, balanced braces.
+2. Physical values from `validated_config` (density, viscosity, temperature, velocity).
+3. Conservative relaxation: 0.3 for pressure, 0.7–0.9 for velocity/turbulence.
+4. Always include correct OpenFOAM dimension arrays.
+5. fvSchemes MUST include `wallDist { method meshWave; }` for any turbulent model.
+6. Do NOT invent patch names not in the config.
+
+---
+
+## J) fvSolution — Linear solver selection rules
+
+Choose the linear solver for each field based on the **mathematical nature of its governing equation**:
+
+| Field | Equation type | Recommended solver | Smoother |
+|---|---|---|---|
+| `p`, `p_rgh` | Symmetric elliptic (Laplacian) | `GAMG` | `GaussSeidel` |
+| `U` | Asymmetric transport | `PBiCGStab` or `smoothSolver` | `symGaussSeidel` |
+| `h`, `e`, `T` | Asymmetric transport | `PBiCGStab` or `smoothSolver` | `symGaussSeidel` |
+| `k`, `omega`, `epsilon`, `nut` | Asymmetric transport | `PBiCGStab` or `smoothSolver` | `symGaussSeidel` |
+| `rho` | Explicit / diagonal update | `diagonal` | — |
+
+**Rules:**
+- `GAMG` is optimal for symmetric positive-definite systems (pressure). It exploits the symmetry to converge aggressively with algebraic multigrid.
+- `PBiCGStab` (Preconditioned Bi-Conjugate Gradient Stabilised) handles the non-symmetric, convection-dominated matrices produced by momentum, energy, and turbulence transport equations.
+- `smoothSolver` with `symGaussSeidel` is a robust alternative to `PBiCGStab` for transport equations — use it when stability is more important than raw speed.
+- Never use `GAMG` for asymmetric fields (`U`, `h`, `k`, etc.) — it may diverge or produce wrong results.
+- Never use `smoothSolver`/`PBiCGStab` for pressure — they converge far slower than `GAMG` for elliptic systems.
+- **🚫 FORBIDDEN: `smoother DIC` inside GAMG for pressure.** DIC (Diagonal Incomplete Cholesky) as a GAMG smoother crashes with SIGFPE (exit code 136) when the coarsened matrix diagonal approaches zero — which happens any time the solution diverges even slightly. **ALWAYS use `smoother GaussSeidel`** for GAMG pressure solvers. DIC is only safe as a standalone preconditioner (`solver PCG; preconditioner DIC;`), NOT as a GAMG smoother.

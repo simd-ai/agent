@@ -5,8 +5,6 @@ import io
 import logging
 import re
 import zipfile
-from pathlib import Path
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +30,7 @@ RUN_SCRIPT_TEMPLATE = """#!/bin/bash
 # Generated run script for OpenFOAM case
 set -e
 
-# Source OpenFOAM environment (adjust path as needed)
+# Source OpenFOAM environment
 if [ -f /opt/openfoam/etc/bashrc ]; then
     source /opt/openfoam/etc/bashrc
 elif [ -f /usr/lib/openfoam/openfoam*/etc/bashrc ]; then
@@ -45,34 +43,15 @@ echo "Working directory: $(pwd)"
 # Step 1: Mesh conversion (if mesh file provided)
 {mesh_conversion_commands}
 
-# Step 2: Run blockMesh if blockMeshDict exists (only if no external mesh)
-if [ -f system/blockMeshDict ] && [ ! -d constant/polyMesh ]; then
-    echo "=== Running blockMesh ==="
-    blockMesh
-elif [ -d constant/polyMesh ]; then
-    echo "=== Mesh already exists in constant/polyMesh ==="
-else
-    echo "No blockMeshDict found, skipping blockMesh"
-fi
-
-# Step 3: Run checkMesh
+# Step 2: Run checkMesh
 if command -v checkMesh &> /dev/null && [ -d constant/polyMesh ]; then
     echo "=== Running checkMesh ==="
     checkMesh || echo "checkMesh reported issues, continuing..."
 fi
 
-# Step 4: Run the solver
+# Step 3: Run the solver
 SOLVER="{solver}"
 echo "=== Running solver: $SOLVER ==="
-
-# For minimal first-run validation (test mode), limit iterations
-if [ -n "$SIMD_TEST_MODE" ] || [ "$1" = "--test" ]; then
-    echo "Test mode: limiting to 1 iteration"
-    # Modify controlDict for test run
-    sed -i.bak 's/endTime.*/endTime 1;/' system/controlDict 2>/dev/null || true
-    sed -i.bak 's/writeInterval.*/writeInterval 1;/' system/controlDict 2>/dev/null || true
-fi
-
 $SOLVER
 
 echo "=== Case execution complete ==="
@@ -397,15 +376,10 @@ def validate_openfoam_structure(files: dict[str, str]) -> list[str]:
     )
     if not has_initial:
         warnings.append("No initial conditions (0/ directory) found")
-    
-    # Check for mesh or blockMeshDict
-    has_mesh = any(
-        "blockMeshDict" in p or "polyMesh" in p
-        for p in files.keys()
-    )
-    if not has_mesh:
-        warnings.append("No mesh definition (blockMeshDict or polyMesh) found")
-    
+
+    # Note: mesh presence is NOT checked here because all cases use an external
+    # mesh converted by gmshToFoam.  blockMeshDict is intentionally never generated.
+
     return warnings
 
 
@@ -454,8 +428,8 @@ def _get_conversion_command(mesh_format: str, mesh_filename: str) -> str:
     fmt = mesh_format.lower()
     
     if fmt in ("msh",):
-        # Fluent/Gmsh mesh
-        return f"fluentMeshToFoam {mesh_filename}"
+        # Gmsh mesh — gmshToFoam handles both Gmsh 2.x and 4.x format
+        return f"gmshToFoam {mesh_filename}"
     elif fmt in ("cas",):
         # Fluent case
         return f"fluentMeshToFoam {mesh_filename}"

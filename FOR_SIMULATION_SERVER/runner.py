@@ -16,8 +16,6 @@ from app.store import emit_event, get_run, runs
 from app.openfoam import (
     collect_artifacts,
     detect_solver,
-    parse_openfoam_log_line,
-    patch_control_dict_for_test,
 )
 
 
@@ -127,7 +125,95 @@ async def run_openfoam_command(
     return process.returncode, "\n".join(stdout_lines), stderr_text
 
 
-async def run_simulation(run_id: str, case_dir: Path, mode: RunMode):
+_DECOMPOSE_PAR_DICT_TEMPLATE = """\
+/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\\\    /   O peration     | Version:  v2312                                 |
+|   \\\\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\\\/     M anipulation  |                                                 |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      decomposeParDict;
+}}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+numberOfSubdomains  {n};
+
+method  scotch;
+
+// ************************************************************************* //
+"""
+
+
+def _ensure_decompose_par_dict(case_dir: Path, n_cores: int) -> None:
+    """Write system/decomposeParDict if not already present or if n_cores changed."""
+    dict_path = case_dir / "system" / "decomposeParDict"
+    if dict_path.exists():
+        content = dict_path.read_text()
+        # If the existing file already has the correct n, leave it alone.
+        if f"numberOfSubdomains  {n_cores};" in content or f"numberOfSubdomains {n_cores};" in content:
+            return
+    dict_path.write_text(_DECOMPOSE_PAR_DICT_TEMPLATE.format(n=n_cores))
+
+
+def _patch_control_dict_for_test_steps(case_dir: Path, n_steps: int = 20) -> None:
+    """Patch system/controlDict so the solver stops after exactly n_steps time-steps.
+
+    Strategy:
+    1. Read the current deltaT (falling back to 1.0 if not found).
+    2. Set endTime = startTime + n_steps * deltaT.
+    3. Force stopAt endTime so no residual control overrides it.
+    4. Set writeInterval = endTime so we get exactly one write at the end.
+
+    This is far cheaper than the old approach of setting endTime=1 when
+    deltaT is very small (e.g. deltaT=0.001 would cause 1000 iterations).
+    """
+    import re
+
+    ctrl = case_dir / "system" / "controlDict"
+    if not ctrl.exists():
+        return
+
+    text = ctrl.read_text()
+
+    def _float(key: str, default: float) -> float:
+        m = re.search(rf"^\s*{key}\s+([\d.eE+\-]+)\s*;", text, re.MULTILINE)
+        return float(m.group(1)) if m else default
+
+    delta_t   = _float("deltaT",   1.0)
+    start_t   = _float("startTime", 0.0)
+    end_time  = start_t + n_steps * delta_t
+
+    def _replace(key: str, value: str) -> str:
+        nonlocal text
+        pattern = rf"(^\s*{key}\s+)[^\n]+;"
+        replacement = rf"\g<1>{value};"
+        new_text, n = re.subn(pattern, replacement, text, flags=re.MULTILINE)
+        if n == 0:
+            # Key not present — append before the final closing line
+            new_text = text.rstrip().rstrip("//").rstrip() + f"\n{key}  {value};\n"
+        text = new_text
+        return text
+
+    _replace("stopAt",       "endTime")
+    _replace("endTime",      f"{end_time:.6g}")
+    _replace("writeControl", "timeStep")
+    _replace("writeInterval", str(n_steps))   # write once at the last step
+
+    ctrl.write_text(text)
+
+
+async def run_simulation(run_id: str, case_dir: Path, mode: RunMode, n_cores: int = 1):
+    # Guard: if routes.py passed a FastAPI Form descriptor instead of a parsed int, coerce it.
+    try:
+        n_cores = int(n_cores)
+    except (TypeError, ValueError):
+        n_cores = 1
     """
     Execute OpenFOAM simulation in the background.
 
@@ -273,57 +359,165 @@ async def run_simulation(run_id: str, case_dir: Path, mode: RunMode):
             level="warn" if exit_code != 0 else "info"
         )
 
-        # ─── Step 4: Run the solver ───
+        # ─── Step 4: Run the solver (serial or MPI parallel) ───
         if run:
             run.status = RunStatus.RUNNING
         solver = detect_solver(case_dir)
+        parallel = n_cores > 1
 
-        # For TEST mode, patch controlDict to run 1 iteration
+        # For TEST mode, patch controlDict to run exactly TEST_STEPS time-steps.
+        # We read the actual deltaT from the generated controlDict so we don't
+        # waste time when deltaT is very small (e.g. 0.001 → endTime=1 would
+        # mean 1000 iterations with the old approach).
         if mode == RunMode.TEST:
-            patch_control_dict_for_test(case_dir)
+            _patch_control_dict_for_test_steps(case_dir, n_steps=20)
+
+        # ─── Step 4a: decomposePar (only when running parallel) ───
+        if parallel:
+            _ensure_decompose_par_dict(case_dir, n_cores)
+
+            emit_event(
+                run_id, "decompose_started",
+                f"Decomposing mesh into {n_cores} subdomains…",
+                payload={"n_cores": n_cores},
+            )
+            dec_code, _, dec_err = await run_openfoam_command(
+                run_id, "decomposePar", case_dir, event_prefix="decompose"
+            )
+            if dec_code != 0:
+                if run:
+                    run.status = RunStatus.FAILED
+                    run.error = f"decomposePar failed (exit code {dec_code})"
+                emit_event(
+                    run_id, "decompose_failed",
+                    f"decomposePar failed (exit code {dec_code})",
+                    level="error",
+                    payload={"exit_code": dec_code, "stderr": dec_err[:2000]},
+                )
+                return
+            emit_event(
+                run_id, "decompose_complete",
+                f"Mesh decomposed into {n_cores} subdomains",
+                payload={"n_cores": n_cores},
+            )
+
+        # ─── Step 4b: Solver command ───
+        if parallel:
+            solver_cmd = f"mpirun -np {n_cores} {solver} -parallel"
+        else:
+            solver_cmd = solver
 
         emit_event(
             run_id, "run_started",
-            f"Starting {solver} ({mode.value} mode)",
-            payload={"solver": solver, "mode": mode.value}
+            f"Starting {solver} ({mode.value} mode, {n_cores} core{'s' if n_cores > 1 else ''})",
+            payload={"solver": solver, "mode": mode.value, "n_cores": n_cores, "parallel": parallel},
         )
 
-        # Run the solver
-        full_cmd = build_shell_command(f"cd {case_dir} && {solver}")
-        
+        full_cmd = build_shell_command(f"cd {case_dir} && {solver_cmd}")
+
         process = await asyncio.create_subprocess_shell(
             full_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
+        import re as _re
+
+        # ── Per-time-step patterns ───────────────────────────────────────────
+        # OpenFOAM log structure per time step:
+        #   Time = 0.482
+        #   Courant Number mean: 0.04 max: 0.27
+        #   smoothSolver: Solving for Ux, Initial residual = 3.67e-3, Final residual = 1.03e-8, No Iterations 1
+        #   continuity errors : sum local = 1.33e-7, global = 5.7e-10, cumulative = -4.16e-6
+        #   ExecutionTime = 41.2 s  ClockTime = 42 s   ← end of step → emit
+        _RE_TIME    = _re.compile(r'^Time\s*=\s*([\d.e+\-]+)')
+        _RE_SOLVE   = _re.compile(
+            r'Solving for (\w+),\s*Initial residual\s*=\s*([\d.e+\-]+),'
+            r'\s*Final residual\s*=\s*([\d.e+\-]+),\s*No Iterations\s+(\d+)'
+        )
+        _RE_COURANT = _re.compile(r'Courant Number mean:\s*([\d.e+\-]+)\s+max:\s*([\d.e+\-]+)')
+        _RE_CONT    = _re.compile(
+            r'continuity errors.*?sum local\s*=\s*([\d.e+\-]+),'
+            r'\s*global\s*=\s*([\d.e+\-]+),\s*cumulative\s*=\s*([-\d.e+\-]+)'
+        )
+        _RE_EXEC    = _re.compile(r'ExecutionTime\s*=\s*([\d.]+)\s*s.*?ClockTime\s*=\s*([\d.]+)\s*s')
+
+        # ── Accumulator for the current time step ────────────────────────────
+        def _fresh_step() -> dict:
+            return {"time": None, "fields": [], "residuals": {}, "courant": None,
+                    "continuity": None, "execution": None}
+
+        step = _fresh_step()
         iteration = 0
-        residuals: dict = {}
+        stdout_lines: list[str] = []
 
         # Stream stdout line by line
         async for raw_line in process.stdout:
             line = raw_line.decode("utf-8", errors="replace").rstrip()
-            
+            stdout_lines.append(line)
+
             # Emit raw log
             emit_event(run_id, "run_log", line, payload={"stream": "stdout"})
-            
-            # Parse for progress
-            parsed = parse_openfoam_log_line(line)
-            if parsed:
-                if "field" in parsed and "residual" in parsed:
-                    residuals[parsed["field"]] = parsed["residual"]
-                if "time" in parsed:
-                    iteration += 1
-                    emit_event(
-                        run_id, "run_progress",
-                        f"Iteration {iteration}",
-                        payload={
-                            "iteration": iteration,
-                            "time": parsed.get("time"),
-                            "residuals": dict(residuals),
-                        }
-                    )
-                    residuals.clear()
+
+            # ── Time marker: start of new step ───────────────────────────────
+            m = _RE_TIME.match(line)
+            if m:
+                step["time"] = float(m.group(1))
+                continue
+
+            # ── Solver residuals ─────────────────────────────────────────────
+            m = _RE_SOLVE.search(line)
+            if m:
+                field = m.group(1)
+                if field not in step["fields"]:
+                    step["fields"].append(field)
+                step["residuals"][field] = {
+                    "initial": float(m.group(2)),
+                    "final":   float(m.group(3)),
+                    "iters":   int(m.group(4)),
+                }
+                continue
+
+            # ── Courant number ───────────────────────────────────────────────
+            m = _RE_COURANT.search(line)
+            if m:
+                step["courant"] = {"mean": float(m.group(1)), "max": float(m.group(2))}
+                continue
+
+            # ── Continuity errors ────────────────────────────────────────────
+            m = _RE_CONT.search(line)
+            if m:
+                step["continuity"] = {
+                    "local":      float(m.group(1)),
+                    "global":     float(m.group(2)),
+                    "cumulative": float(m.group(3)),
+                }
+                continue
+
+            # ── ExecutionTime: end of step → emit run_progress ───────────────
+            m = _RE_EXEC.search(line)
+            if m and step["time"] is not None and step["residuals"]:
+                t, ct = float(m.group(1)), float(m.group(2))
+                step["execution"] = {
+                    "step_seconds":  t,
+                    "clock_seconds": ct,
+                    "label":         f"{t:.2f}s (clock {ct:.2f}s)",
+                }
+                iteration += 1
+                emit_event(
+                    run_id, "run_progress",
+                    f"Time {step['time']:.4g} | Step {iteration}",
+                    payload={
+                        "iteration":   iteration,
+                        "time":        step["time"],
+                        "fields":      list(step["fields"]),
+                        "residuals":   dict(step["residuals"]),
+                        "courant":     step["courant"],
+                        "continuity":  step["continuity"],
+                        "execution":   step["execution"],
+                    },
+                )
+                step = _fresh_step()
 
         # Wait for process to finish
         await process.wait()
@@ -331,14 +525,39 @@ async def run_simulation(run_id: str, case_dir: Path, mode: RunMode):
 
         # Capture any remaining stderr
         stderr_data = await process.stderr.read()
-        if stderr_data:
-            stderr_text = stderr_data.decode("utf-8", errors="replace")
+        stderr_text = stderr_data.decode("utf-8", errors="replace") if stderr_data else ""
+        if stderr_text.strip():
             emit_event(
                 run_id, "run_log", stderr_text[:2000],
                 level="warn", payload={"stream": "stderr"}
             )
 
-        # Update run status
+        # ─── Step 4c: reconstructPar (parallel runs only) ───
+        if parallel and process.returncode == 0:
+            emit_event(
+                run_id, "reconstruct_started",
+                "Reconstructing parallel results…",
+                payload={"n_cores": n_cores},
+            )
+            rec_code, _, rec_err = await run_openfoam_command(
+                run_id, "reconstructPar", case_dir, event_prefix="reconstruct"
+            )
+            if rec_code != 0:
+                # Not fatal — results still exist in processor* dirs; warn but continue
+                emit_event(
+                    run_id, "reconstruct_failed",
+                    f"reconstructPar failed (exit code {rec_code}) — results kept in processor* directories",
+                    level="warn",
+                    payload={"exit_code": rec_code, "stderr": rec_err[:2000]},
+                )
+            else:
+                emit_event(
+                    run_id, "reconstruct_complete",
+                    "Parallel results reconstructed successfully",
+                    payload={"n_cores": n_cores},
+                )
+
+        # ─── Update run status ───
         if run:
             run.exit_code = process.returncode
             run.duration_seconds = round(duration, 2)
@@ -354,6 +573,7 @@ async def run_simulation(run_id: str, case_dir: Path, mode: RunMode):
                     "exit_code": 0,
                     "duration_seconds": round(duration, 2),
                     "mode": mode.value,
+                    "n_cores": n_cores,
                 }
             )
 
@@ -364,12 +584,35 @@ async def run_simulation(run_id: str, case_dir: Path, mode: RunMode):
                 f"Results ready ({len(artifacts)} files)",
                 payload={"artifacts": artifacts}
             )
+
+            # Kick off VTK precomputation in the background so all timestep
+            # VTPs are ready on disk before the agent (or frontend) asks.
+            # Lazy import avoids a circular dependency with routes.py.
+            async def _kick_vtk_precompute():
+                try:
+                    from app.routes import _precompute_all_timesteps
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None, _precompute_all_timesteps, case_dir, run_id
+                    )
+                    emit_event(
+                        run_id, "vtk_precompute_complete",
+                        "VTK precomputation finished — all timestep VTPs ready",
+                    )
+                except Exception as exc:
+                    print(f"[VTK] Background precompute failed for {run_id}: {exc}")
+
+            asyncio.create_task(_kick_vtk_precompute())
         else:
             if run:
                 run.status = RunStatus.FAILED
                 run.error = f"Solver exited with code {process.returncode}"
-            
-            stderr_text = stderr_data.decode("utf-8", errors="replace") if stderr_data else ""
+
+            # OpenFOAM writes FATAL errors and FPE stack traces to stdout, not stderr.
+            # Include the last 100 stdout lines so the agent can diagnose the crash
+            # even when stderr is empty (e.g. exit code 136 = SIGFPE).
+            stdout_tail = "\n".join(stdout_lines[-100:]) if stdout_lines else ""
+
             emit_event(
                 run_id, "run_failed",
                 f"Solver failed (exit code {process.returncode})",
@@ -377,7 +620,9 @@ async def run_simulation(run_id: str, case_dir: Path, mode: RunMode):
                 payload={
                     "exit_code": process.returncode,
                     "duration_seconds": round(duration, 2),
+                    # Both streams — agent uses whichever is non-empty
                     "stderr": stderr_text[:2000],
+                    "stdout": stdout_tail[-4000:],   # last ~4k chars of solver output
                 }
             )
 

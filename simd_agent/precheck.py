@@ -1,462 +1,133 @@
 # simd_agent/precheck.py
-"""Precheck service for analyzing user prompts and extracting simulation specifications.
+"""Precheck service — analyzes user prompts and extracts CFD simulation specs.
 
-Uses Google GenAI with structured output (response_schema) for reliable JSON parsing.
+Uses Google GenAI with structured function-calling for reliable JSON output.
+All Pydantic models, fluid presets, and the tool schema live in precheck_models.py.
 """
 
-import json
 import logging
 import math
-import re
-from typing import Any, Literal
 
-from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
 
 from simd_agent.settings import get_settings
-
-load_dotenv()
-
-logger = logging.getLogger(__name__)
-
-
-# --- Request Models ---
-
-class MeshPatch(BaseModel):
-    """Mesh patch information."""
-    name: str
-    type: str  # e.g., "wall", "patch", "empty"
-    n_cells: int = Field(alias="nCells", default=0)
-
-    class Config:
-        populate_by_name = True
-
-
-class CheckMeshInfo(BaseModel):
-    """checkMesh output information."""
-    cells: int
-    faces: int
-    points: int
-    bounding_box: dict[str, list[float]] | None = Field(alias="boundingBox", default=None)
-    characteristic_length: float | None = Field(alias="characteristicLength", default=None)
-
-    class Config:
-        populate_by_name = True
-
-
-class MeshInfo(BaseModel):
-    """Uploaded mesh information."""
-    mesh_id: str = Field(alias="meshId")
-    file_name: str = Field(alias="fileName")
-    patches: list[MeshPatch]
-    check_mesh: CheckMeshInfo = Field(alias="checkMesh")
-
-    class Config:
-        populate_by_name = True
-
-
-class PrecheckRequest(BaseModel):
-    """Request for precheck analysis."""
-    prompt: str = Field(..., min_length=1, description="Natural language simulation description")
-    has_mesh: bool = Field(default=False, alias="hasMesh")
-    mesh_info: MeshInfo | None = Field(default=None, alias="meshInfo")
-    # Legacy support for old format
-    mesh: MeshInfo | None = None
-    previous_config: dict[str, Any] | None = Field(default=None, alias="previousConfig")
-
-    class Config:
-        populate_by_name = True
-
-    def get_mesh(self) -> MeshInfo | None:
-        """Get mesh info from either field."""
-        return self.mesh_info or self.mesh
-
-
-# --- Response Models ---
-
-class SolverSettings(BaseModel):
-    """Solver configuration."""
-    algorithm: Literal["SIMPLE", "PIMPLE", "PISO"] = "SIMPLE"
-    max_iterations: int = Field(default=2000, alias="maxIterations")
-    convergence_criteria: float = Field(default=1e-6, alias="convergenceCriteria")
-    end_time: float | None = Field(default=None, alias="endTime")  # For transient
-    delta_t: float | None = Field(default=None, alias="deltaT")  # For transient
-    write_interval: float | None = Field(default=None, alias="writeInterval")
-
-    class Config:
-        populate_by_name = True
-
-
-class FluidProperties(BaseModel):
-    """Fluid/material properties."""
-    preset_id: str = Field(default="air", alias="presetId")  # water, air, custom
-    name: str = "Air"
-    rho: float = 1.225  # density [kg/m³]
-    mu: float = 1.81e-5  # dynamic viscosity [Pa·s]
-    Cp: float = 1006.0  # specific heat [J/(kg·K)]
-    k: float = 0.0257  # thermal conductivity [W/(m·K)]
-    temperature: float = 293.15  # reference temp [K]
-
-    class Config:
-        populate_by_name = True
-
-
-class TurbulenceSettings(BaseModel):
-    """Turbulence model parameters."""
-    model: Literal["kEpsilon", "kOmegaSST", "spalartAllmaras", "laminar"] = "kOmegaSST"
-    turbulence_intensity: float = Field(default=5.0, alias="turbulenceIntensity")  # I [%]
-    turbulence_length_scale: float = Field(default=0.01, alias="turbulenceLengthScale")  # L [m]
-    hydraulic_diameter: float = Field(default=0.1, alias="hydraulicDiameter")  # Dh [m]
-    wall_functions: bool = Field(default=True, alias="wallFunctions")
-
-    class Config:
-        populate_by_name = True
-
-
-class FieldBC(BaseModel):
-    """Single field boundary condition (OpenFOAM-style)."""
-    type: str  # fixedValue, zeroGradient, noSlip, etc.
-    value: float | list[float] | None = None
-
-
-class PatchBoundaryCondition(BaseModel):
-    """Per-patch, per-field boundary conditions."""
-    patch_class: Literal["inlet", "outlet", "wall", "symmetry", "periodic", "empty"] = Field(
-        alias="patchClass"
-    )
-    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
-    # Velocity field
-    U: FieldBC | None = None
-    # Pressure field
-    p: FieldBC | None = None
-    # Temperature (if heat transfer enabled)
-    T: FieldBC | None = None
-    # Turbulence fields (k-epsilon)
-    k: FieldBC | None = None
-    epsilon: FieldBC | None = None
-    # Turbulence fields (k-omega)
-    omega: FieldBC | None = None
-    # Turbulent viscosity
-    nut: FieldBC | None = None
-
-    class Config:
-        populate_by_name = True
-
-
-class SuggestedConfig(BaseModel):
-    """Suggested simulation configuration - complete setup for frontend."""
-    # Core physics
-    case_type: str = Field(default="internal_flow", alias="caseType")  # internal_pipe_flow, external_aero, etc.
-    flow_regime: Literal["laminar", "turbulent"] = Field(alias="flowRegime")
-    time_scheme: Literal["steady", "transient"] = Field(alias="timeScheme")
-    compressibility: Literal["incompressible", "compressible"] = "incompressible"
-    enable_heat_transfer: bool = Field(default=False, alias="enableHeatTransfer")
-    gravity: bool = False
-
-    # Solver settings
-    solver: SolverSettings
-
-    # Fluid properties
-    fluid: FluidProperties
-
-    # Turbulence settings
-    turbulence: TurbulenceSettings
-
-    # Per-patch boundary conditions (OpenFOAM-style)
-    boundary_conditions: dict[str, PatchBoundaryCondition] = Field(
-        default_factory=dict, alias="boundaryConditions"
-    )
-
-    class Config:
-        populate_by_name = True
-
-
-# Legacy boundary hint (still supported for backward compat)
-class VelocityBC(BaseModel):
-    """Velocity boundary condition."""
-    type: str
-    value: list[float] | None = None
-    magnitude: float | None = None
-
-
-class PressureBC(BaseModel):
-    """Pressure boundary condition."""
-    type: str
-    value: float | None = None
-
-
-class TemperatureBC(BaseModel):
-    """Temperature boundary condition."""
-    type: str
-    value: float | None = None
-
-
-class BoundaryHint(BaseModel):
-    """Suggested boundary condition for a patch (legacy format)."""
-    suggested_type: Literal["inlet", "outlet", "wall", "symmetry", "periodic"] = Field(
-        alias="suggestedType"
-    )
-    velocity: VelocityBC | None = None
-    pressure: PressureBC | None = None
-    temperature: TemperatureBC | None = None
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
-    reasoning: str = ""
-
-    class Config:
-        populate_by_name = True
-
-
-class KPIValue(BaseModel):
-    """A KPI target value."""
-    value: float
-    unit: str
-
-
-class CustomKPI(BaseModel):
-    """Custom KPI target."""
-    name: str
-    value: float
-    unit: str
-
-
-class KPITargets(BaseModel):
-    """KPI targets extracted from prompt."""
-    pressure_drop: KPIValue | None = Field(default=None, alias="pressureDrop")
-    flow_rate: KPIValue | None = Field(default=None, alias="flowRate")
-    temperature: KPIValue | None = None
-    velocity: KPIValue | None = None
-    custom: list[CustomKPI] = Field(default_factory=list)
-
-    class Config:
-        populate_by_name = True
-
-
-class Interpretation(BaseModel):
-    """LLM's understanding of the prompt."""
-    summary: str
-    simulation_type: str = Field(alias="simulationType")  # e.g., "Internal pipe flow"
-    key_physics: list[str] = Field(default_factory=list, alias="keyPhysics")
-    assumptions: list[str] = Field(default_factory=list)
-    clarifications: list[str] | None = None
-
-    class Config:
-        populate_by_name = True
-
-
-class ConfidenceScores(BaseModel):
-    """Confidence scores for various aspects."""
-    overall: float = Field(default=0.5, ge=0.0, le=1.0)
-    flow_regime: float = Field(default=0.5, ge=0.0, le=1.0, alias="flowRegime")
-    boundary_conditions: float = Field(default=0.5, ge=0.0, le=1.0, alias="boundaryConditions")
-    physics_settings: float = Field(default=0.5, ge=0.0, le=1.0, alias="physicsSettings")
-
-    class Config:
-        populate_by_name = True
-
-
-class PrecheckResponse(BaseModel):
-    """Response from precheck analysis."""
-    success: bool
-    confidence: float = Field(default=0.5, ge=0.0, le=1.0)  # Top-level confidence
-    message: str = ""  # Summary message for frontend
-    suggested_config: SuggestedConfig = Field(alias="suggestedConfig")
-    # Legacy fields (still returned for backward compat)
-    boundary_hints: dict[str, BoundaryHint] | None = Field(default=None, alias="boundaryHints")
-    kpi_targets: KPITargets | None = Field(default=None, alias="kpiTargets")
-    interpretation: Interpretation
-    confidence_scores: ConfidenceScores = Field(alias="confidenceScores")
-    next_step: int = Field(default=1, ge=1, le=3, alias="nextStep")
-    should_show_mesh_viewer: bool = Field(default=False, alias="shouldShowMeshViewer")
-    warnings: list[str] | None = None
-    errors: list[str] | None = None
-
-    class Config:
-        populate_by_name = True
-
-
-# --- Fluid Presets ---
-
-FLUID_PRESETS: dict[str, FluidProperties] = {
-    "air": FluidProperties(
-        preset_id="air",
-        name="Air",
-        rho=1.225,
-        mu=1.81e-5,
-        Cp=1006.0,
-        k=0.0257,
-        temperature=293.15,
-    ),
-    "water": FluidProperties(
-        preset_id="water",
-        name="Water",
-        rho=998.2,
-        mu=1.002e-3,
-        Cp=4182.0,
-        k=0.598,
-        temperature=293.15,
-    ),
-    "oil": FluidProperties(
-        preset_id="oil",
-        name="Oil (SAE 30)",
-        rho=880.0,
-        mu=0.29,
-        Cp=1900.0,
-        k=0.145,
-        temperature=293.15,
-    ),
-    "ln2": FluidProperties(
-        preset_id="ln2",
-        name="Liquid Nitrogen (LN2)",
-        rho=808.0,  # kg/m³ at 77K
-        mu=1.58e-4,  # Pa·s at 77K
-        Cp=2042.0,  # J/(kg·K)
-        k=0.140,  # W/(m·K) thermal conductivity
-        temperature=77.0,  # K (boiling point at 1 atm)
-    ),
-}
-
-
-# --- Precheck Service ---
-
-# Model to use for precheck analysis (Gemini 3)
-PRECHECK_MODEL = "gemini-3-flash-preview"
-
-
-# --- Function/Tool Definition for Structured Output ---
-# Using function calling instead of response_schema to handle dict[str, ...] types
-
-PRECHECK_TOOL_SCHEMA = types.Tool(
+from simd_agent.precheck_models import (
+    # request / response
+    PrecheckRequest, PrecheckResponse, SuggestedConfig,
+    SolverSettings, FluidProperties, TurbulenceSettings,
+    FieldBC, PatchBoundaryCondition,
+    BoundaryHint, VelocityBC, PressureBC, TemperatureBC,
+    Interpretation, ConfidenceScores,
+    # constants
+    FLUID_PRESETS, CRYOGENIC_KEYWORDS,
+    PRECHECK_MODEL, REVIEW_MODEL, PRECHECK_TOOL_SCHEMA,
+)
+
+# ---------------------------------------------------------------------------
+# Auxiliary tool schemas (only used internally in precheck.py)
+# ---------------------------------------------------------------------------
+
+# Pass-2a: quick spec completeness check — decides whether to skip the review
+_SELF_VERIFY_TOOL = types.Tool(
     function_declarations=[
         types.FunctionDeclaration(
-            name="submit_cfd_configuration",
-            description="Submit the analyzed CFD simulation configuration based on user requirements",
+            name="submit_verification",
+            description=(
+                "Report whether the generated CFD spec is complete and physically consistent. "
+                "Call this once after reviewing the spec."
+            ),
             parameters=types.Schema(
                 type="OBJECT",
                 properties={
-                    "message": types.Schema(
-                        type="STRING",
-                        description="Summary message of the detected simulation",
-                    ),
-                    "case_type": types.Schema(
-                        type="STRING",
-                        description="Type of simulation",
-                        enum=["internal_pipe_flow", "external_aero", "heat_exchanger", "mixing", "general"],
-                    ),
-                    "flow_regime": types.Schema(
-                        type="STRING",
-                        enum=["laminar", "turbulent"],
-                    ),
-                    "time_scheme": types.Schema(
-                        type="STRING",
-                        enum=["steady", "transient"],
-                    ),
-                    "compressibility": types.Schema(
-                        type="STRING",
-                        enum=["incompressible", "compressible"],
-                    ),
-                    "enable_heat_transfer": types.Schema(type="BOOLEAN"),
-                    "gravity": types.Schema(type="BOOLEAN"),
-                    "solver_algorithm": types.Schema(
-                        type="STRING",
-                        enum=["SIMPLE", "PIMPLE", "PISO"],
-                    ),
-                    "solver_max_iterations": types.Schema(type="INTEGER"),
-                    "solver_convergence_criteria": types.Schema(type="NUMBER"),
-                    "solver_end_time": types.Schema(type="NUMBER", nullable=True),
-                    "solver_delta_t": types.Schema(type="NUMBER", nullable=True),
-                    "fluid_preset_id": types.Schema(
-                        type="STRING",
-                        enum=["air", "water", "oil", "ln2", "custom"],
-                    ),
-                    "fluid_name": types.Schema(type="STRING"),
-                    "fluid_rho": types.Schema(type="NUMBER", description="Density kg/m³"),
-                    "fluid_mu": types.Schema(type="NUMBER", description="Dynamic viscosity Pa·s"),
-                    "fluid_Cp": types.Schema(type="NUMBER", description="Specific heat J/(kg·K)"),
-                    "fluid_k": types.Schema(type="NUMBER", description="Thermal conductivity W/(m·K)"),
-                    "fluid_temperature": types.Schema(type="NUMBER", description="Reference temperature K"),
-                    "turbulence_model": types.Schema(
-                        type="STRING",
-                        enum=["kEpsilon", "kOmegaSST", "spalartAllmaras", "laminar"],
-                    ),
-                    "turbulence_intensity": types.Schema(type="NUMBER", description="Percentage (0-100)"),
-                    "turbulence_length_scale": types.Schema(type="NUMBER", description="Length scale in meters"),
-                    "hydraulic_diameter": types.Schema(type="NUMBER", description="Hydraulic diameter in meters"),
-                    "wall_functions": types.Schema(type="BOOLEAN"),
-                    "boundary_conditions": types.Schema(
-                        type="ARRAY",
-                        description="Boundary conditions for each patch",
-                        items=types.Schema(
-                            type="OBJECT",
-                            properties={
-                                "patch_name": types.Schema(type="STRING"),
-                                "patch_class": types.Schema(
-                                    type="STRING",
-                                    enum=["inlet", "outlet", "wall", "symmetry", "periodic"],
-                                ),
-                                "confidence": types.Schema(type="NUMBER"),
-                                "U_type": types.Schema(type="STRING"),
-                                "U_value": types.Schema(
-                                    type="ARRAY",
-                                    items=types.Schema(type="NUMBER"),
-                                    nullable=True,
-                                ),
-                                "p_type": types.Schema(type="STRING"),
-                                "p_value": types.Schema(type="NUMBER", nullable=True),
-                                "T_type": types.Schema(type="STRING", nullable=True),
-                                "T_value": types.Schema(type="NUMBER", nullable=True),
-                                "k_type": types.Schema(type="STRING", nullable=True),
-                                "k_value": types.Schema(type="NUMBER", nullable=True),
-                                "omega_type": types.Schema(type="STRING", nullable=True),
-                                "omega_value": types.Schema(type="NUMBER", nullable=True),
-                                "epsilon_type": types.Schema(type="STRING", nullable=True),
-                                "epsilon_value": types.Schema(type="NUMBER", nullable=True),
-                                "nut_type": types.Schema(type="STRING", nullable=True),
-                                "nut_value": types.Schema(type="NUMBER", nullable=True),
-                            },
-                            required=["patch_name", "patch_class", "U_type", "p_type"],
+                    "all_correct": types.Schema(
+                        type="BOOLEAN",
+                        description=(
+                            "True ONLY if every required field has a non-null, physically valid value "
+                            "and all BCs are physically consistent. False if anything is missing or wrong."
                         ),
                     ),
-                    "interpretation_summary": types.Schema(type="STRING"),
-                    "interpretation_simulation_type": types.Schema(type="STRING"),
-                    "interpretation_key_physics": types.Schema(
+                    "issues": types.Schema(
                         type="ARRAY",
+                        description="Concise description of each issue found. Empty list when all_correct=True.",
                         items=types.Schema(type="STRING"),
                     ),
-                    "interpretation_assumptions": types.Schema(
-                        type="ARRAY",
-                        items=types.Schema(type="STRING"),
-                    ),
-                    "confidence_overall": types.Schema(type="NUMBER"),
-                    "confidence_flow_regime": types.Schema(type="NUMBER"),
-                    "confidence_boundary_conditions": types.Schema(type="NUMBER"),
-                    "confidence_physics_settings": types.Schema(type="NUMBER"),
                 },
-                required=[
-                    "message",
-                    "case_type",
-                    "flow_regime",
-                    "time_scheme",
-                    "enable_heat_transfer",
-                    "fluid_preset_id",
-                    "fluid_rho",
-                    "fluid_mu",
-                    "turbulence_model",
-                    "boundary_conditions",
-                    "interpretation_summary",
-                    "confidence_overall",
-                ],
+                required=["all_correct", "issues"],
             ),
         )
     ]
 )
 
+# Pass-2c: reconcile reviewer thinking → structured JSON
+_RECONCILE_TOOL = types.Tool(
+    function_declarations=[
+        types.FunctionDeclaration(
+            name="submit_reconciled_bcs",
+            description=(
+                "Return the corrected boundary conditions after cross-checking your chain-of-thought. "
+                "Every numeric value MUST match exactly what was computed in the reasoning text."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "corrected_boundary_conditions": types.Schema(
+                        type="ARRAY",
+                        description="All patches with corrected values. Every patch must be listed.",
+                        items=types.Schema(
+                            type="OBJECT",
+                            properties={
+                                "patch_name":    types.Schema(type="STRING"),
+                                "patch_class":   types.Schema(type="STRING"),
+                                "confidence":    types.Schema(type="NUMBER",  nullable=True),
+                                "U_type":        types.Schema(type="STRING",  nullable=True),
+                                "U_value":       types.Schema(type="ARRAY",   nullable=True, items=types.Schema(type="NUMBER")),
+                                "p_type":        types.Schema(type="STRING",  nullable=True),
+                                "p_value":       types.Schema(type="NUMBER",  nullable=True),
+                                "T_type":        types.Schema(type="STRING",  nullable=True),
+                                "T_value":       types.Schema(type="NUMBER",  nullable=True),
+                                "k_type":        types.Schema(type="STRING",  nullable=True),
+                                "k_value":       types.Schema(type="NUMBER",  nullable=True),
+                                "omega_type":    types.Schema(type="STRING",  nullable=True),
+                                "omega_value":   types.Schema(type="NUMBER",  nullable=True),
+                                "epsilon_type":  types.Schema(type="STRING",  nullable=True),
+                                "epsilon_value": types.Schema(type="NUMBER",  nullable=True),
+                                "nut_type":      types.Schema(type="STRING",  nullable=True),
+                                "nut_value":     types.Schema(type="NUMBER",  nullable=True),
+                            },
+                            required=["patch_name", "patch_class"],
+                        ),
+                    ),
+                },
+                required=["corrected_boundary_conditions"],
+            ),
+        )
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _norm_conf(value: float | int) -> float:
+    """Normalise a confidence value to [0, 1].
+
+    The LLM sometimes returns percentages (e.g. 80, 100) instead of fractions
+    (0.8, 1.0).  Any value > 1 is assumed to be a percentage and divided by 100.
+    """
+    v = float(value)
+    return v / 100.0 if v > 1.0 else v
+
+
+# ---------------------------------------------------------------------------
+# PrecheckService
+# ---------------------------------------------------------------------------
 
 class PrecheckService:
-    """Service for analyzing prompts and extracting simulation specs.
+    """Analyze user prompts and return structured CFD simulation configuration.
     
-    Uses Google GenAI with function calling for reliable structured output.
+    Uses Gemini function-calling for reliable structured output.
+    The fallback path (LLM failure) returns a minimal default config — it does
+    NOT attempt complex regex parsing since the LLM handles all interpretation.
     """
 
     def __init__(self):
@@ -465,637 +136,860 @@ class PrecheckService:
 
     @property
     def client(self) -> genai.Client:
-        """Lazy-load the Google GenAI client."""
         if self._client is None:
             self._client = genai.Client(api_key=self.settings.gemini_api_key)
         return self._client
 
+    # ── Public API ───────────────────────────────────────────────────────────
+
     async def analyze(self, request: PrecheckRequest) -> PrecheckResponse:
-        """Analyze a user prompt and extract simulation specifications.
-        
-        Uses Gemini with function calling for reliable structured output.
-        """
+        """Analyze a user prompt and return a structured PrecheckResponse."""
+        validation_error = request.validate_prompt()
+        if validation_error:
+            return self._create_friendly_error_response(validation_error)
         try:
-            # Build the analysis prompt
-            analysis_prompt = self._build_analysis_prompt(request)
-
-            # Call Gemini with function calling
-            logger.info(f"[Precheck] Calling Gemini model: {PRECHECK_MODEL} with tool calling")
-
+            prompt = self._build_analysis_prompt(request)
+            logger.info(f"[Precheck] Calling {PRECHECK_MODEL} with tool calling")
             response = self.client.models.generate_content(
                 model=PRECHECK_MODEL,
-                contents=analysis_prompt,
+                contents=prompt,
                 config=types.GenerateContentConfig(
                     temperature=0.3,
                     tools=[PRECHECK_TOOL_SCHEMA],
                     tool_config=types.ToolConfig(
+                        thinking_config=types.ThinkingConfig(
+                            include_thoughts=True
+                        ),
                         function_calling_config=types.FunctionCallingConfig(
-                            mode="ANY",  # Force function call
+                            mode="ANY",
                             allowed_function_names=["submit_cfd_configuration"],
                         )
                     ),
                 ),
             )
-
-            # Parse the function call response
-            logger.info("[Precheck] Got function call response from Gemini")
-            result = self._parse_function_call_response(response, request)
-            return result
-
+            logger.info("[Precheck] Got function call response")
+            return self._parse_function_call_response(response, request)
         except Exception as e:
             logger.exception(f"Precheck analysis failed: {e}")
             return self._create_fallback_response(request, str(e))
 
+    # ── Prompt builder ───────────────────────────────────────────────────────
+
+    def _build_analysis_prompt(self, request: PrecheckRequest) -> str:
+        mesh = request.get_mesh()
+        parts = [
+            "Analyze this CFD simulation request and return a complete configuration with CALCULATED values.",
+            "",
+            "=== OUTPUT FORMATTING (apply in ALL text fields: message, summaries, assumptions, key_physics) ===",
+            "• Patch / field / BC identifiers  → backtick code: `inlet`, `kOmegaSST`, `fixedValue`, `p`, `U`, `T`",
+            "  NEVER wrap patch or field names in quotes (\"inlet\") — always use backticks: `inlet`. You don't need to mention the task you are doing, just the names of the patches, fields, and boundary conditions.",
+            "• Turbulence quantities, Greek symbols → inline LaTeX: $k$, $\\omega$, $\\varepsilon$, $\\nu_t$, $\\mu$, $\\rho$",
+            "• Scientific values                → inline LaTeX: $1.81 \\times 10^{-5}$, $\\rho = 808\\,\\text{kg/m}^3$",
+            "• Derived formulas                 → inline LaTeX: $k = 1.5\\,(U I)^2$, $\\omega = \\sqrt{k}/(C_\\mu^{0.25} L)$",
+            "• Important solver/model names     → **bold**: **kOmegaSST**, **rhoPimpleFoam**, **icoPolynomial**",
+            "• Never write raw unicode symbols (ω ε μ ρ) — always use LaTeX inside $...$",
+            "",
+            f"User description: {request.prompt}",
+            "",
+        ]
+
+        if mesh:
+            parts += [
+                "Mesh info:",
+                f"  File: {mesh.file_name} | Cells: {mesh.check_mesh.cells:,}",
+                "  Patches:",
+            ]
+            for p in mesh.patches:
+                parts.append(f"    - {p.name}  (mesh type: {p.type}, cells: {p.n_cells})")
+            parts.append("")
+
+        if request.previous_config:
+            import json
+            parts += ["Previous config (user is refining):", json.dumps(request.previous_config, indent=2), ""]
+
+        parts += [
+            "=== COMPRESSIBILITY ===",
+            "compressible  → cryogenic liquid (LN2/LNG/LH2/LOX/Helium), gas at Mach>0.3, large ΔT in gas",
+            "               → solvers: rhoSimpleFoam (steady) / rhoPimpleFoam or compressibleInterFoam (transient)",
+            "incompressible → stable liquid (water/oil), low-speed gas (Mach<0.3)",
+            "               → solvers: simpleFoam / pimpleFoam",
+            "",
+            "=== FLUID GUIDE ===",
+            "Stable liquids  (water, oil): incompressible; rhoConst EOS safe if ΔT small.",
+            "Cryogenic liquids (LN2 bp=77K, LNG bp=111K, LH2 bp=20K, LOX bp=90K, LHe bp=4K):",
+            "  ALWAYS compressible + enable_heat_transfer=true.",
+            "  Hot or cold wall → fluid T rises above boiling → NEVER rhoConst. Use icoPolynomial or perfectGas.",
+            "",
+            "=== FLUID PROPERTIES ===",
+            "Air:    rho=1.225,  mu=1.81e-5, Cp=1006,  k=0.0257,  T=293K",
+            "Water:  rho=998.2,  mu=1.002e-3,Cp=4182,  k=0.598,   T=293K",
+            "LN2:    rho=808,    mu=1.58e-4, Cp=2042,  k=0.140,   T=77K",
+            "LNG:    rho=450,    mu=1.2e-4,  Cp=3500,  k=0.185,   T=111K",
+            "Helium: rho=0.164,  mu=1.96e-5, Cp=5193,  k=0.152,   T=293K",
+            "",
+            "=== CALCULATIONS ===",
+            "Velocity:  U = m_dot / (rho * A),  A = π*(D/2)²",
+            "Turbulence (Cmu=0.09, I=0.05, L=0.07*Dh):",
+            "  k = 1.5*(U*I)²  |  omega = sqrt(k)/(Cmu^0.25*L)  |  epsilon = Cmu^0.75*k^1.5/L",
+            "",
+            "=== BOUNDARY CONDITIONS (read user description carefully for each value) ===",
+            "",
+            "TEMPERATURE RULE — read this first:",
+            "  • T_inlet  = temperature of the fluid entering the domain (e.g. '77 K LN2 inlet')",
+            "  • T_wall   = temperature imposed on the solid wall   (e.g. 'wall heated to 400 K')",
+            "  • T_outlet = zeroGradient — NEVER fixedValue on an outlet",
+            "  ⚠️  NEVER assign T_wall to the inlet patch. NEVER assign T_inlet to the wall patch.",
+            "  ⚠️  If the user does not mention a wall temperature, use zeroGradient on wall T.",
+            "",
+            "MANDATORY T ASSIGNMENT when enable_heat_transfer=true (NEVER omit T from any patch):",
+            "  • inlet:   T_type='fixedValue',   T_value=<fluid_temperature in K>  ← FLUID temp, NOT wall temp",
+            "  • outlet:  T_type='zeroGradient', T_value=null",
+            "  • wall:    T_type='fixedValue',   T_value=<wall temperature in K>   ← WALL temp, NOT fluid temp",
+            "             (if user gave no wall temperature: T_type='zeroGradient', T_value=null)",
+            "  • empty:   T_type='empty',         T_value=null",
+            "",
+            "PRESSURE RULE:",
+            "  • Incompressible outlet: p=fixedValue, value=0 (gauge).",
+            "  • Compressible outlet: p=fixedValue, value = operating pressure from user context",
+            "    (e.g. '1 atm' → 101325 Pa, '2 bar' → 200000 Pa, '0.5 MPa' → 500000 Pa).",
+            "    If no operating pressure is stated, use 101325 Pa as a safe default.",
+            "  ⚠️  NEVER invent a pressure value — derive it from what the user said.",
+            "",
+            "PATCH PATTERNS (list every field you must set for each patch):",
+            "  INLET:    U_type='fixedValue',     U_value=[Ux,Uy,Uz] (computed from mass flow or stated velocity)",
+            "            p_type='zeroGradient',   p_value=null",
+            "            T_type='fixedValue',     T_value=<fluid_temperature K>  (heat transfer only)",
+            "            k_type='fixedValue',     k_value=<k computed above>",
+            "            omega_type='fixedValue', omega_value=<omega computed above>  (kOmegaSST)",
+            "            epsilon_type='fixedValue', epsilon_value=<epsilon computed above>  (kEpsilon)",
+            "            nut_type='calculated',   nut_value=0",
+            "  OUTLET:   U_type='zeroGradient',   p_type='fixedValue' (see pressure rule)",
+            "            T_type='zeroGradient',   T_value=null  (heat transfer only)",
+            "            k_type='zeroGradient',   omega_type='zeroGradient',  nut_type='calculated'",
+            "  WALL:     U_type='noSlip',          p_type='zeroGradient'",
+            "            T_type per MANDATORY T ASSIGNMENT above",
+            "            k_type='kqRWallFunction', omega_type='omegaWallFunction',",
+            "            epsilon_type='epsilonWallFunction', nut_type='nutkWallFunction'",
+            "  EMPTY:    frontAndBack in 2D mesh — ALL fields type='empty', patch_class='empty'. NEVER symmetry.",
+            "  SYMMETRY: only when mesh patch type is symmetry/symmetryPlane.",
+            "",
+            "VALUE CONSISTENCY RULE:",
+            "  Compute U, k, omega/epsilon once from the CALCULATIONS section above.",
+            "  Use those EXACT same numbers in BOTH the message text AND the boundary_conditions array.",
+            "  Do NOT write one value in the message and a different value in the structured fields.",
+            "",
+        ]
+
+        return "\n".join(parts)
+
+    # ── Auxiliary LLM passes ─────────────────────────────────────────────────
+
+    async def _llm_self_verify(
+        self,
+        request: PrecheckRequest,
+        response: PrecheckResponse,
+    ) -> tuple[bool, list[str]]:
+        """Pass-2a: quick LLM completeness check on the first-pass spec.
+
+        Returns (all_correct, issues).  When all_correct=True the full review
+        pass is skipped so a correct spec cannot be accidentally degraded.
+        """
+        import json as _json
+
+        spec_json = _json.dumps(response.model_dump(by_alias=True), indent=2, default=str)
+
+        # Detect heat transfer from the request flags or keywords
+        enable_heat = (
+            getattr(request, "enable_heat_transfer", False)
+            or any(kw in request.prompt.lower() for kw in ("heat", "temperature", "thermal", "°c", "°f", "kelvin"))
+        )
+
+        ht_rule = (
+            "\n• Heat transfer is active: `inlet` MUST have T_type='fixedValue' "
+            "with a real fluid temperature in K (not null, not zero)."
+            if enable_heat else ""
+        )
+
+        prompt = f"""\
+You are a CFD expert doing a rapid quality check on an OpenFOAM configuration.
+
+=== USER REQUEST ===
+{request.prompt}
+
+=== GENERATED SPEC ===
+{spec_json}
+
+Silently check for these physical issues:
+• Any inlet/outlet/wall BC field that should have a value is null or zero{ht_rule}
+• Turbulence inlet values (k, omega/epsilon) are missing or physically implausible
+• Inlet velocity is null when the user specified a velocity or flow rate
+• Pressure BCs are inverted (fixedValue at inlet instead of outlet)
+• Any setting that is physically impossible or self-contradictory
+
+If everything is set correctly and consistently → all_correct=True, empty issues list.
+If anything is wrong or incomplete → all_correct=False, brief issues list (one string per problem)."""
+
+        try:
+            print(f"[Precheck/self-verify] → calling generate_content (model={REVIEW_MODEL})...", flush=True)
+            resp = await self.client.aio.models.generate_content(
+                model=REVIEW_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.1,
+                    tools=[_SELF_VERIFY_TOOL],
+                    tool_config=types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(
+                            mode="ANY",
+                            allowed_function_names=["submit_verification"],
+                        )
+                    ),
+                ),
+            )
+            print("[Precheck/self-verify] ✓ response received", flush=True)
+            for part in resp.candidates[0].content.parts:
+                if getattr(part, "function_call", None) is not None:
+                    args = dict(part.function_call.args)
+                    all_correct = bool(args.get("all_correct", False))
+                    issues = list(args.get("issues", []))
+                    print(f"[Precheck] Self-verify → all_correct={all_correct}, issues={issues}", flush=True)
+                    return all_correct, issues
+        except Exception as e:
+            print(f"[Precheck/self-verify] ✗ FAILED: {e}", flush=True)
+            logger.warning(f"[Precheck] Self-verify failed: {e}")
+
+        # Fail-safe: assume something might be wrong and run the review
+        return False, ["self-verify call failed; running full review"]
+
+    async def _llm_reconcile(
+        self,
+        thinking_text: str,
+        proposed_bcs: list[dict],
+    ) -> list[dict]:
+        """Pass-2c: ground-truth check — reviewer thinking vs. proposed JSON.
+
+        The reviewer sometimes computes correct values in its chain-of-thought
+        but transcribes them wrong into the structured function call.  This pass
+        treats the thinking text as the authoritative source and returns a
+        BC list where every value matches what was actually computed.
+        """
+        import json as _json
+
+        if not thinking_text.strip():
+            # No thinking available — nothing to cross-check against
+            return proposed_bcs
+
+        proposed_json = _json.dumps(proposed_bcs, indent=2, default=str)
+
+        prompt = f"""\
+You previously reviewed a CFD configuration. Here is your complete reasoning:
+
+=== YOUR REASONING ===
+{thinking_text}
+
+=== YOUR PROPOSED CORRECTIONS ===
+{proposed_json}
+
+Task: verify that every numeric value in the proposed corrections EXACTLY matches
+what you computed in your reasoning above.
+
+Rules:
+- If a value in the proposed corrections does NOT match your reasoning → fix it to match your reasoning.
+- If a value is null but your reasoning computed a specific number → fill it in.
+- If a value is correct already → keep it unchanged.
+- Include ALL patches, not just changed ones.
+- Do NOT introduce any new value that is not supported by your reasoning.
+- Temperature rule: inlet T_value = fluid temperature you computed; wall T_value = wall temperature you computed."""
+
+        try:
+            resp = await self.client.aio.models.generate_content(
+                model=REVIEW_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    tools=[_RECONCILE_TOOL],
+                    tool_config=types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(
+                            mode="ANY",
+                            allowed_function_names=["submit_reconciled_bcs"],
+                        )
+                    ),
+                ),
+            )
+            import json as _j2
+            for part in resp.candidates[0].content.parts:
+                if getattr(part, "function_call", None) is not None:
+                    args = dict(part.function_call.args)
+                    reconciled = list(args.get("corrected_boundary_conditions", []))
+                    print(f"[Precheck] Reconcile → {len(reconciled)} patches:")
+                    print(_j2.dumps(reconciled, indent=2, default=str))
+                    return reconciled
+        except Exception as e:
+            logger.warning(f"[Precheck] Reconcile failed: {e}")
+
+        return proposed_bcs
+
+    # ── Streaming API ────────────────────────────────────────────────────────
+
+    async def analyze_stream(self, request: PrecheckRequest):
+        """Async generator for streaming precheck over WebSocket.
+
+        Yields a sequence of typed event dicts:
+            {"type": "start"}
+            {"type": "thought",        "text": "<incremental thinking text>"}  # 0-N times
+            {"type": "spec_generating"}                                          # once
+            {"type": "spec",           "data": {<PrecheckResponse camelCase>}}  # once
+            {"type": "done"}
+            # OR on error:
+            {"type": "error",          "message": "<description>"}
+            {"type": "done"}
+        """
+        print(f"[Precheck] analyze_stream called — prompt={request.prompt[:60]!r}", flush=True)
+        validation_error = request.validate_prompt()
+        if validation_error:
+            yield {"type": "start"}
+            yield {"type": "error", "message": validation_error}
+            yield {"type": "done"}
+            return
+
+        yield {"type": "start"}
+        print("[Precheck] ✓ start yielded — building prompt...", flush=True)
+        try:
+            prompt = self._build_analysis_prompt(request)
+            print(f"[Precheck] ✓ prompt built ({len(prompt)} chars)", flush=True)
+            func_call_args: dict | None = None
+            spec_generating_sent = False
+            _thought_buf: list[str] = []  # accumulate for terminal print
+
+            print(f"[Precheck] → calling generate_content_stream (model={PRECHECK_MODEL})...", flush=True)
+            stream = await self.client.aio.models.generate_content_stream(
+                model=PRECHECK_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(include_thoughts=True),
+                    tools=[PRECHECK_TOOL_SCHEMA],
+                    tool_config=types.ToolConfig(
+                        function_calling_config=types.FunctionCallingConfig(
+                            mode="ANY",
+                            allowed_function_names=["submit_cfd_configuration"],
+                        )
+                    ),
+                ),
+            )
+            print("[Precheck] ✓ stream object obtained — iterating chunks...", flush=True)
+            chunk_count = 0
+            async for chunk in stream:
+                chunk_count += 1
+                if chunk_count == 1:
+                    print("[Precheck] ✓ first chunk received from LLM", flush=True)
+                if not chunk.candidates:
+                    continue
+                for part in chunk.candidates[0].content.parts:
+                    # ── Thought chunk — stream to frontend + collect for terminal
+                    if getattr(part, "thought", False) and part.text:
+                        yield {"type": "thought", "text": part.text}
+                        _thought_buf.append(part.text)
+
+                    # ── Function call — signal + collect ─────────────────────
+                    elif getattr(part, "function_call", None) is not None:
+                        if not spec_generating_sent:
+                            print("[Precheck] ✓ function call received — spec_generating", flush=True)
+                            yield {"type": "spec_generating"}
+                            spec_generating_sent = True
+                        # Overwrite each time — final chunk carries the complete args
+                        func_call_args = dict(part.function_call.args)
+            print(f"[Precheck] ✓ stream done — {chunk_count} chunks, func_call_args={'present' if func_call_args else 'MISSING'}", flush=True)
+
+            # ── Print full first-pass thinking + raw args ─────────────────────
+            import json as _json_dbg
+            if _thought_buf:
+                print("=" * 70)
+                print("[Precheck] FIRST-PASS THINKING:")
+                print("".join(_thought_buf))
+                print("=" * 70)
+
+            if func_call_args is not None:
+                print("=" * 70)
+                print("[Precheck] RAW first-pass function call args:")
+                print(_json_dbg.dumps(func_call_args, indent=2, default=str))
+                print("=" * 70)
+                result = self._build_response_from_args(func_call_args, request)
+                yield {"type": "spec", "data": result.model_dump(by_alias=True)}
+
+                # ── Single review pass ────────────────────────────────────────
+                yield {"type": "review_start"}
+                print("[Precheck] → starting review...", flush=True)
+                async for event in self._llm_review(request, result):
+                    yield event
+            else:
+                yield {"type": "error", "message": "LLM did not return a configuration"}
+
+        except Exception as e:
+            logger.exception(f"[Precheck] Streaming failed: {e}")
+            yield {"type": "error", "message": str(e)}
+        finally:
+            yield {"type": "done"}
+
+    # ── LLM review ───────────────────────────────────────────────────────────
+
+    async def _llm_review(self, request: PrecheckRequest, response: PrecheckResponse):
+        """Single physics review: streams thinking live, then emits a summary item.
+
+        No function-calling — plain streaming with include_thoughts so thoughts
+        actually arrive incrementally (forced function-call mode suppresses thinking
+        on flash models).
+
+        Streams:
+            {"type": "review_phase_start", "phase": "review", ...}
+            {"type": "thought",            "text": "..."}        ← live thinking
+            {"type": "review_phase_done",  "phase": "review", ...}
+            {"type": "review_item",        "field": "summary", ...}  ← full text response
+            {"type": "review_done"}
+        """
+        import json as _json
+
+        spec_json = _json.dumps(response.model_dump(by_alias=True), indent=2, default=str)
+
+        review_prompt = f"""\
+You are a CFD expert reviewing an OpenFOAM configuration for physical correctness.
+
+Write your assessment as plain flowing prose — like a colleague explaining the physics.
+Use backticks for identifiers (`inlet`, `fixedValue`, `kOmegaSST`),
+inline LaTeX for symbols ($k$, $\\omega$, $\\rho$), and display math ($$...$$)
+on its own line for any formula with a numeric substitution.
+
+=== USER REQUEST ===
+{request.prompt}
+
+=== GENERATED SPEC ===
+{spec_json}
+
+=== WHAT TO COVER ===
+
+1. **Fluid & velocity** — identify the fluid; if a mass flow rate was given, show
+   the velocity derivation:
+   $$A = \\pi\\left(\\frac{{D}}{{2}}\\right)^2, \\quad U = \\frac{{\\dot{{m}}}}{{\\rho A}}$$
+   State the result to 4 sig. fig.
+
+2. **Turbulence** — narrate the derivation ($I=0.05$, $C_\\mu=0.09$, $L=0.07 D_h$):
+   $$k = 1.5(U I)^2, \\quad \\omega = \\frac{{\\sqrt{{k}}}}{{C_\\mu^{{0.25}} L}}, \\quad \\varepsilon = C_\\mu^{{0.75}}\\frac{{k^{{1.5}}}}{{L}}$$
+   State each result to 4 sig. fig.
+
+3. **Boundary conditions** — one paragraph per patch; describe what each patch does
+   physically and confirm the BC types are correct.
+
+4. **Summary** — one paragraph recap, then a markdown table of the final BC values:
+
+| Patch | Class | `U` | `p` | `T` | `k` / $\\omega$ |
+|-------|-------|-----|-----|-----|----------------|
+"""
+
+        yield {
+            "type": "review_phase_start",
+            "phase": "review",
+            "title": "Physics review",
+            "description": "Reviewing boundary conditions, turbulence parameters, and fluid properties...",
+        }
+        print(f"[Precheck] → review (model={PRECHECK_MODEL}, no function-call so thoughts stream)...", flush=True)
+
+        try:
+            stream = await self.client.aio.models.generate_content_stream(
+                model=PRECHECK_MODEL,
+                contents=review_prompt,
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(include_thoughts=True),
+                ),
+            )
+
+            text_parts: list[str] = []
+
+            async for chunk in stream:
+                if not chunk.candidates:
+                    continue
+                for part in chunk.candidates[0].content.parts:
+                    if getattr(part, "thought", False) and part.text:
+                        yield {"type": "thought", "text": part.text}
+                    elif getattr(part, "text", None):
+                        text_parts.append(part.text)
+
+            yield {
+                "type": "review_phase_done",
+                "phase": "review",
+                "message": "Review complete.",
+            }
+
+            summary = "".join(text_parts).strip()
+            if summary:
+                yield {
+                    "type": "review_item",
+                    "status": "ok",
+                    "patch": None,
+                    "field": "summary",
+                    "label": "Configuration review",
+                    "detail": summary,
+                }
+
+        except Exception as e:
+            logger.warning(f"[Precheck] Review failed: {e}")
+            yield {
+                "type": "review_item",
+                "status": "warning",
+                "patch": None,
+                "field": "summary",
+                "label": "Review unavailable",
+                "detail": f"Could not complete the review: `{e}`",
+            }
+
+        yield {"type": "review_done"}
+
+    # ── Response parser ──────────────────────────────────────────────────────
+
     def _parse_function_call_response(
         self, response: types.GenerateContentResponse, request: PrecheckRequest
     ) -> PrecheckResponse:
-        """Parse the function call response from Gemini into PrecheckResponse."""
         try:
-            # Extract function call from response
-            candidate = response.candidates[0]
-            part = candidate.content.parts[0]
-
-            if not hasattr(part, 'function_call') or part.function_call is None:
+            part = response.candidates[0].content.parts[0]
+            if not hasattr(part, "function_call") or part.function_call is None:
                 raise ValueError("No function call in response")
-
             func_call = part.function_call
             if func_call.name != "submit_cfd_configuration":
                 raise ValueError(f"Unexpected function: {func_call.name}")
-
-            # Get the arguments
             args = dict(func_call.args)
-            logger.debug(f"[Precheck] Function args: {list(args.keys())}")
-
-            # Build solver settings
-            solver = SolverSettings(
-                algorithm=args.get("solver_algorithm", "SIMPLE"),
-                max_iterations=args.get("solver_max_iterations", 2000),
-                convergence_criteria=args.get("solver_convergence_criteria", 1e-6),
-                end_time=args.get("solver_end_time"),
-                delta_t=args.get("solver_delta_t"),
-                write_interval=args.get("solver_write_interval"),
-            )
-
-            # Build fluid properties
-            preset_id = args.get("fluid_preset_id", "air")
-            fluid = FluidProperties(
-                preset_id=preset_id,
-                name=args.get("fluid_name", preset_id.upper()),
-                rho=args.get("fluid_rho", 1.225),
-                mu=args.get("fluid_mu", 1.81e-5),
-                Cp=args.get("fluid_Cp", 1006.0),
-                k=args.get("fluid_k", 0.0257),
-                temperature=args.get("fluid_temperature", 293.15),
-            )
-
-            # Build turbulence settings
-            flow_regime = args.get("flow_regime", "turbulent")
-            turbulence = TurbulenceSettings(
-                model=args.get("turbulence_model", "kOmegaSST"),
-                turbulence_intensity=args.get("turbulence_intensity", 5.0),
-                turbulence_length_scale=args.get("turbulence_length_scale", 0.01),
-                hydraulic_diameter=args.get("hydraulic_diameter", 0.1),
-                wall_functions=args.get("wall_functions", True),
-            )
-
-            # Build boundary conditions from array
-            boundary_conditions = {}
-            bc_array = args.get("boundary_conditions", [])
-            for bc in bc_array:
-                patch_name = bc.get("patch_name", "unknown")
-                boundary_conditions[patch_name] = PatchBoundaryCondition(
-                    patch_class=bc.get("patch_class", "wall"),
-                    confidence=bc.get("confidence", 0.8),
-                    U=FieldBC(type=bc.get("U_type", "fixedValue"), value=bc.get("U_value")),
-                    p=FieldBC(type=bc.get("p_type", "zeroGradient"), value=bc.get("p_value")),
-                    T=FieldBC(type=bc["T_type"], value=bc.get("T_value")) if bc.get("T_type") else None,
-                    k=FieldBC(type=bc["k_type"], value=bc.get("k_value")) if bc.get("k_type") else None,
-                    epsilon=FieldBC(type=bc["epsilon_type"], value=bc.get("epsilon_value")) if bc.get("epsilon_type") else None,
-                    omega=FieldBC(type=bc["omega_type"], value=bc.get("omega_value")) if bc.get("omega_type") else None,
-                    nut=FieldBC(type=bc["nut_type"], value=bc.get("nut_value")) if bc.get("nut_type") else None,
-                )
-
-            # Build suggested config
-            suggested_config = SuggestedConfig(
-                case_type=args.get("case_type", "internal_pipe_flow"),
-                flow_regime=flow_regime,
-                time_scheme=args.get("time_scheme", "steady"),
-                compressibility=args.get("compressibility", "incompressible"),
-                enable_heat_transfer=args.get("enable_heat_transfer", False),
-                gravity=args.get("gravity", False),
-                solver=solver,
-                fluid=fluid,
-                turbulence=turbulence,
-                boundary_conditions=boundary_conditions,
-            )
-
-            # Build legacy boundary hints
-            boundary_hints = self._build_boundary_hints(boundary_conditions)
-
-            # Build interpretation
-            interpretation = Interpretation(
-                summary=args.get("interpretation_summary", "CFD simulation analysis"),
-                simulation_type=args.get("interpretation_simulation_type", "General CFD"),
-                key_physics=args.get("interpretation_key_physics", []),
-                assumptions=args.get("interpretation_assumptions", []),
-                clarifications=args.get("interpretation_clarifications"),
-            )
-
-            # Build confidence scores
-            confidence_scores = ConfidenceScores(
-                overall=args.get("confidence_overall", 0.8),
-                flow_regime=args.get("confidence_flow_regime", 0.8),
-                boundary_conditions=args.get("confidence_boundary_conditions", 0.7),
-                physics_settings=args.get("confidence_physics_settings", 0.8),
-            )
-
-            # Determine next step
-            mesh = request.get_mesh()
-            next_step = 2 if mesh else 1
-            should_show_mesh = mesh is not None
-
-            return PrecheckResponse(
-                success=True,
-                confidence=confidence_scores.overall,
-                message=args.get("message", f"Detected {flow_regime} {suggested_config.case_type} simulation"),
-                suggested_config=suggested_config,
-                boundary_hints=boundary_hints,
-                kpi_targets=None,  # KPI targets not in function schema for simplicity
-                interpretation=interpretation,
-                confidence_scores=confidence_scores,
-                next_step=next_step,
-                should_show_mesh_viewer=should_show_mesh,
-            )
-
+            logger.debug(f"[Precheck] Function args keys: {list(args.keys())}")
+            return self._build_response_from_args(args, request)
         except Exception as e:
             logger.warning(f"Failed to parse function call response: {e}")
             return self._create_fallback_response(request, f"Parse error: {e}")
-    
-    def _build_analysis_prompt(self, request: PrecheckRequest) -> str:
-        """Build the prompt for LLM analysis."""
-        mesh = request.get_mesh()
 
-        prompt_parts = [
-            "Analyze the following CFD simulation request and return a COMPLETE configuration.",
-            "",
-            f"User's description: {request.prompt}",
-            "",
-        ]
-        
-        # Add mesh info if available
-        if mesh:
-            prompt_parts.extend([
-                "Uploaded mesh information:",
-                f"  - File: {mesh.file_name}",
-                f"  - Mesh ID: {mesh.mesh_id}",
-                f"  - Cells: {mesh.check_mesh.cells:,}",
-                f"  - Faces: {mesh.check_mesh.faces:,}",
-                f"  - Points: {mesh.check_mesh.points:,}",
-                "",
-                "Mesh patches (boundaries):",
-            ])
-            for patch in mesh.patches:
-                prompt_parts.append(f"  - {patch.name} (type: {patch.type}, cells: {patch.n_cells})")
-            prompt_parts.append("")
-        
-        # Add previous config if refining
-        if request.previous_config:
-            prompt_parts.extend([
-                "Previous configuration (user is refining):",
-                json.dumps(request.previous_config, indent=2),
-                "",
-            ])
-        
-        prompt_parts.extend([
-            "IMPORTANT: Return a COMPLETE suggested configuration with CALCULATED NUMERICAL VALUES.",
-            "DO NOT use 'calculated' type with null values - always compute the actual numbers!",
-            "",
-            "Include ALL of the following:",
-            "1. Physics: case_type, flow_regime, time_scheme, compressibility, enable_heat_transfer, gravity",
-            "2. Solver: algorithm (SIMPLE/PIMPLE/PISO), max_iterations, convergence_criteria, and for transient: end_time, delta_t, write_interval",
-            "3. Fluid: preset_id (air/water/oil/ln2/custom), name, rho, mu, Cp, k, temperature (in Kelvin)",
-            "4. Turbulence: model, turbulence_intensity (%), turbulence_length_scale, hydraulic_diameter, wall_functions",
-            "5. Boundary conditions: For EACH patch, provide OpenFOAM-style BCs with ACTUAL VALUES for U, p, T (if heat transfer), k, omega, epsilon, nut",
-            "",
-            "=== FLUID PROPERTIES (use these or calculate custom values) ===",
-            "Air:   rho=1.225 kg/m³, mu=1.81e-5 Pa·s, Cp=1006 J/(kg·K), k=0.0257 W/(m·K), T=293.15K",
-            "Water: rho=998.2 kg/m³, mu=1.002e-3 Pa·s, Cp=4182 J/(kg·K), k=0.598 W/(m·K), T=293.15K",
-            "LN2:   rho=808 kg/m³, mu=1.58e-4 Pa·s, Cp=2042 J/(kg·K), k=0.140 W/(m·K), T=77K",
-            "",
-            "=== VELOCITY CALCULATIONS (ALWAYS CALCULATE!) ===",
-            "From mass flow rate: U = m_dot / (rho * A)",
-            "  where A = π * (D/2)² for circular pipe",
-            "  Example: m_dot=0.089 kg/s, rho=808 kg/m³, D=0.025m → A=π*(0.0125)²=4.91e-4 m² → U=0.089/(808*4.91e-4)=0.224 m/s",
-            "",
-            "=== TURBULENCE CALCULATIONS (ALWAYS CALCULATE!) ===",
-            "Constants: Cmu = 0.09",
-            "Turbulence intensity I = 0.05 (5% default), or calculate: I = 0.16 * Re^(-1/8)",
-            "Length scale L = 0.07 * D_h (hydraulic diameter)",
-            "",
-            "k (turbulent kinetic energy) = 1.5 * (U * I)²",
-            "  Example: U=0.224 m/s, I=0.05 → k = 1.5 * (0.224 * 0.05)² = 1.88e-4 m²/s²",
-            "",
-            "epsilon (dissipation rate) = Cmu^0.75 * k^1.5 / L",
-            "  Example: k=1.88e-4, L=0.00175m → epsilon = 0.09^0.75 * (1.88e-4)^1.5 / 0.00175 = 8.4e-5 m²/s³",
-            "",
-            "omega (specific dissipation) = sqrt(k) / (Cmu^0.25 * L)",
-            "  Example: k=1.88e-4, L=0.00175m → omega = sqrt(1.88e-4) / (0.09^0.25 * 0.00175) = 14.3 1/s",
-            "",
-            "nut (turbulent viscosity at inlet) = k / omega (or Cmu * k² / epsilon)",
-            "",
-            "=== BOUNDARY CONDITION PATTERNS ===",
-            "INLET:",
-            "  U: type=fixedValue, value=[Ux, Uy, Uz] (calculated velocity vector)",
-            "  p: type=zeroGradient",
-            "  T: type=fixedValue, value=<inlet_temp_in_K> (if heat transfer enabled)",
-            "  k: type=fixedValue, value=<calculated_k>",
-            "  omega: type=fixedValue, value=<calculated_omega>",
-            "  epsilon: type=fixedValue, value=<calculated_epsilon>",
-            "  nut: type=calculated, value=0",
-            "",
-            "OUTLET:",
-            "  U: type=zeroGradient or inletOutlet",
-            "  p: type=fixedValue, value=0 (gauge pressure)",
-            "  T: type=zeroGradient (if heat transfer enabled)",
-            "  k: type=zeroGradient",
-            "  omega: type=zeroGradient",
-            "  epsilon: type=zeroGradient",
-            "  nut: type=calculated, value=0",
-            "",
-            "WALL (with heat transfer):",
-            "  U: type=noSlip",
-            "  p: type=zeroGradient",
-            "  T: type=fixedValue, value=<wall_temp_in_K> (e.g., 400K for heated wall)",
-            "  k: type=kqRWallFunction, value=0",
-            "  omega: type=omegaWallFunction, value=0",
-            "  epsilon: type=epsilonWallFunction, value=0",
-            "  nut: type=nutkWallFunction, value=0",
-            "",
-            "RESPOND WITH ONLY VALID JSON, NO MARKDOWN CODE BLOCKS.",
-            "",
-            "JSON Schema:",
-            """{
-  "message": "Summary of detected simulation",
-  "suggested_config": {
-    "case_type": "internal_pipe_flow" | "external_aero" | "heat_exchanger" | "mixing" | "general",
-    "flow_regime": "laminar" | "turbulent",
-    "time_scheme": "steady" | "transient",
-    "compressibility": "incompressible" | "compressible",
-    "enable_heat_transfer": boolean,
-    "gravity": boolean,
-    "solver": {
-      "algorithm": "SIMPLE" | "PIMPLE" | "PISO",
-      "max_iterations": number,
-      "convergence_criteria": number,
-      "end_time": number | null,
-      "delta_t": number | null,
-      "write_interval": number | null
-    },
-    "fluid": {
-      "preset_id": "air" | "water" | "oil" | "ln2" | "custom",
-      "name": string,
-      "rho": number,
-      "mu": number,
-      "Cp": number,
-      "k": number,
-      "temperature": number
-    },
-    "turbulence": {
-      "model": "kEpsilon" | "kOmegaSST" | "spalartAllmaras" | "laminar",
-      "turbulence_intensity": number,
-      "turbulence_length_scale": number,
-      "hydraulic_diameter": number,
-      "wall_functions": boolean
-    },
-    "boundary_conditions": {
-    "<patchName>": {
-        "patch_class": "inlet" | "outlet" | "wall" | "symmetry" | "periodic",
-      "confidence": number,
-        "U": { "type": string, "value": [x, y, z] },
-        "p": { "type": string, "value": number },
-        "T": { "type": string, "value": number } | null,
-        "k": { "type": string, "value": number },
-        "omega": { "type": string, "value": number },
-        "epsilon": { "type": string, "value": number },
-        "nut": { "type": string, "value": number }
-      }
-    }
-  },
-  "kpi_targets": {
-    "pressure_drop": { "value": number, "unit": string } | null,
-    "flow_rate": { "value": number, "unit": string } | null,
-    "velocity": { "value": number, "unit": string } | null,
-    "custom": []
-  },
-  "interpretation": {
-    "summary": string,
-    "simulation_type": string,
-    "key_physics": [string],
-    "assumptions": [string],
-    "clarifications": [string] | null
-  },
-  "confidence_scores": {
-    "overall": number,
-    "flow_regime": number,
-    "boundary_conditions": number,
-    "physics_settings": number
-  }
-}""",
-        ])
-        
-        return "\n".join(prompt_parts)
-    
-    def _parse_field_bc(self, data: dict | None) -> FieldBC | None:
-        """Parse a field boundary condition."""
-        if not data:
-            return None
-        return FieldBC(
-            type=data.get("type", "fixedValue"),
-            value=data.get("value"),
+    def _build_response_from_args(
+        self, args: dict, request: PrecheckRequest
+    ) -> PrecheckResponse:
+        """Build a PrecheckResponse from the LLM function-call args dict."""
+        solver = SolverSettings(
+            algorithm=args.get("solver_algorithm", "SIMPLE"),
+            max_iterations=args.get("solver_max_iterations", 2000),
+            convergence_criteria=args.get("solver_convergence_criteria", 1e-6),
+            end_time=args.get("solver_end_time"),
+            delta_t=args.get("solver_delta_t"),
+            write_interval=args.get("solver_write_interval"),
         )
-    
-    def _parse_kpi_value(self, data: dict | None) -> KPIValue | None:
-        """Parse KPI value."""
-        if not data:
-            return None
-        return KPIValue(
-            value=data.get("value", 0),
-            unit=data.get("unit", ""),
+
+        preset_id = args.get("fluid_preset_id", "air")
+        fluid = FluidProperties(
+            preset_id=preset_id,
+            name=args.get("fluid_name", preset_id.upper()),
+            rho=args.get("fluid_rho", 1.225),
+            mu=args.get("fluid_mu", 1.81e-5),
+            Cp=args.get("fluid_Cp", 1006.0),
+            k=args.get("fluid_k", 0.0257),
+            temperature=args.get("fluid_temperature", 293.15),
         )
-    
-    def _build_boundary_hints(
-        self, boundary_conditions: dict[str, PatchBoundaryCondition]
-    ) -> dict[str, BoundaryHint]:
-        """Build legacy boundary hints from new boundary conditions."""
-        hints = {}
-        for patch_name, bc in boundary_conditions.items():
-            velocity = None
-            if bc.U:
-                velocity = VelocityBC(
-                    type=bc.U.type,
-                    value=bc.U.value if isinstance(bc.U.value, list) else None,
-                    magnitude=bc.U.value if isinstance(bc.U.value, (int, float)) else None,
-                )
 
-            pressure = None
-            if bc.p:
-                pressure = PressureBC(
-                    type=bc.p.type,
-                    value=bc.p.value if isinstance(bc.p.value, (int, float)) else None,
-                )
+        flow_regime = args.get("flow_regime", "turbulent")
+        turbulence = TurbulenceSettings(
+            model=args.get("turbulence_model", "kOmegaSST"),
+            turbulence_intensity=args.get("turbulence_intensity", 5.0),
+            turbulence_length_scale=args.get("turbulence_length_scale", 0.01),
+            hydraulic_diameter=args.get("hydraulic_diameter", 0.1),
+            wall_functions=args.get("wall_functions", True),
+        )
 
-            temperature = None
-            if bc.T:
-                temperature = TemperatureBC(
-                    type=bc.T.type,
-                    value=bc.T.value if isinstance(bc.T.value, (int, float)) else None,
-                )
-
-            hints[patch_name] = BoundaryHint(
-                suggested_type=bc.patch_class,
-                velocity=velocity,
-                pressure=pressure,
-                temperature=temperature,
-                confidence=bc.confidence,
-                reasoning=f"Classified as {bc.patch_class}",
+        boundary_conditions: dict[str, PatchBoundaryCondition] = {}
+        for bc in args.get("boundary_conditions", []):
+            patch_name = bc.get("patch_name", "unknown")
+            boundary_conditions[patch_name] = PatchBoundaryCondition(
+                patch_class=bc.get("patch_class", "wall"),
+            confidence=_norm_conf(bc.get("confidence", 0.8)),
+                U=FieldBC(type=bc.get("U_type", "fixedValue"), value=bc.get("U_value")),
+                p=FieldBC(type=bc.get("p_type", "zeroGradient"), value=bc.get("p_value")),
+                T=FieldBC(type=bc["T_type"], value=bc.get("T_value")) if bc.get("T_type") else None,
+                k=FieldBC(type=bc["k_type"], value=bc.get("k_value")) if bc.get("k_type") else None,
+                epsilon=FieldBC(type=bc["epsilon_type"], value=bc.get("epsilon_value")) if bc.get("epsilon_type") else None,
+                omega=FieldBC(type=bc["omega_type"], value=bc.get("omega_value")) if bc.get("omega_type") else None,
+                nut=FieldBC(type=bc["nut_type"], value=bc.get("nut_value")) if bc.get("nut_type") else None,
             )
 
-        return hints
-    
-    def _create_fallback_response(self, request: PrecheckRequest, error: str) -> PrecheckResponse:
-        """Create a fallback response when LLM fails using heuristics."""
-        prompt_lower = request.prompt.lower()
-        mesh = request.get_mesh()
-        
-        # Detect flow regime
-        is_turbulent = any(word in prompt_lower for word in [
-            "turbulent", "industrial", "high speed", "fast", "re >", "reynolds"
-        ])
-        is_laminar = any(word in prompt_lower for word in [
-            "laminar", "slow", "creeping", "viscous", "low speed"
-        ])
-        flow_regime = "laminar" if is_laminar and not is_turbulent else "turbulent"
-        
-        # Detect time scheme
-        is_transient = any(word in prompt_lower for word in [
-            "transient", "unsteady", "time", "pulsating", "oscillating"
-        ])
-        time_scheme = "transient" if is_transient else "steady"
-        
-        # Detect fluid type
-        uses_ln2 = any(word in prompt_lower for word in ["ln2", "liquid nitrogen", "nitrogen", "cryogenic"])
-        uses_water = any(word in prompt_lower for word in ["water", "liquid", "hydraulic"])
-        if uses_ln2:
-            fluid = FLUID_PRESETS["ln2"]
-        elif uses_water:
-            fluid = FLUID_PRESETS["water"]
-        else:
-            fluid = FLUID_PRESETS["air"]
-
-        # Extract temperatures from prompt (e.g., "77K", "400 K", "293.15 kelvin")
-        inlet_temp = fluid.temperature  # Default to fluid's reference temp
-        wall_temp = 300.0  # Default wall temp
-        # Match numbers followed by K or kelvin (with optional space)
-        temp_matches = re.findall(r"(\d+(?:\.\d+)?)\s*k(?:elvin)?(?:\b|$)", prompt_lower, re.IGNORECASE)
-        if temp_matches:
-            temps = [float(t) for t in temp_matches]
-            # Assume smaller temp is inlet (cryogenic), larger is wall (heated)
-            if len(temps) >= 2:
-                inlet_temp = min(temps)
-                wall_temp = max(temps)
-            else:
-                # Single temp - decide based on context
-                if "wall" in prompt_lower or "heated" in prompt_lower:
-                    wall_temp = temps[0]
-                else:
-                    inlet_temp = temps[0]
-
-        # Detect heat transfer - either explicit keywords or different temperatures detected
-        has_heat = any(word in prompt_lower for word in [
-            "heat", "thermal", "temperature", "cooling", "heating", "hot", "cold"
-        ])
-        # Also enable heat transfer if we have multiple temperatures or wall temp differs from inlet
-        if len(temp_matches) >= 2 or (temp_matches and abs(wall_temp - inlet_temp) > 50):
-            has_heat = True
-
-        # Extract hydraulic diameter / pipe ID
-        diam_match = re.search(r"(?:id|diameter|d)\s*[=:]\s*(\d+(?:\.\d+)?)\s*mm", prompt_lower)
-        hydraulic_diameter = float(diam_match.group(1)) / 1000.0 if diam_match else 0.025  # Default 25mm
-
-        # Extract mass flow rate
-        mass_flow_match = re.search(r"(\d+(?:\.\d+)?)\s*g/s(?:ec)?", prompt_lower)
-        mass_flow_rate = float(mass_flow_match.group(1)) / 1000.0 if mass_flow_match else None  # kg/s
-
-        # Note: Pressure extracted but OpenFOAM typically uses gauge pressure (0 at outlet)
-        # pressure_match = re.search(r"(\d+(?:\.\d+)?)\s*bar", prompt_lower)
-        # inlet_pressure = float(pressure_match.group(1)) * 1e5 if pressure_match else 101325  # Pa
-        
-        # Detect simulation type
-        is_internal = any(word in prompt_lower for word in [
-            "pipe", "duct", "channel", "internal", "tube"
-        ])
-        is_external = any(word in prompt_lower for word in [
-            "external", "wind", "aerodynamic", "vehicle", "airfoil", "wing"
-        ])
-        case_type = "internal_pipe_flow" if is_internal else "external_aero" if is_external else "general"
-        sim_type = "Internal pipe flow" if is_internal else "External aerodynamics" if is_external else "General CFD"
-
-        # Extract velocity if mentioned, or calculate from mass flow rate
-        velocity_match = re.search(r"(\d+(?:\.\d+)?)\s*m/s", prompt_lower)
-        if velocity_match:
-            inlet_velocity = float(velocity_match.group(1))
-        elif mass_flow_rate is not None:
-            # Calculate from mass flow rate: U = m_dot / (rho * A)
-            area = math.pi * (hydraulic_diameter / 2) ** 2
-            inlet_velocity = mass_flow_rate / (fluid.rho * area)
-        else:
-            inlet_velocity = 1.0
-
-        # Calculate turbulence quantities
-        turb_intensity = 0.05  # 5% turbulence intensity
-        length_scale = 0.07 * hydraulic_diameter  # length scale = 0.07 * Dh
-        Cmu = 0.09
-        U_mag = inlet_velocity
-        k_inlet = 1.5 * (U_mag * turb_intensity) ** 2
-        omega_inlet = math.sqrt(k_inlet) / (Cmu ** 0.25 * length_scale)
-        epsilon_inlet = Cmu ** 0.75 * k_inlet ** 1.5 / length_scale
-
-        # Build boundary conditions from mesh patches
-        boundary_conditions = {}
-        if mesh:
-            for patch in mesh.patches:
-                patch_lower = patch.name.lower()
-                if any(x in patch_lower for x in ["inlet", "inflow", "in"]):
-                    bc_class = "inlet"
-                    boundary_conditions[patch.name] = PatchBoundaryCondition(
-                        patch_class=bc_class,
-                        confidence=0.7,
-                        U=FieldBC(type="fixedValue", value=[inlet_velocity, 0, 0]),
-                        p=FieldBC(type="zeroGradient"),
-                        T=FieldBC(type="fixedValue", value=inlet_temp) if has_heat else None,
-                        k=FieldBC(type="fixedValue", value=k_inlet) if flow_regime == "turbulent" else None,
-                        omega=FieldBC(type="fixedValue", value=omega_inlet) if flow_regime == "turbulent" else None,
-                        epsilon=FieldBC(type="fixedValue", value=epsilon_inlet) if flow_regime == "turbulent" else None,
-                        nut=FieldBC(type="calculated", value=0) if flow_regime == "turbulent" else None,
-                    )
-                elif any(x in patch_lower for x in ["outlet", "outflow", "out", "exit"]):
-                    bc_class = "outlet"
-                    boundary_conditions[patch.name] = PatchBoundaryCondition(
-                        patch_class=bc_class,
-                        confidence=0.7,
-                        U=FieldBC(type="zeroGradient"),
-                        p=FieldBC(type="fixedValue", value=0),
-                        T=FieldBC(type="zeroGradient") if has_heat else None,
-                        k=FieldBC(type="zeroGradient") if flow_regime == "turbulent" else None,
-                        omega=FieldBC(type="zeroGradient") if flow_regime == "turbulent" else None,
-                        epsilon=FieldBC(type="zeroGradient") if flow_regime == "turbulent" else None,
-                        nut=FieldBC(type="calculated", value=0) if flow_regime == "turbulent" else None,
-                    )
-                elif any(x in patch_lower for x in ["wall", "surface"]):
-                    bc_class = "wall"
-                    boundary_conditions[patch.name] = PatchBoundaryCondition(
-                        patch_class=bc_class,
-                        confidence=0.9,
-                        U=FieldBC(type="noSlip"),
-                        p=FieldBC(type="zeroGradient"),
-                        T=FieldBC(type="fixedValue", value=wall_temp) if has_heat else None,
-                        k=FieldBC(type="kqRWallFunction", value=0) if flow_regime == "turbulent" else None,
-                        omega=FieldBC(type="omegaWallFunction", value=0) if flow_regime == "turbulent" else None,
-                        epsilon=FieldBC(type="epsilonWallFunction", value=0) if flow_regime == "turbulent" else None,
-                        nut=FieldBC(type="nutkWallFunction", value=0) if flow_regime == "turbulent" else None,
-                    )
-                elif any(x in patch_lower for x in ["sym", "symmetry"]):
-                    bc_class = "symmetry"
-                    boundary_conditions[patch.name] = PatchBoundaryCondition(
-                        patch_class=bc_class,
-                        confidence=0.9,
-                        U=FieldBC(type="symmetry"),
-                        p=FieldBC(type="symmetry"),
-                        T=FieldBC(type="symmetry") if has_heat else None,
-                        k=FieldBC(type="symmetry") if flow_regime == "turbulent" else None,
-                        omega=FieldBC(type="symmetry") if flow_regime == "turbulent" else None,
-                        epsilon=FieldBC(type="symmetry") if flow_regime == "turbulent" else None,
-                        nut=FieldBC(type="symmetry") if flow_regime == "turbulent" else None,
-                    )
-                else:
-                    # Default to wall
-                    bc_class = "wall"
-                    boundary_conditions[patch.name] = PatchBoundaryCondition(
-                        patch_class=bc_class,
-                        confidence=0.5,
-                        U=FieldBC(type="noSlip"),
-                        p=FieldBC(type="zeroGradient"),
-                        T=FieldBC(type="fixedValue", value=wall_temp) if has_heat else None,
-                        k=FieldBC(type="kqRWallFunction", value=0) if flow_regime == "turbulent" else None,
-                        omega=FieldBC(type="omegaWallFunction", value=0) if flow_regime == "turbulent" else None,
-                        nut=FieldBC(type="nutkWallFunction", value=0) if flow_regime == "turbulent" else None,
-                    )
-
-        # Build solver settings
-        solver = SolverSettings(
-            algorithm="SIMPLE" if time_scheme == "steady" else "PIMPLE",
-            max_iterations=2000 if time_scheme == "steady" else 50,
-            convergence_criteria=1e-6,
-            end_time=1.0 if is_transient else None,
-            delta_t=0.001 if is_transient else None,
-            write_interval=0.1 if is_transient else None,
-        )
-
-        # Build turbulence settings
-        turbulence = TurbulenceSettings(
-            model="kOmegaSST" if flow_regime == "turbulent" else "laminar",
-            turbulence_intensity=turb_intensity * 100,  # Convert to percentage
-            turbulence_length_scale=length_scale,
-            hydraulic_diameter=hydraulic_diameter,
-            wall_functions=True,
-        )
-
         suggested_config = SuggestedConfig(
-            case_type=case_type,
+            case_type=args.get("case_type", "internal_pipe_flow"),
             flow_regime=flow_regime,
-            time_scheme=time_scheme,
-            compressibility="incompressible",
-            enable_heat_transfer=has_heat,
-            gravity=False,
+            time_scheme=args.get("time_scheme", "steady"),
+            compressibility=args.get("compressibility", "incompressible"),
+            enable_heat_transfer=args.get("enable_heat_transfer", False),
+            gravity=args.get("gravity", False),
             solver=solver,
             fluid=fluid,
             turbulence=turbulence,
             boundary_conditions=boundary_conditions,
         )
 
-        boundary_hints = self._build_boundary_hints(boundary_conditions)
+        interpretation = Interpretation(
+            summary=args.get("interpretation_summary", "CFD simulation analysis"),
+            simulation_type=args.get("interpretation_simulation_type", "General CFD"),
+            key_physics=args.get("interpretation_key_physics", []),
+            assumptions=args.get("interpretation_assumptions", []),
+            clarifications=args.get("interpretation_clarifications"),
+        )
+
+        confidence_scores = ConfidenceScores(
+        overall=_norm_conf(args.get("confidence_overall", 0.8)),
+        flow_regime=_norm_conf(args.get("confidence_flow_regime", 0.8)),
+        boundary_conditions=_norm_conf(args.get("confidence_boundary_conditions", 0.7)),
+        physics_settings=_norm_conf(args.get("confidence_physics_settings", 0.8)),
+        )
+
+        mesh = request.get_mesh()
+        response = PrecheckResponse(
+            success=True,
+            confidence=confidence_scores.overall,
+        message=args.get("message", f"Detected {flow_regime} {suggested_config.case_type}"),
+            suggested_config=suggested_config,
+        boundary_hints=self._build_boundary_hints(boundary_conditions),
+        kpi_targets=None,
+            interpretation=interpretation,
+            confidence_scores=confidence_scores,
+        next_step=2 if mesh else 1,
+        should_show_mesh_viewer=mesh is not None,
+        )
+
+        import json
+        print("=" * 70)
+        print("[Precheck] Final response sent to frontend:")
+        print(json.dumps(response.model_dump(by_alias=True), indent=2, default=str))
+        print("=" * 70)
+
+        return response
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    
+    def _build_boundary_hints(
+        self, boundary_conditions: dict[str, PatchBoundaryCondition]
+    ) -> dict[str, BoundaryHint]:
+        hints: dict[str, BoundaryHint] = {}
+        for patch_name, bc in boundary_conditions.items():
+            hints[patch_name] = BoundaryHint(
+                suggested_type=bc.patch_class if bc.patch_class != "empty" else "wall",
+                velocity=VelocityBC(
+                    type=bc.U.type,
+                    value=bc.U.value if isinstance(bc.U.value, list) else None,
+                    magnitude=bc.U.value if isinstance(bc.U.value, (int, float)) else None,
+                ) if bc.U else None,
+                pressure=PressureBC(
+                    type=bc.p.type,
+                    value=bc.p.value if isinstance(bc.p.value, (int, float)) else None,
+                ) if bc.p else None,
+                temperature=TemperatureBC(
+                    type=bc.T.type,
+                    value=bc.T.value if isinstance(bc.T.value, (int, float)) else None,
+                ) if bc.T else None,
+                confidence=bc.confidence,
+                reasoning=f"Classified as {bc.patch_class}",
+            )
+        return hints
+    
+    # ── Fallback (LLM unavailable) ───────────────────────────────────────────
+    
+    def _create_friendly_error_response(self, message: str) -> PrecheckResponse:
+        """Return a clean, non-technical error response shown directly to the user."""
+        return PrecheckResponse(
+            success=False,
+            confidence=0.0,
+            message=message,
+            suggested_config=SuggestedConfig(
+                case_type="general",
+                flow_regime="turbulent",
+                time_scheme="steady",
+                compressibility="incompressible",
+                enable_heat_transfer=False,
+                gravity=False,
+                solver=SolverSettings(),
+                fluid=FLUID_PRESETS["air"],
+                turbulence=TurbulenceSettings(model="kOmegaSST"),
+                boundary_conditions={},
+            ),
+            interpretation=Interpretation(
+                summary=message,
+                simulation_type="Unknown",
+                key_physics=[],
+                assumptions=[],
+            ),
+            confidence_scores=ConfidenceScores(
+                overall=0.0,
+                flow_regime=0.0,
+                boundary_conditions=0.0,
+                physics_settings=0.0,
+            ),
+            errors=[message],
+        )
+    
+    def _create_fallback_response(self, request: PrecheckRequest, error: str) -> PrecheckResponse:
+        """Minimal fallback for when the LLM call completely fails.
+
+        NOTE: The LLM handles all parsing and calculation during normal operation.
+        This fallback deliberately avoids complex regex — it detects fluid type
+        and cryogenic status from simple keyword matching, then returns safe defaults.
+        The user is expected to review/edit the config manually.
+        """
+        prompt_lower = request.prompt.lower()
+        mesh = request.get_mesh()
+        
+        # ── Fluid detection (keyword only) ───
+        is_cryogenic = any(kw in prompt_lower for kw in CRYOGENIC_KEYWORDS)
+        uses_lng = any(kw in prompt_lower for kw in ("lng", "liquefied natural gas", "liquid natural gas"))
+        uses_helium = any(kw in prompt_lower for kw in ("helium", "lhe", "liquid helium"))
+        uses_ln2 = any(kw in prompt_lower for kw in ("ln2", "liquid nitrogen", "nitrogen"))
+        uses_water = any(kw in prompt_lower for kw in ("water", "hydraulic"))
+        uses_oil = any(kw in prompt_lower for kw in ("oil", "lubricant"))
+
+        if uses_lng:
+            fluid = FLUID_PRESETS["lng"]
+        elif uses_helium:
+            fluid = FLUID_PRESETS["helium"]
+        elif uses_ln2:
+            fluid = FLUID_PRESETS["ln2"]
+        elif uses_oil:
+            fluid = FLUID_PRESETS["oil"]
+        elif uses_water:
+            fluid = FLUID_PRESETS["water"]
+        else:
+            fluid = FLUID_PRESETS["air"]
+
+        # ── Physics flags ───
+        is_high_speed = any(w in prompt_lower for w in ("mach", "supersonic", "transonic", "compressible"))
+        compressibility = "compressible" if (is_cryogenic or is_high_speed) else "incompressible"
+        is_transient = any(w in prompt_lower for w in ("transient", "unsteady", "pulsating", "oscillating"))
+        time_scheme = "transient" if is_transient else "steady"
+        flow_regime = "laminar" if "laminar" in prompt_lower else "turbulent"
+        has_heat = is_cryogenic or any(w in prompt_lower for w in ("heat", "thermal", "temperature", "cooling", "heating"))
+
+        # ── Geometry guess (for case_type label only) ───
+        case_type = (
+            "internal_pipe_flow" if any(w in prompt_lower for w in ("pipe", "duct", "channel", "tube"))
+            else "external_aero" if any(w in prompt_lower for w in ("external", "wind", "airfoil", "wing"))
+            else "general"
+        )
+
+        # ── Minimal turbulence defaults (Dh=25mm, U=1 m/s) ───
+        Dh, U_ref, turb_intensity, Cmu = 0.025, 1.0, 0.05, 0.09
+        L = 0.07 * Dh
+        k0 = 1.5 * (U_ref * turb_intensity) ** 2
+        omega0 = math.sqrt(k0) / (Cmu ** 0.25 * L)
+        epsilon0 = Cmu ** 0.75 * k0 ** 1.5 / L
+
+        outlet_p = 101325.0 if compressibility == "compressible" else 0.0
+
+        # ── Boundary conditions from mesh patches ───
+        boundary_conditions: dict[str, PatchBoundaryCondition] = {}
+        if mesh:
+            for patch in mesh.patches:
+                pl = patch.name.lower().replace("_", "")
+                turb = flow_regime == "turbulent"
+                empty_bc = PatchBoundaryCondition(
+                    patch_class="empty", confidence=1.0,
+                    U=FieldBC(type="empty"), p=FieldBC(type="empty"),
+                    T=FieldBC(type="empty") if has_heat else None,
+                    k=FieldBC(type="empty") if turb else None,
+                    omega=FieldBC(type="empty") if turb else None,
+                    epsilon=FieldBC(type="empty") if turb else None,
+                    nut=FieldBC(type="empty") if turb else None,
+                )
+                if pl in ("frontandback", "frontback", "defaultfaces") or patch.type == "empty":
+                    boundary_conditions[patch.name] = empty_bc
+                elif any(x in pl for x in ("inlet", "inflow")):
+                    boundary_conditions[patch.name] = PatchBoundaryCondition(
+                        patch_class="inlet", confidence=0.7,
+                        U=FieldBC(type="fixedValue", value=[U_ref, 0.0, 0.0]),
+                        p=FieldBC(type="zeroGradient"),
+                        T=FieldBC(type="fixedValue", value=fluid.temperature) if has_heat else None,
+                        k=FieldBC(type="fixedValue", value=k0) if turb else None,
+                        omega=FieldBC(type="fixedValue", value=omega0) if turb else None,
+                        epsilon=FieldBC(type="fixedValue", value=epsilon0) if turb else None,
+                        nut=FieldBC(type="calculated", value=0) if turb else None,
+                    )
+                elif any(x in pl for x in ("outlet", "outflow", "exit")):
+                    boundary_conditions[patch.name] = PatchBoundaryCondition(
+                        patch_class="outlet", confidence=0.7,
+                        U=FieldBC(type="zeroGradient"),
+                        p=FieldBC(type="fixedValue", value=outlet_p),
+                        T=FieldBC(type="zeroGradient") if has_heat else None,
+                        k=FieldBC(type="zeroGradient") if turb else None,
+                        omega=FieldBC(type="zeroGradient") if turb else None,
+                        epsilon=FieldBC(type="zeroGradient") if turb else None,
+                        nut=FieldBC(type="calculated", value=0) if turb else None,
+                    )
+                elif any(x in pl for x in ("sym", "symmetry")) and patch.type in ("symmetry", "symmetryPlane"):
+                    boundary_conditions[patch.name] = PatchBoundaryCondition(
+                        patch_class="symmetry", confidence=0.9,
+                        U=FieldBC(type="symmetry"), p=FieldBC(type="symmetry"),
+                        T=FieldBC(type="symmetry") if has_heat else None,
+                        k=FieldBC(type="symmetry") if turb else None,
+                        omega=FieldBC(type="symmetry") if turb else None,
+                        epsilon=FieldBC(type="symmetry") if turb else None,
+                        nut=FieldBC(type="symmetry") if turb else None,
+                    )
+                else:
+                    boundary_conditions[patch.name] = PatchBoundaryCondition(
+                        patch_class="wall", confidence=0.6,
+                        U=FieldBC(type="noSlip"), p=FieldBC(type="zeroGradient"),
+                        T=FieldBC(type="fixedValue", value=300.0) if has_heat else None,
+                        k=FieldBC(type="kqRWallFunction", value=0) if turb else None,
+                        omega=FieldBC(type="omegaWallFunction", value=0) if turb else None,
+                        epsilon=FieldBC(type="epsilonWallFunction", value=0) if turb else None,
+                        nut=FieldBC(type="nutkWallFunction", value=0) if turb else None,
+        )
+
+        suggested_config = SuggestedConfig(
+            case_type=case_type,
+            flow_regime=flow_regime,
+            time_scheme=time_scheme,
+            compressibility=compressibility,
+            enable_heat_transfer=has_heat,
+            gravity=False,
+            solver=SolverSettings(
+                algorithm="SIMPLE" if not is_transient else "PIMPLE",
+                max_iterations=2000 if not is_transient else 100,
+                end_time=1.0 if is_transient else None,
+                delta_t=0.001 if is_transient else None,
+                write_interval=0.1 if is_transient else None,
+            ),
+            fluid=fluid,
+            turbulence=TurbulenceSettings(
+                model="kOmegaSST" if flow_regime == "turbulent" else "laminar",
+                turbulence_intensity=5.0,
+                turbulence_length_scale=L,
+                hydraulic_diameter=Dh,
+                wall_functions=True,
+            ),
+            boundary_conditions=boundary_conditions,
+        )
 
         return PrecheckResponse(
             success=False,
-            confidence=0.4,
-            message=f"Fallback: Detected {flow_regime} {case_type} (LLM unavailable)",
+            confidence=0.3,
+            message="Fallback defaults — LLM unavailable. Please review carefully.",
             suggested_config=suggested_config,
-            boundary_hints=boundary_hints,
+            boundary_hints=self._build_boundary_hints(boundary_conditions),
             interpretation=Interpretation(
-                summary=f"Fallback analysis (LLM error: {error})",
-                simulation_type=sim_type,
+                summary=f"Fallback (LLM error: {error})",
+                simulation_type=case_type.replace("_", " ").title(),
                 key_physics=["turbulence"] if flow_regime == "turbulent" else [],
-                assumptions=["Using heuristic-based defaults due to LLM error"],
-                clarifications=["Please review and adjust settings manually"],
+                assumptions=["All values are conservative defaults — review before running"],
+                clarifications=["LLM unavailable; numerical values (velocity, k, ω) are placeholders"],
             ),
-            confidence_scores=ConfidenceScores(
-                overall=0.4,
-                flow_regime=0.5,
-                boundary_conditions=0.4,
-                physics_settings=0.5,
-            ),
+            confidence_scores=ConfidenceScores(overall=0.3, flow_regime=0.4,
+                                               boundary_conditions=0.3, physics_settings=0.4),
             next_step=1,
             should_show_mesh_viewer=mesh is not None,
-            warnings=[f"LLM analysis failed, using heuristics: {error}"],
+            warnings=[f"LLM failed, using minimal fallback: {error}"],
         )
 
 
-# Singleton instance
+# ---------------------------------------------------------------------------
+# Singleton
+# ---------------------------------------------------------------------------
+
 _precheck_service: PrecheckService | None = None
 
 
 def get_precheck_service() -> PrecheckService:
-    """Get or create the precheck service singleton."""
     global _precheck_service
     if _precheck_service is None:
         _precheck_service = PrecheckService()

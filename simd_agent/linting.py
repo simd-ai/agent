@@ -687,9 +687,47 @@ class CFDLinter:
             # end_time: for transient sims this is the physical end-time; for
             # steady it mirrors max_iterations so the LLM always has a value.
             "end_time": _end_time,
+            # delta_t — propagated from solver.delta_t (frontend key: "delta_t" or "deltaT")
+            "delta_t": config.solver.delta_t,
             "viscosity": config.fluid.kinematic_viscosity,
             "density": config.fluid.density,
             "mesh_resolution": "medium",
+            # ── Physics flags for solver selection ────────────────────────────
+            # These fields are consumed by SolverSelector and the codegen LLM.
+            "heat_transfer":   config.physics.heat_transfer,
+            "gravity":         getattr(config.physics, "gravity", False),
+            "multiphase":      getattr(config.physics, "multiphase", False),
+            "phases":          list(getattr(config.physics, "phases", []) or []),
+            "compressibility": config.physics.compressibility.value,
+            "flow_regime": (
+                config.physics.flow_regime.value
+                if config.physics.flow_regime
+                else "turbulent"
+            ),
+            # ── Full fluid properties dict (consumed by build_case_spec) ──────
+            # build_case_spec reads validated_config["fluid"] for nu, rho, mu,
+            # cp, Pr.  Without this dict those values are null and thermophysical
+            # properties cannot be computed correctly.
+            "fluid": {
+                "name":                 config.fluid.name,
+                "density":              config.fluid.density,
+                "kinematic_viscosity":  config.fluid.kinematic_viscosity,
+                "nu":                   config.fluid.kinematic_viscosity,
+                "dynamic_viscosity":    config.fluid.dynamic_viscosity,
+                "mu":                   config.fluid.dynamic_viscosity,
+                "rho":                  config.fluid.density,
+                "specific_heat":        config.fluid.specific_heat,
+                "cp":                   config.fluid.specific_heat,
+                "Cp":                   config.fluid.specific_heat,
+                "thermal_conductivity": config.fluid.thermal_conductivity,
+                "thermal_diffusivity":  config.fluid.thermal_diffusivity,
+                "prandtl_number":       config.fluid.prandtl_number,
+                "prandtl":              config.fluid.prandtl_number,
+                "Pr":                   config.fluid.prandtl_number,
+                # Reference / bulk temperature (useful for internalField initial conditions)
+                "temperature":          config.fluid.temperature,
+                "T":                    config.fluid.temperature,
+            },
         }
         
         # Add mesh info — include full mesh data with patch types for codegen
@@ -704,6 +742,28 @@ class CFDLinter:
                 ],
             }
         
+        # Add turbulence config — carries pre-computed k/omega/epsilon/nut initial values
+        # so the codegen layer never has to guess turbulence field values.
+        if config.turbulence:
+            tc = config.turbulence
+            validated["turbulence"] = {
+                "model":              tc.model,
+                "intensity":          tc.intensity,
+                "length_scale":       tc.length_scale,
+                "hydraulic_diameter": tc.hydraulic_diameter,
+                "k":                  tc.k,
+                "omega":              tc.omega,
+                "epsilon":            tc.epsilon,
+                "nut":                tc.nut,
+                "wall_functions":     tc.wall_functions,
+            }
+        else:
+            # Even without an explicit turbulence block, expose the model name
+            # from physics so build_case_spec has a single lookup path.
+            turb_m = turb_model or config.physics.turbulence_model
+            if turb_m:
+                validated["turbulence"] = {"model": turb_m, "wall_functions": True}
+
         # Add geometry
         if config.geometry:
             validated["geometry"] = {
@@ -744,6 +804,19 @@ class CFDLinter:
                     "type": bc.temperature.type,
                     "value": bc.temperature.value,
                 }
+            # ── Turbulence BCs (top-level fields k/omega/epsilon/nut/alphat) ──
+            # These are stored directly on BoundaryConditionV1 and must be
+            # propagated verbatim so build_case_spec can inject them into 0/* prompts.
+            for turb_field in ("k", "epsilon", "omega", "nut", "alphat", "nuTilda"):
+                val = getattr(bc, turb_field, None)
+                if val is not None:
+                    bc_dict[turb_field] = val
+            # Also propagate nested TurbulenceBCV1 (older path, if used)
+            if bc.turbulence:
+                for turb_field in ("k", "epsilon", "omega", "nut"):
+                    val = getattr(bc.turbulence, turb_field, None)
+                    if val is not None and turb_field not in bc_dict:
+                        bc_dict[turb_field] = val
             validated["boundary_conditions"][name] = bc_dict
-        
+
         return validated

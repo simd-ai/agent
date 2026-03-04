@@ -171,6 +171,7 @@ class SimulationServerClient:
         mode: SimRunMode = SimRunMode.FULL,
         run_id: str | None = None,
         callback_url: str | None = None,
+        n_cores: int = 1,
     ) -> SimSubmitResponse:
         """Submit a case ZIP for execution.
         
@@ -179,6 +180,7 @@ class SimulationServerClient:
             mode: Run mode - TEST (1 iteration) or FULL
             run_id: Optional run ID (generated if not provided)
             callback_url: Optional URL to POST final status to
+            n_cores: Number of MPI processes. 1 = serial (default). >1 = parallel.
             
         Returns:
             SimSubmitResponse with run_id and status URLs
@@ -190,6 +192,7 @@ class SimulationServerClient:
         }
         data = {
             "mode": mode.value,
+            "n_cores": str(n_cores),
         }
         if run_id:
             data["run_id"] = run_id
@@ -219,17 +222,19 @@ class SimulationServerClient:
         self,
         case_zip: bytes,
         run_id: str | None = None,
+        n_cores: int = 1,
     ) -> SimSubmitResponse:
         """Shortcut for submitting a test run (1 iteration validation).
         
         Args:
             case_zip: The OpenFOAM case folder as a zip file bytes
             run_id: Optional run ID
+            n_cores: Number of MPI processes (passed through to submit_run)
             
         Returns:
             SimSubmitResponse
         """
-        return await self.submit_run(case_zip, mode=SimRunMode.TEST, run_id=run_id)
+        return await self.submit_run(case_zip, mode=SimRunMode.TEST, run_id=run_id, n_cores=n_cores)
     
     async def get_status(self, run_id: str) -> SimRunInfo:
         """Get the current status of a simulation run.
@@ -370,6 +375,166 @@ class SimulationServerClient:
             logger.error(f"[SIM_SERVER] Artifact download error: {e}")
             raise SimulationServerError(f"Failed to download artifact: {e}")
     
+    async def get_vtk_results(self, run_id: str) -> dict:
+        """Trigger VTK surface generation and return field metadata.
+
+        Calls POST /api/run/{run_id}/vtk-results on the simulation server, which:
+        - runs foamToVTK -latestTime
+        - merges all boundary patches into one surface.vtp
+        - pre-computes vector magnitudes (U_magnitude, etc.)
+
+        Returns a dict matching the frontend contract:
+            {
+                "run_id": str,
+                "vtp_url": str,   # relative URL on the sim server
+                "fields": [
+                    {"name": str, "num_components": int,
+                     "range": [min, max], "location": "point",
+                     "vector_source": str | None},
+                    ...
+                ]
+            }
+        """
+        client = await self._get_client()
+        try:
+            response = await client.get(
+                f"/api/run/{run_id}/vtk-results",
+                timeout=180.0,  # foamToVTK can take a while
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"[SIM_SERVER] VTK results failed: {e.response.status_code} {e.response.text}")
+            raise SimulationServerError(f"VTK generation failed: {e.response.status_code}")
+        except Exception as e:
+            logger.error(f"[SIM_SERVER] VTK results error: {e}")
+            raise SimulationServerError(f"VTK results error: {e}")
+
+    async def download_surface_vtp(self, run_id: str) -> bytes:
+        """Download the merged surface VTP file for a completed run.
+
+        The VTP must already exist (call get_vtk_results first).
+        Returns the raw bytes of the VTP file.
+        """
+        client = await self._get_client()
+        try:
+            response = await client.get(
+                f"/api/run/{run_id}/vtk/surface.vtp",
+                timeout=120.0,
+            )
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as e:
+            raise SimulationServerError(f"VTP download failed: {e.response.status_code}")
+        except Exception as e:
+            raise SimulationServerError(f"VTP download error: {e}")
+
+    async def get_precomputed_index(self, run_id: str) -> dict:
+        """Fetch the precomputed VTP index from the simulation server.
+
+        Calls GET /api/run/{run_id}/vtk-timesteps/index.json.
+
+        The sim server builds this once after run_succeeded (triggered by
+        runner.py's background precompute task).  If not yet ready it will
+        trigger precompute on-demand and block until done.
+
+        Returns a dict matching the simulation server spec:
+            {
+                "run_id": str,
+                "total": int,
+                "fields": [{"name": str, "num_components": int,
+                             "range": [min, max], "location": "point",
+                             "vector_source": str | null}, ...],
+                "timesteps": [
+                    {"time": 0.1, "filename": "t_0_1.vtp",
+                     "url": "/api/run/{run_id}/vtk-timesteps/t_0_1.vtp"},
+                    ...
+                ]
+            }
+        """
+        client = await self._get_client()
+        try:
+            response = await client.get(
+                f"/api/run/{run_id}/vtk-timesteps/index.json",
+                timeout=300.0,  # precompute can take time on first call
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"[SIM_SERVER] Precomputed index failed: {e.response.status_code} {e.response.text}")
+            raise SimulationServerError(f"Precomputed index failed: {e.response.status_code}")
+        except Exception as e:
+            logger.error(f"[SIM_SERVER] Precomputed index error: {e}")
+            raise SimulationServerError(f"Precomputed index error: {e}")
+
+    async def download_precomputed_vtp(self, run_id: str, filename: str) -> bytes:
+        """Download a single precomputed timestep VTP by filename.
+
+        Calls GET /api/run/{run_id}/vtk-timesteps/{filename}.
+        The filename comes from the index (e.g. "t_0_1.vtp").
+        """
+        client = await self._get_client()
+        try:
+            response = await client.get(
+                f"/api/run/{run_id}/vtk-timesteps/{filename}",
+                timeout=120.0,
+            )
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as e:
+            raise SimulationServerError(f"Precomputed VTP download failed: {e.response.status_code}")
+        except Exception as e:
+            raise SimulationServerError(f"Precomputed VTP download error: {e}")
+
+    async def get_timesteps(self, run_id: str) -> dict:
+        """Return the list of all simulation timesteps with their VTP URLs.
+
+        Calls GET /api/run/{run_id}/timesteps on the simulation server.
+
+        Returns a dict like:
+            {
+                "run_id": str,
+                "timesteps": [
+                    {"time": "0.0", "vtp_url": "/api/run/.../vtk-timestep/0.0/surface.vtp"},
+                    ...
+                ],
+                "fields": [{"name": str, "num_components": int, "range": [...], ...}]
+            }
+        """
+        client = await self._get_client()
+        try:
+            response = await client.get(
+                f"/api/run/{run_id}/timesteps",
+                timeout=60.0,
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"[SIM_SERVER] Timesteps failed: {e.response.status_code} {e.response.text}")
+            raise SimulationServerError(f"Timesteps request failed: {e.response.status_code}")
+        except Exception as e:
+            logger.error(f"[SIM_SERVER] Timesteps error: {e}")
+            raise SimulationServerError(f"Timesteps error: {e}")
+
+    async def download_timestep_vtp(self, run_id: str, time_str: str) -> bytes:
+        """Download the surface VTP for a specific simulation timestep.
+
+        The VTP is built on-demand by the simulation server (cached after first call).
+        Returns the raw bytes of the VTP file.
+        """
+        client = await self._get_client()
+        try:
+            response = await client.get(
+                f"/api/run/{run_id}/vtk-timestep/{time_str}/surface.vtp",
+                timeout=120.0,
+            )
+            response.raise_for_status()
+            return response.content
+        except httpx.HTTPStatusError as e:
+            raise SimulationServerError(f"Timestep VTP download failed: {e.response.status_code}")
+        except Exception as e:
+            raise SimulationServerError(f"Timestep VTP download error: {e}")
+
     async def delete_run(self, run_id: str) -> bool:
         """Delete a completed run and its files.
         
@@ -398,6 +563,7 @@ class SimulationServerClient:
         case_zip: bytes,
         on_event: Callable[[SimRunEvent], Awaitable[None]] | None = None,
         run_id: str | None = None,
+        n_cores: int = 1,
     ) -> tuple[str, SimRunInfo, list[SimRunEvent]]:
         """Submit a test run and wait for completion, streaming events.
         
@@ -415,7 +581,7 @@ class SimulationServerClient:
             Tuple of (run_id, final_status, all_events)
         """
         # Submit test run
-        submit_response = await self.submit_test_run(case_zip, run_id=run_id)
+        submit_response = await self.submit_test_run(case_zip, run_id=run_id, n_cores=n_cores)
         sim_run_id = submit_response.run_id
         
         logger.info(f"[SIM_SERVER] Test run submitted: {sim_run_id}")
@@ -445,6 +611,7 @@ class SimulationServerClient:
         case_zip: bytes,
         on_event: Callable[[SimRunEvent], Awaitable[None]] | None = None,
         run_id: str | None = None,
+        n_cores: int = 1,
     ) -> tuple[str, SimRunInfo, list[SimRunEvent]]:
         """Submit a full run and stream events until completion.
         
@@ -460,9 +627,10 @@ class SimulationServerClient:
         """
         # Submit full run
         submit_response = await self.submit_run(
-            case_zip, 
-            mode=SimRunMode.FULL, 
-            run_id=run_id
+            case_zip,
+            mode=SimRunMode.FULL,
+            run_id=run_id,
+            n_cores=n_cores,
         )
         sim_run_id = submit_response.run_id
         

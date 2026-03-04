@@ -2,17 +2,21 @@
 """Application settings loaded from environment variables."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field, PostgresDsn
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Resolve .env relative to the repo root (one level up from this file's package dir)
+_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
 
 class Settings(BaseSettings):
     """Application configuration from environment variables."""
     
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -63,6 +67,10 @@ class Settings(BaseSettings):
         default="gemini-3-flash-preview",
         description="Default Gemini model for code generation",
     )
+    gemini_super_model: str = Field(
+        default="gemini-3.1-pro-preview",
+        description="High-capacity Gemini model used for post-generation code verification",
+    )
     grok_api_key: str | None = Field(
         default=None,
         description="xAI Grok API key",
@@ -77,7 +85,7 @@ class Settings(BaseSettings):
     )
     
     # Default provider
-    default_provider: Literal["gemini3", "grok", "openai", "anthropic", "mock"] = Field(
+    default_provider: Literal["gemini3", "grok", "openai", "anthropic"] = Field(
         default="gemini3",
         description="Default LLM provider to use",
     )
@@ -104,6 +112,13 @@ class Settings(BaseSettings):
     max_log_lines_in_event: int = Field(
         default=100,
         description="Maximum number of log lines to include in events",
+    )
+
+    # Local VTK cache — VTPs are downloaded from the sim server once and served
+    # directly from this directory, eliminating repeated sim-server round-trips.
+    vtk_cache_dir: str = Field(
+        default="/tmp/simd_vtk_cache",
+        description="Local directory for caching VTP files downloaded from the simulation server",
     )
 
 

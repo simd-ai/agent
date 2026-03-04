@@ -136,6 +136,9 @@ class PhysicsV1(BaseModel):
         description="Compressibility treatment"
     )
     heat_transfer: bool = Field(default=False, description="Enable heat transfer")
+    gravity: bool = Field(default=False, description="Enable gravity / buoyancy effects")
+    multiphase: bool = Field(default=False, description="Multiphase simulation")
+    phases: list[str] = Field(default_factory=list, description="Phase names for multiphase (e.g. ['water','air'])")
     turbulence_model: str | None = Field(
         default=None,
         description="Turbulence model (kEpsilon, kOmegaSST, laminar, etc.)"
@@ -200,13 +203,57 @@ class FluidV1(BaseModel):
         default=None,
         description="Dynamic viscosity (Pa·s)"
     )
-    specific_heat: float | None = Field(default=None, description="Specific heat (J/kg·K)")
+    specific_heat: float | None = Field(default=None, description="Specific heat Cp (J/kg·K)")
     thermal_conductivity: float | None = Field(
         default=None,
         description="Thermal conductivity (W/m·K)"
     )
-    prandtl_number: float | None = Field(default=None, description="Prandtl number")
-    
+    thermal_diffusivity: float | None = Field(
+        default=None,
+        description="Thermal diffusivity α = k/(ρ·Cp) (m²/s)"
+    )
+    prandtl_number: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("prandtl_number", "prandtl"),
+        description="Prandtl number (also accepted as 'prandtl')",
+    )
+    temperature: float | None = Field(
+        default=None,
+        description="Reference / bulk temperature of the fluid (K or °C as provided)"
+    )
+
+    class Config:
+        populate_by_name = True
+
+
+class TurbulenceConfigV1(BaseModel):
+    """Top-level turbulence configuration block.
+
+    Carries the turbulence model choice AND the pre-computed initial field
+    values (k, omega, epsilon, nut) so the backend never has to guess them.
+    """
+    model: str = Field(default="kOmegaSST", description="Turbulence model name")
+    intensity: float | None = Field(default=None, description="Turbulence intensity I [%]")
+    length_scale: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("length_scale", "lengthScale"),
+        description="Turbulence length scale L [m]",
+    )
+    hydraulic_diameter: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("hydraulic_diameter", "hydraulicDiameter"),
+        description="Hydraulic diameter Dh [m]",
+    )
+    k: float | None = Field(default=None, description="Turbulent kinetic energy k [m²/s²]")
+    omega: float | None = Field(default=None, description="Specific dissipation rate ω [1/s]")
+    epsilon: float | None = Field(default=None, description="Turbulent dissipation rate ε [m²/s³]")
+    nut: float | None = Field(default=None, description="Turbulent kinematic viscosity νt [m²/s]")
+    wall_functions: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("wall_functions", "wallFunctions"),
+        description="Use wall functions for turbulence BCs",
+    )
+
     class Config:
         populate_by_name = True
 
@@ -320,8 +367,16 @@ class BoundaryConditionV1(BaseModel):
     velocity: VelocityBCV1 | None = Field(default=None, description="Velocity BC")
     pressure: PressureBCV1 | None = Field(default=None, description="Pressure BC")
     temperature: TemperatureBCV1 | None = Field(default=None, description="Temperature BC")
-    turbulence: TurbulenceBCV1 | None = Field(default=None, description="Turbulence BCs")
-    
+    turbulence: TurbulenceBCV1 | None = Field(default=None, description="Turbulence BCs (nested)")
+
+    # Turbulence fields at top level (frontend sends them here directly)
+    k: dict[str, Any] | None = Field(default=None, description="k BC")
+    epsilon: dict[str, Any] | None = Field(default=None, description="epsilon BC")
+    omega: dict[str, Any] | None = Field(default=None, description="omega BC")
+    nut: dict[str, Any] | None = Field(default=None, description="nut BC")
+    alphat: dict[str, Any] | None = Field(default=None, description="alphat BC")
+    nuTilda: dict[str, Any] | None = Field(default=None, description="nuTilda BC (Spalart-Allmaras)")
+
     class Config:
         populate_by_name = True
     
@@ -367,6 +422,10 @@ class SimulationConfigV1(BaseModel):
     physics: PhysicsV1 = Field(default_factory=PhysicsV1, description="Physics settings")
     solver: SolverV1 = Field(default_factory=SolverV1, description="Solver settings")
     fluid: FluidV1 = Field(default_factory=FluidV1, description="Fluid properties")
+    turbulence: TurbulenceConfigV1 | None = Field(
+        default=None,
+        description="Turbulence model + pre-computed initial field values (k, ω, ε, νt)"
+    )
     geometry: GeometryV1 | None = Field(default=None, description="Geometry description")
     
     # Boundary conditions keyed by patch name
@@ -599,6 +658,9 @@ class EventTypes:
     CODEGEN_STARTED = "codegen_started"
     CODEGEN_ITERATION = "codegen_iteration"
     CODEGEN_COMPLETE = "codegen_complete"
+    # Per-file streaming events
+    FILE_GENERATING = "file_generating"   # emitted when an individual file LLM call starts
+    FILE_GENERATED = "file_generated"     # emitted when an individual file is ready (with content)
     
     # Sandbox (legacy)
     SANDBOX_SUBMITTED = "sandbox_submitted"
@@ -624,7 +686,20 @@ class EventTypes:
     SIM_RUN_SUCCEEDED = "sim_run_succeeded"
     SIM_RUN_FAILED = "sim_run_failed"
     SIM_ARTIFACTS_READY = "sim_artifacts_ready"
+    # MPI parallel decompose / reconstruct
+    SIM_DECOMPOSE_STARTED = "sim_decompose_started"
+    SIM_DECOMPOSE_COMPLETE = "sim_decompose_complete"
+    SIM_DECOMPOSE_FAILED = "sim_decompose_failed"
+    SIM_RECONSTRUCT_STARTED = "sim_reconstruct_started"
+    SIM_RECONSTRUCT_COMPLETE = "sim_reconstruct_complete"
+    SIM_RECONSTRUCT_FAILED = "sim_reconstruct_failed"
     
+    # Code verification (super-model quality gate)
+    SOLVER_SELECTION_STARTED = "solver_selection_started"
+    SOLVER_SELECTED = "solver_selected"
+    CODEGEN_VERIFICATION_STARTED = "codegen_verification_started"
+    CODEGEN_VERIFICATION_COMPLETE = "codegen_verification_complete"
+
     # Self-healing
     ERROR_SUMMARY = "error_summary"
     RETRYING = "retrying"
