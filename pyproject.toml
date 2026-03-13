@@ -26,7 +26,6 @@ dependencies = [
     "numpy>=2.0.0",
     "pyvista>=0.45.0",
     "meshio>=5.3.5",
-    "gmsh",
 ]
 
 [project.optional-dependencies]

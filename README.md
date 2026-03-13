@@ -26,6 +26,7 @@ FastAPI service for orchestrating CFD (Computational Fluid Dynamics) workflows v
 # Clone and install
 cd simd_agent
 pip install -e ".[dev]"
+sudo apt install python3-gmsh
 ```
 
 ### Environment Variables
