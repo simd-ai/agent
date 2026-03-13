@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import textwrap
 import traceback
 from typing import Any
 
@@ -350,101 +349,15 @@ def _is_transient(snap: SimulationSnapshot) -> bool:
     return False
 
 
-def _assess_steady_convergence(pts: list[dict[str, Any]]) -> str:
-    """Convergence check for steady-state solvers (simpleFoam, rhoSimpleFoam…).
-
-    Steady-state initial residuals should drop monotonically.
-    Criteria:
-      well_converged : dropped ≥ 3 orders  OR  final ≤ 1e-5
-      converging     : dropped ≥ 1 order   OR  final ≤ 1e-3
-      not_converged  : everything else
-    """
-    vals = [_safe_float(p.get("initial"), None) for p in pts]
-    vals = [v for v in vals if v is not None and v > 0]
-    if not vals:
-        return "not_converged"
-
-    first_val = vals[0]
-    last_val = vals[-1]
-    drop_orders = math.log10(first_val) - math.log10(last_val) if last_val > 0 else 0.0
-
-    # Stability check on the tail
-    tail = vals[max(0, len(vals) - max(len(vals) // 5, 3)):]
-    mean_tail = sum(tail) / len(tail) if tail else last_val
-    if len(tail) > 1 and mean_tail > 0:
-        variance = sum((v - mean_tail) ** 2 for v in tail) / len(tail)
-        cv = (variance ** 0.5) / mean_tail
-        is_stable = cv < 0.15
-    else:
-        is_stable = False
-
-    if last_val <= 1e-5 or drop_orders >= 3:
-        status = "well_converged"
-    elif last_val <= 1e-3 or drop_orders >= 1:
-        status = "converging"
-    else:
-        status = "not_converged"
-
-    if is_stable and last_val <= 1e-2 and status == "not_converged":
-        status = "converging"
-
-    return status
-
-
-def _assess_transient_inner_convergence(pts: list[dict[str, Any]]) -> str:
-    """Convergence check for transient solvers (pimpleFoam, icoFoam…).
-
-    For transient simulations, initial residuals OSCILLATE with the physics —
-    a high initial residual at the start of a time step is normal and does NOT
-    mean the simulation is diverging.
-
-    What matters is the FINAL residual: how well the inner PISO/PIMPLE loop
-    solved the equations within each time step.  We check whether the solver
-    consistently achieved tight inner convergence.
-
-    Criteria:
-      well_converged : median final residual ≤ 1e-5  (inner loop fully resolved)
-      converging     : median final residual ≤ 1e-3  (inner loop mostly resolved)
-      not_converged  : median final residual > 1e-3  (inner loop struggling)
-    """
-    finals = [_safe_float(p.get("final"), None) for p in pts]
-    finals = [v for v in finals if v is not None and v > 0]
-
-    if not finals:
-        # No final residuals stored — fall back to checking if initial residuals
-        # are at least consistently low (weak signal for transient health).
-        initials = [_safe_float(p.get("initial"), None) for p in pts]
-        initials = [v for v in initials if v is not None and v > 0]
-        if not initials:
-            return "not_converged"
-        median_init = sorted(initials)[len(initials) // 2]
-        # Transient initial residuals of ~0.1–0.3 are completely normal;
-        # only flag as not_converged if they're very large (> 1, diverging)
-        return "converging" if median_init <= 1.0 else "not_converged"
-
-    # Use median over ALL time steps — robust against occasional spikes and
-    # correctly reflects inner-loop quality throughout the full run.
-    sorted_f = sorted(finals)
-    median_final = sorted_f[len(sorted_f) // 2]
-
-    if median_final <= 1e-5:
-        return "well_converged"
-    elif median_final <= 1e-3:
-        return "converging"
-    else:
-        return "not_converged"
-
-
 def compute_residual_trend(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str, Any]:
-    """Return residual convergence series for the requested field(s).
+    """Return residual history series for the requested field(s).
 
     X-axis is simulation time (sim_time) when available — matching the
     /api/runs/{id}/timesteps format — with iteration as fallback.
 
-    Convergence assessment differs by solver type:
-    - Transient (pimpleFoam, icoFoam…): checks inner-loop FINAL residuals.
-      Initial residuals oscillate with physics and are NOT a divergence signal.
-    - Steady-state (simpleFoam…): checks monotonic drop of INITIAL residuals.
+    For transient solvers (pimpleFoam, icoFoam…): shows inner-loop FINAL
+    residuals. For steady-state (simpleFoam…): shows INITIAL residuals.
+    No convergence assessment is performed.
     """
     fields_arg = args.get("fields")
     if isinstance(fields_arg, str):
@@ -482,24 +395,12 @@ def compute_residual_trend(args: dict[str, Any], snap: SimulationSnapshot) -> di
     if not non_empty:
         return {"error": "Requested fields not found in simulation progress"}
 
-    # Convergence assessment — method depends on solver type
-    convergence_assessment: dict[str, str] = {}
-    for fname, pts in non_empty.items():
-        if transient:
-            convergence_assessment[fname] = _assess_transient_inner_convergence(pts)
-        else:
-            convergence_assessment[fname] = _assess_steady_convergence(pts)
-
     # Build recharts-ready rows keyed by x_key.
     #
     # Transient (pimpleFoam…): use FINAL residuals — these are the inner-loop
-    # (PISO/PIMPLE) residuals after each time step, matching exactly what the
-    # frontend residuals chart plots (values in 1e-6 to 1e-7 range).
-    # Initial residuals oscillate with the physics (0.1–0.3) and are NOT useful
-    # for the chart — they would show noise, not solver health.
-    #
-    # Steady-state (simpleFoam…): use INITIAL residuals — these show the
-    # monotonic drop over iterations that engineers look for (1 → 1e-5).
+    # (PISO/PIMPLE) residuals after each time step.
+    # Steady-state (simpleFoam…): use INITIAL residuals — these show the drop
+    # over iterations that engineers look for.
     residual_key = "final" if transient else "initial"
 
     x_to_row: dict[Any, dict[str, Any]] = {}
@@ -529,7 +430,6 @@ def compute_residual_trend(args: dict[str, Any], snap: SimulationSnapshot) -> di
     else:
         recharts_rows = all_rows
 
-    # Determine last sim_time and completion fraction for context
     last_sim_time = snap.sim_progress[-1].get("sim_time") if snap.sim_progress else None
     end_time = (
         snap.solver.get("endTime") or snap.solver.get("end_time")
@@ -541,17 +441,7 @@ def compute_residual_trend(args: dict[str, Any], snap: SimulationSnapshot) -> di
         "last_sim_time": last_sim_time,
         "end_time": end_time,
         "solver_type": "transient" if transient else "steady_state",
-        "residual_type_shown": residual_key,  # "final" or "initial"
-        "convergence": convergence_assessment,
-        "convergence_note": (
-            "Transient simulation: chart shows inner-loop FINAL residuals per time step "
-            "(PISO/PIMPLE quality). Initial residuals oscillate with physics and are normal. "
-            "Convergence status = inner loop solved each time step well."
-            if transient else
-            "Steady-state simulation: chart shows initial residuals dropping over iterations. "
-            "Convergence = residuals fell 3+ orders or reached ≤ 1e-5."
-        ),
-        # recharts-ready block — matches the frontend residuals chart exactly
+        "residual_type_shown": residual_key,
         "chart": {
             "type": "line",
             "title": "Residual History",
@@ -561,7 +451,6 @@ def compute_residual_trend(args: dict[str, Any], snap: SimulationSnapshot) -> di
             "yScale": "log",
             "lines": list(non_empty.keys()),
             "data": recharts_rows,
-            "convergence": convergence_assessment,
             "solver_type": "transient" if transient else "steady_state",
         },
     }
@@ -647,6 +536,208 @@ def run_python_analysis(args: dict[str, Any], snap: SimulationSnapshot) -> dict[
     return {"description": description, "result": str(result)}
 
 
+def _plain_solver_explanation(solver_name: str, transient: bool) -> str:
+    """Return a plain-language explanation of what the chosen solver does."""
+    s = (solver_name or "").lower()
+    if "simplefoam" in s or s == "simple":
+        return (
+            "The solver chosen for this simulation is **simpleFoam**. "
+            "This solver is designed for steady-state, incompressible flow — meaning it "
+            "computes the final, settled flow field rather than tracking how the fluid moves "
+            "step by step over time. It is well suited for situations where the flow "
+            "conditions do not change significantly once the system reaches equilibrium, "
+            "such as flow around a stationary object or through a duct at constant speed."
+        )
+    if "rhosimplefoam" in s:
+        return (
+            "The solver chosen is **rhoSimpleFoam**. "
+            "This is a steady-state solver for compressible flow, meaning it accounts for "
+            "the fact that the fluid's density can change — something that becomes important "
+            "at high speeds (typically above Mach 0.3). It finds the long-term average "
+            "flow field, not the time evolution."
+        )
+    if "pimplefoam" in s:
+        return (
+            "The solver chosen is **pimpleFoam**. "
+            "This is a time-stepping solver — it advances the simulation forward in small "
+            "time increments, capturing how the flow evolves over time. It is used when the "
+            "flow is expected to change dynamically, for example due to vortex shedding, "
+            "oscillating boundaries, or unsteady inlet conditions."
+        )
+    if "rhopimplefoam" in s:
+        return (
+            "The solver chosen is **rhoPimpleFoam**. "
+            "This is a time-stepping solver for compressible flow, combining time accuracy "
+            "with the ability to model density changes in the fluid. It is used when the "
+            "flow is both fast (compressible effects matter) and time-dependent."
+        )
+    if "interfoam" in s or "interisofoam" in s:
+        return (
+            "The solver chosen is **interFoam**. "
+            "This solver is designed for two-phase flows — situations where two different "
+            "fluids (such as water and air) coexist and interact. It tracks the boundary "
+            "(called the interface) between the two fluids as it moves and deforms over time."
+        )
+    if "pisofoam" in s or "icofoam" in s:
+        return (
+            f"The solver chosen is **{solver_name}**. "
+            "This is a time-stepping solver for incompressible flow, advancing the "
+            "simulation in small time steps to capture how the flow changes over time."
+        )
+    if transient:
+        return (
+            f"The solver **{solver_name}** is a time-stepping (transient) solver. "
+            "It advances the simulation forward in time, step by step, capturing the "
+            "dynamic evolution of the flow field."
+        )
+    return (
+        f"The solver **{solver_name}** is a steady-state solver. "
+        "It computes the long-term average flow field without tracking time evolution."
+    )
+
+
+def _plain_turbulence_explanation(model: str) -> str:
+    """Return a plain-language explanation of the turbulence model."""
+    m = (model or "").lower()
+    if "komegasst" in m or "k-omega" in m or "komega" in m:
+        return (
+            "The turbulence model selected is **k-omega SST** (Shear Stress Transport). "
+            "Turbulence refers to the chaotic, swirling motion that develops in most "
+            "real-world flows. Simulating every tiny turbulent eddy directly would require "
+            "enormous computing power, so engineers use turbulence models — mathematical "
+            "approximations that capture the average effect of turbulence on the flow. "
+            "k-omega SST is one of the most trusted models in engineering because it "
+            "performs well both close to solid surfaces (like walls of a pipe or body of a "
+            "car) and in the open flow further away."
+        )
+    if "kepsilon" in m or "k-epsilon" in m or "keps" in m:
+        return (
+            "The turbulence model selected is **k-epsilon**. "
+            "This is a widely used two-equation model that characterises turbulence using "
+            "two quantities: the turbulent kinetic energy (k) and its rate of dissipation "
+            "(epsilon). It performs well in free-stream regions and jets but is less "
+            "accurate very close to walls."
+        )
+    if "spalart" in m or "sa" == m:
+        return (
+            "The turbulence model selected is **Spalart-Allmaras**. "
+            "This is a simpler, one-equation model developed for aerodynamic applications "
+            "such as flow over aircraft wings and surfaces. It is computationally "
+            "efficient and works well for attached boundary layer flows."
+        )
+    if "laminar" in m or not m:
+        return (
+            "The flow is treated as **laminar** — meaning it moves in smooth, ordered "
+            "layers without turbulent mixing. This is valid when the Reynolds number is "
+            "low, typically in slow flows or with very viscous fluids. No turbulence "
+            "model is needed in this case."
+        )
+    if "realizablek" in m or "realizable" in m:
+        return (
+            "The turbulence model selected is **Realizable k-epsilon**. "
+            "This is an improved version of the standard k-epsilon model that satisfies "
+            "certain mathematical constraints (realizability conditions), making it more "
+            "accurate for flows with strong streamline curvature and rotation."
+        )
+    return (
+        f"The turbulence model selected is **{model}**. "
+        "Turbulence models are mathematical approximations that capture the average "
+        "effect of chaotic flow fluctuations without having to simulate every detail, "
+        "making the computation practical on standard hardware."
+    )
+
+
+def _plain_reynolds_explanation(re_num: Any, regime: str) -> str:
+    """Return a plain-language explanation of the Reynolds number and flow regime."""
+    regime_lower = (regime or "").lower()
+    try:
+        re_val = float(re_num)
+        re_str = f"{re_val:,.0f}"
+    except (TypeError, ValueError):
+        re_str = str(re_num)
+        re_val = None
+
+    regime_desc = ""
+    if "turbulent" in regime_lower:
+        regime_desc = (
+            "At this Reynolds number the flow is **turbulent** — the fluid moves in a "
+            "chaotic, mixing fashion with eddies and swirls at many scales. "
+            "This is the most common regime in engineering applications."
+        )
+    elif "laminar" in regime_lower:
+        regime_desc = (
+            "At this Reynolds number the flow is **laminar** — the fluid moves in "
+            "smooth, parallel layers with little mixing between them. "
+            "This regime occurs at low speeds or with very viscous fluids."
+        )
+    elif "transitional" in regime_lower:
+        regime_desc = (
+            "The flow is in the **transitional** regime — somewhere between laminar and "
+            "fully turbulent. Predicting this regime accurately is challenging and "
+            "typically requires specialised models."
+        )
+
+    re_explanation = (
+        f"The **Reynolds number** for this simulation is **{re_str}**. "
+        "The Reynolds number is a dimensionless quantity that describes whether a flow "
+        "will be smooth and orderly (laminar) or chaotic and mixing (turbulent). "
+        "It combines the fluid speed, the size of the geometry, and the fluid's "
+        "viscosity (resistance to flow) into a single number. "
+        "As a rough guide: below about 2,300 the flow is typically laminar; "
+        "above about 4,000 it is typically turbulent."
+    )
+    if regime_desc:
+        re_explanation += f" {regime_desc}"
+    return re_explanation
+
+
+def _plain_bc_explanation(patches: dict[str, Any]) -> str:
+    """Return a short plain-language note about boundary condition types found."""
+    seen_types: set[str] = set()
+    for pdata in patches.values():
+        if isinstance(pdata, dict):
+            for field_bc in pdata.values():
+                if isinstance(field_bc, dict):
+                    t = field_bc.get("type", "")
+                    if t:
+                        seen_types.add(t.lower())
+
+    explanations: list[str] = []
+    if "fixedvalue" in seen_types:
+        explanations.append(
+            "**Fixed value** boundaries set an exact quantity (e.g. a specific velocity or "
+            "temperature) at that surface — like specifying that fluid enters at 10 m/s."
+        )
+    if "zerogradient" in seen_types:
+        explanations.append(
+            "**Zero gradient** boundaries allow the quantity to flow freely out of the domain "
+            "without any artificial reflection — commonly used at outlets."
+        )
+    if "noslip" in seen_types or "noSlip" in seen_types:
+        explanations.append(
+            "**No-slip** walls enforce zero velocity at solid surfaces, matching the "
+            "physical behaviour that fluid sticks to a wall."
+        )
+    if "symmetry" in seen_types or "symmetryplane" in seen_types:
+        explanations.append(
+            "**Symmetry** boundaries allow the simulation to model only half (or a fraction) "
+            "of the geometry, reducing computation while capturing the full physics."
+        )
+    if "inletoutlet" in seen_types:
+        explanations.append(
+            "**Inlet/outlet** boundaries switch automatically between inlet and outlet "
+            "behaviour depending on flow direction — useful when backflow is possible."
+        )
+    if not explanations:
+        return ""
+    return (
+        "Boundary conditions define what happens at every surface of the simulation domain. "
+        "Think of them as the rules that tell the solver what the fluid is doing at each "
+        "wall, inlet, and outlet. In this simulation:\n\n"
+        + "\n".join(f"- {e}" for e in explanations)
+    )
+
+
 def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str, Any]:
     """Produce a structured report (markdown + typed data block) for the simulation.
 
@@ -675,12 +766,14 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
 
     parts: list[str] = []
 
+    solver_name = snap.solver.get("solver") or snap.physics.get("solver") or "N/A"
+    regime = snap.physics.get("flowType") or snap.physics.get("flowRegime") or "N/A"
+    re_num = snap.physics.get("Re") or snap.physics.get("reynoldsNumber") or "N/A"
+    turb_model = snap.turbulence.get("model") or "N/A"
+    transient = _is_transient(snap)
+
     # ── Summary ──────────────────────────────────────────────────────────────
     if "summary" in sections:
-        solver_name = snap.solver.get("solver") or snap.physics.get("solver") or "N/A"
-        regime = (snap.physics.get("flowType") or snap.physics.get("flowRegime") or "N/A")
-        re_num = snap.physics.get("Re") or snap.physics.get("reynoldsNumber") or "N/A"
-        turb_model = snap.turbulence.get("model") or "N/A"
         status = snap.agent_run.get("status", "N/A")
         started = snap.agent_run.get("started_at", "N/A")
         completed = snap.agent_run.get("completed_at", "N/A")
@@ -696,6 +789,27 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
             f"| Completed | {completed} |"
         )
 
+    # ── Plain-language explanation ─────────────────────────────────────────────
+    explanation_parts: list[str] = []
+
+    solver_expl = _plain_solver_explanation(solver_name, transient)
+    if solver_expl:
+        explanation_parts.append(solver_expl)
+
+    re_expl = _plain_reynolds_explanation(re_num, regime)
+    if re_expl:
+        explanation_parts.append(re_expl)
+
+    turb_expl = _plain_turbulence_explanation(turb_model)
+    if turb_expl:
+        explanation_parts.append(turb_expl)
+
+    if explanation_parts:
+        parts.append(
+            "## About This Simulation\n\n"
+            + "\n\n".join(explanation_parts)
+        )
+
     # ── Physics ───────────────────────────────────────────────────────────────
     if "physics" in sections and snap.physics:
         rows = "\n".join(f"| {k} | {v} |" for k, v in snap.physics.items())
@@ -708,7 +822,15 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
     if "mesh" in sections and snap.mesh_info:
         mi = snap.mesh_info
         has_errors = mi.get("hasErrors", False)
-        quality_badge = "⚠️ Issues detected" if has_errors else "✅ No issues"
+        quality_note = "Issues detected — see messages below" if has_errors else "No issues detected"
+        mesh_expl = (
+            "\n\nThe mesh is the grid that divides the simulation domain into small cells. "
+            "The solver computes the flow equations separately in each cell, then assembles "
+            "the full picture. A finer mesh (more cells) generally gives more accurate "
+            "results but requires more computation time. "
+            "Aspect ratio measures how stretched a cell is — very elongated cells can "
+            "reduce accuracy. Skewness measures how distorted a cell is from an ideal shape."
+        )
         parts.append(
             "## Mesh Quality\n\n"
             f"- **Cells:** {mi.get('cells', 'N/A')}\n"
@@ -716,7 +838,8 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
             f"- **Points:** {mi.get('points', 'N/A')}\n"
             f"- **Max aspect ratio:** {mi.get('maxAspectRatio', 'N/A')}\n"
             f"- **Max skewness:** {mi.get('maxSkewness', 'N/A')}\n"
-            f"- **Quality:** {quality_badge}"
+            f"- **Quality:** {quality_note}"
+            + mesh_expl
         )
         if mi.get("messages"):
             msgs = "\n".join(f"  - {m}" for m in mi["messages"])
@@ -727,93 +850,82 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
         bc_lines = []
         for pname, pdata in snap.patches.items():
             if isinstance(pdata, dict):
-                # Flatten key fields for readability
                 u_type = (pdata.get("U") or {}).get("type", "—")
                 p_type = (pdata.get("p") or {}).get("type", "—")
                 bc_lines.append(
                     f"| **{pname}** | U: `{u_type}` | p: `{p_type}` |"
                 )
         if bc_lines:
-            parts.append(
+            bc_expl = _plain_bc_explanation(snap.patches)
+            bc_section = (
                 "## Boundary Conditions\n\n"
                 "| Patch | Velocity (U) | Pressure (p) |\n|---|---|---|\n"
                 + "\n".join(bc_lines)
             )
+            if bc_expl:
+                bc_section += f"\n\n{bc_expl}"
+            parts.append(bc_section)
 
-    # ── Residuals / Convergence ───────────────────────────────────────────────
-    convergence_chart: dict[str, Any] | None = None
+    # ── Residuals ─────────────────────────────────────────────────────────────
     if "residuals" in sections and snap.sim_progress:
-        # Always use the FINAL step for the residuals table — that is the most
-        # meaningful snapshot: for steady-state it reflects how far the solution
-        # has converged; for transient it shows the inner-loop quality at the
-        # last time step.
         last = snap.sim_progress[-1]
         residuals = last.get("residuals", {})
         total_iters = len(snap.sim_progress)
         last_sim_time = last.get("sim_time")
 
         if residuals:
-            transient = _is_transient(snap)
-            field_series: dict[str, list[dict[str, Any]]] = {}
-            for step in snap.sim_progress:
-                for f, r in step.get("residuals", {}).items():
-                    field_series.setdefault(f, []).append({
-                        "initial": r.get("initial"),
-                        "final": r.get("final"),
-                    })
-
             rows_list = []
             for f, r in residuals.items():
-                pts = field_series.get(f, [{"initial": r.get("initial"), "final": r.get("final")}])
                 if transient:
-                    status = _assess_transient_inner_convergence(pts)
-                    # For transient runs, the FINAL residual (inner-loop) is the
-                    # key quality metric; the initial residual naturally oscillates
-                    # with the physics and is NOT a convergence indicator.
                     key_residual = r.get("final", "N/A")
-                    key_label = f"**{key_residual}** _(inner-loop final)_"
+                    key_label = f"**{key_residual}** (inner-loop final)"
                 else:
-                    status = _assess_steady_convergence(pts)
                     key_residual = r.get("initial", "N/A")
                     key_label = str(key_residual)
-                badge = {"well_converged": "✅", "converging": "🔶", "not_converged": "❌"}.get(status, "—")
                 rows_list.append(
-                    f"| {f} | {r.get('initial', 'N/A')} | {key_label} | {badge} |"
+                    f"| {f} | {r.get('initial', 'N/A')} | {key_label} |"
                 )
             rows = "\n".join(rows_list)
 
-            # Build section heading that makes it clear these are FINAL-step values
             if transient and last_sim_time is not None:
                 residual_heading = (
-                    f"## Residuals — Final Time Step (t = {last_sim_time:.4g} s) "
+                    f"## Solver Residuals — Final Time Step (t = {last_sim_time:.4g} s) "
                     f"— {total_iters} steps total\n\n"
-                    "> **Transient simulation**: convergence status is based on the "
-                    "inner-loop **FINAL** residual (PISO/PIMPLE quality per time step). "
-                    "Initial residuals oscillate with the physics and are shown for reference only.\n\n"
+                    "> **Transient simulation**: the inner-loop final residual (shown in bold) "
+                    "reflects how accurately the solver resolved each time step. "
+                    "The initial residual naturally varies with the physics and is shown for reference.\n\n"
                 )
             else:
                 residual_heading = (
-                    f"## Residuals — Final Iteration ({last.get('iteration', total_iters)}"
+                    f"## Solver Residuals — Final Iteration ({last.get('iteration', total_iters)}"
                     f" / {total_iters})\n\n"
                 )
 
+            residual_expl = (
+                "\n\nResiduals are a measure of how well the solver has satisfied the "
+                "governing equations in each cell of the mesh. Think of them as the "
+                "remaining 'error' in the solution at each step — smaller residuals mean "
+                "the equations are being satisfied more precisely. "
+                "They are reported on a logarithmic scale, so a value of 1e-6 is far "
+                "smaller (better) than 1e-3."
+            )
+
             parts.append(
                 residual_heading
-                + "| Field | Initial | Final (key metric) | Status |\n|---|---|---|---|\n"
+                + "| Field | Initial | Final (key metric) |\n|---|---|---|\n"
                 + rows
+                + residual_expl
             )
 
         courant = last.get("courant", {})
         if courant:
             parts.append(
                 f"**Courant number** — mean: {courant.get('mean', 'N/A')}, "
-                f"max: {courant.get('max', 'N/A')}"
+                f"max: {courant.get('max', 'N/A')}\n\n"
+                "The Courant number (also called the CFL number) relates the fluid speed "
+                "to the time step size and cell size. Keeping it below 1 ensures the "
+                "simulation remains numerically stable in time-stepping solvers."
             )
-
-        # Build convergence chart data for frontend PDF embedding
-        trend = compute_residual_trend({"fields": list(residuals.keys())}, snap)
-        if "chart" in trend:
-            convergence_chart = trend["chart"]
 
     # ── Final Results ──────────────────────────────────────────────────────────
     if "results" in sections and snap.final_result:
@@ -826,10 +938,9 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
 
     report_md = "\n\n---\n\n".join(parts) if parts else "No simulation data available yet."
 
-    result: dict[str, Any] = {
+    return {
         "report_markdown": report_md,
         "sections_included": sections,
-        # Typed data block for the frontend PDF renderer — all raw values
         "report_data": {
             "solver": snap.solver.get("solver") or snap.physics.get("solver"),
             "status": snap.agent_run.get("status"),
@@ -843,10 +954,6 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
             "total_iterations": len(snap.sim_progress),
         },
     }
-    if convergence_chart:
-        result["chart"] = convergence_chart  # service.py will emit this as a "chart" artifact too
-
-    return result
 
 
 def analyze_chart(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str, Any]:
@@ -858,7 +965,7 @@ def analyze_chart(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str, A
         trend_result = compute_residual_trend({"fields": field}, snap)
         return {
             "chart_type": "residuals",
-            "analysis": trend_result,
+            "analysis": {k: v for k, v in trend_result.items() if k != "convergence"},
             "note": "Residual data extracted from simulation progress.",
         }
 
@@ -949,9 +1056,9 @@ CHAT_TOOLS_SCHEMA = types.Tool(
         types.FunctionDeclaration(
             name="compute_residual_trend",
             description=(
-                "Return residual convergence history for one or more fields. "
-                "Use this to assess whether the simulation converged, to explain "
-                "residual plots, or when the user asks about convergence."
+                "Return residual history for one or more fields as a chart. "
+                "Use this when the user explicitly asks to see residuals or the "
+                "residual plot. Do NOT call this proactively."
             ),
             parameters=types.Schema(
                 type="OBJECT",
@@ -1013,7 +1120,11 @@ CHAT_TOOLS_SCHEMA = types.Tool(
                 "a report, export results, download a PDF, or get a complete simulation summary. "
                 "Use the 'focus' parameter to tailor the report to what the user asked for "
                 "(e.g. 'convergence', 'boundary conditions', 'results'). "
-                "Omit 'sections' to auto-select based on focus or include everything."
+                "Omit 'sections' to auto-select based on focus or include everything. "
+                "IMPORTANT: the report must use plain language accessible to users without a "
+                "CFD background — explain every choice (solver, turbulence model, BCs) in "
+                "plain terms. Do NOT use any emoji. Do NOT make convergence/divergence "
+                "conclusions; if residual data is shown, describe the trend only."
             ),
             parameters=types.Schema(
                 type="OBJECT",

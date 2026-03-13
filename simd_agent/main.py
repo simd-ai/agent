@@ -549,13 +549,15 @@ async def websocket_run(websocket: WebSocket):
             store=store,
             request=request,
         )
-        
+
+        op_str = request.op.value  # "CFD_LINT" or "CFD_CODEGEN_RUN"
+
         # Start heartbeat task
         logger.info("[WS] Starting heartbeat task...")
         heartbeat_task = asyncio.create_task(
             _heartbeat_loop(websocket, get_settings().ws_heartbeat_interval)
         )
-        
+
         try:
             # Execute the workflow
             logger.info("[WS] Starting orchestrator.run()...")
@@ -816,8 +818,18 @@ async def _ensure_vtk_cached(run_id: str) -> dict:
                 logger.info(f"[VTK_CACHE] Cached (fallback) surface.vtp for run {run_id} t={sim_time} → {local_dir}")
                 return local_index
 
-            surface_bytes = await sim.download_surface_vtp(sim_run_id)
-            (local_dir / "surface.vtp").write_bytes(surface_bytes)
+            # Try to download surface.vtp; sim servers using the precomputed index
+            # may not expose /vtk/surface.vtp — fall back to the last timestep VTP.
+            surface_bytes: bytes | None = None
+            try:
+                surface_bytes = await sim.download_surface_vtp(sim_run_id)
+                (local_dir / "surface.vtp").write_bytes(surface_bytes)
+                logger.info(f"[VTK_CACHE] surface.vtp downloaded for {run_id}")
+            except SimulationServerError as surf_err:
+                logger.warning(
+                    f"[VTK_CACHE] surface.vtp unavailable ({surf_err}); "
+                    "will copy last timestep VTP as surface.vtp after download"
+                )
 
             # ── 3. Download each timestep VTP ─────────────────────────────────
             raw_ts_list = sim_index.get("timesteps", [])
@@ -849,6 +861,15 @@ async def _ensure_vtk_cached(run_id: str) -> dict:
                 f"[VTK_CACHE] Saved local timesteps order: "
                 + str([ts["time"] for ts in local_timesteps])
             )
+
+            # If surface.vtp was unavailable, use the last (highest-time) timestep
+            if surface_bytes is None and local_timesteps:
+                last_ts = sorted(local_timesteps, key=lambda t: float(t["time"]))[-1]
+                last_path = ts_dir / last_ts["filename"]
+                (local_dir / "surface.vtp").write_bytes(last_path.read_bytes())
+                logger.info(
+                    f"[VTK_CACHE] Used last timestep (t={last_ts['time']}) as surface.vtp for {run_id}"
+                )
 
             # ── 4. Write local index ──────────────────────────────────────────
             local_index = {

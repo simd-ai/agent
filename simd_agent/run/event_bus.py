@@ -181,6 +181,21 @@ class EventBus:
             f"Run started: {op}",
             {"op": op, "provider": provider},
         )
+
+    async def emit_run_cancelled(self, op: str, reason: str = "User cancelled") -> AgentEvent:
+        """Emit a clean cancellation event.
+
+        The frontend must listen for this and:
+          - Restore the 'Validate Setup' button  (op == 'CFD_LINT')
+          - Restore the 'Run Simulation' button  (op == 'CFD_CODEGEN_RUN')
+          - Clear / reset the event panel for that op so the next run starts fresh.
+        """
+        duration = (datetime.utcnow() - self._started_at).total_seconds()
+        return await self.emit_info(
+            EventTypes.RUN_CANCELLED,
+            reason,
+            {"op": op, "reason": reason, "duration_seconds": duration},
+        )
     
     # --- Config validation events (NEW) ---
     
@@ -727,6 +742,7 @@ class EventBus:
     async def emit_final(
         self,
         status: str,
+        op: str | None = None,
         validated_config: dict[str, Any] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
         iterations: int = 0,
@@ -736,13 +752,21 @@ class EventBus:
         solver: str | None = None,
         error: str | None = None,
     ) -> AgentEvent:
-        """Emit final event with complete results."""
+        """Emit final event with complete results.
+
+        ``op`` ("CFD_LINT" | "CFD_CODEGEN_RUN") lets the frontend route this
+        event to the correct section (validation panel vs simulation panel) so
+        it can restore the appropriate action button and display events in the
+        right place regardless of how many times the user has started / cancelled.
+        """
         duration = (datetime.utcnow() - self._started_at).total_seconds()
+        level = EventLevel.INFO if status in ("succeeded", "cancelled") else EventLevel.ERROR
         return await self.emit(
             EventTypes.FINAL,
             f"Final: {status}",
             {
                 "run_id": str(self.run_id),
+                "op": op,
                 "status": status,
                 "validated_config": validated_config,
                 "artifacts": artifacts or [],
@@ -754,7 +778,7 @@ class EventBus:
                 "error": error,
                 "duration_seconds": duration,
             },
-            level=EventLevel.INFO if status == "succeeded" else EventLevel.ERROR,
+            level=level,
         )
     
     @property

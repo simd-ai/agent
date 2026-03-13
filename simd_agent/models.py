@@ -31,6 +31,7 @@ class RunStatus(str, Enum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     NOT_CLEAR = "not_clear"
     CONFIG_INCOMPLETE = "config_incomplete"
 
@@ -676,6 +677,10 @@ class EventTypes:
     RUN_STARTED = "run_started"
     RUN_SUCCEEDED = "run_succeeded"
     RUN_FAILED = "run_failed"
+    # Emitted when the user explicitly cancels a validation or run.
+    # The frontend should restore the "Validate Setup" / "Run Simulation" button
+    # and reset the events panel so the user can start again cleanly.
+    RUN_CANCELLED = "run_cancelled"
     SIMULATION_NOT_CLEAR = "simulation_not_clear"
     
     # Config validation
@@ -748,7 +753,8 @@ class EventTypes:
     ERROR_SUMMARY = "error_summary"
     RETRYING = "retrying"
     
-    # Final
+    # Final — always carries op ("CFD_LINT" | "CFD_CODEGEN_RUN") so the frontend
+    # can route the result to the correct section (validation vs simulation).
     FINAL = "final"
 
 

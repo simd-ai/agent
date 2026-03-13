@@ -59,6 +59,10 @@ class ChatService:
             yield DoneEvent().model_dump()
             return
 
+        sim_id = request.simulation_id or request.context.simulation_id
+        if sim_id:
+            await persist_chat_message(sim_id, "user", request.message)
+
         system_prompt = SYSTEM_PROMPT.replace(
             "{context_json}",
             json.dumps(snap.summary_dict(), indent=2, default=str),
@@ -99,7 +103,6 @@ class ChatService:
 
         sim_id = request.simulation_id or request.context.simulation_id
         if sim_id:
-            await persist_chat_message(sim_id, "user", request.message)
             await persist_chat_message(sim_id, "assistant", full_response_text, suggested_actions)
 
     async def _stream_with_tools(
@@ -230,13 +233,15 @@ class ChatService:
                 if "report_markdown" in result_data:
                     # Emit a "report" artifact carrying both the markdown and the
                     # typed data block so the frontend can render / PDF-export it.
+                    # Content is a plain dict (not double-serialized) so the frontend
+                    # receives a proper JSON object it can use directly.
                     yield ArtifactEvent(
                         kind="report",
-                        content=_json.dumps({
+                        content={
                             "markdown": result_data["report_markdown"],
                             "data": result_data.get("report_data", {}),
                             "sections": result_data.get("sections_included", []),
-                        }),
+                        },
                     ).model_dump()
                     # Strip large keys — LLM only needs a short acknowledgement
                     keys_to_strip.extend(["report_markdown", "report_data"])
@@ -257,8 +262,8 @@ class ChatService:
         actions: list[str] = []
         lower = user_msg.lower()
 
-        if snap.sim_progress and "converge" not in lower and "residual" not in lower:
-            actions.append("Show residual convergence")
+        if snap.sim_progress and "residual" not in lower:
+            actions.append("Show residual plot")
         if snap.vtk_result:
             actions.append("Explain the velocity field")
         if snap.patches:
