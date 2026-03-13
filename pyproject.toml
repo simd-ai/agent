@@ -21,6 +21,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.25",
     "asyncpg>=0.29.0",
     "codegen @ git+https://github.com/simd-ai/codegen.git",
+    "google-genai>=1.0.0",
     "python-multipart==0.0.19",
     "numpy>=2.0.0",
 ]
