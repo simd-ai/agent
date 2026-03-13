@@ -1,149 +1,157 @@
 # Solver: rhoPimpleFoam  ·  OpenFOAM v2406
 
-**Type**: Transient · Compressible · PIMPLE (pressure-based compressible)  
-**Pressure field**: `p` (absolute static pressure in Pa, dimensions `[1 -1 -2 0 0 0 0]`)  
-**Energy equation**: ✅ YES — the solver transports `he = thermo.he()` internally (`h` or `e`).  
-  ⚠️ **Do NOT generate `0/h` or `0/e`.** The thermo package initialises the energy field from `0/T` at startup — providing `0/h` causes "Negative initial temperature" because back-conversion from h→T is reference-sensitive.  
-  **Always provide `0/T` with temperature boundary conditions (in Kelvin).**  
-**Gravity file**: ❌ No (use buoyantPimpleFoam if buoyancy-driven natural convection needed)  
+**Type**: Transient · Compressible (pressure-based) · PIMPLE  
+**Pressure field**: `p` — absolute static pressure in Pa, dimensions `[1 -1 -2 0 0 0 0]`  
+**Energy**: thermo-driven; always initialised from `0/T` (Kelvin).
+
+---
+
+## Prime directive
+
+Generate a **syntactically correct, internally consistent** OpenFOAM case from
+`validated_config`.  
+**Do NOT refuse or redirect** because a fluid choice, EOS, or temperature range
+looks unusual.  If something is ambiguous, apply the conservative defaults in
+this file.  Physical realism is the user's responsibility.
+
+---
 
 ## Required files
 
 | File | Notes |
 |------|-------|
-| `system/controlDict` | `application rhoPimpleFoam;` · deltaT = solver.delta_t · endTime = solver.endTime |
-| `system/fvSchemes` | Euler ddt · upwind divSchemes; include `div(phi,e)` OR `div(phi,h)` matching thermo energy setting |
-| `system/fvSolution` | `PIMPLE { }` block; solvers for p/pFinal and regex group for rho/U/e (or h)/k/omega or epsilon |
-| `0/U` | Velocity — all patches (MUST_READ by solver) |
-| `0/p` | Absolute pressure `[1 -1 -2 0 0 0 0]` in Pa |
-| `0/T` | Temperature `[0 0 0 1 0 0 0]` in **Kelvin** — the thermo reads T and initialises h/e from it |
-| `constant/thermophysicalProperties` | REQUIRED — defines thermoType, EOS, transport, and energy setting |
-| `constant/turbulenceProperties` | Required if turbulent |
-| `0/k`, `0/omega`, `0/nut`, `0/alphat` | If kOmegaSST + energy active |
-| `0/k`, `0/epsilon`, `0/nut`, `0/alphat` | If kEpsilon + energy active |
-| `constant/fvOptions` | **Conditionally required** — MUST include for cryogenic/liquid cases; use `limitTemperature` to suppress `Negative Temperature` divergence during startup (see template below) |
+| `system/controlDict` | `application rhoPimpleFoam;` |
+| `system/fvSchemes` | Euler ddt; div schemes for U and energy (e or h); wallDist if turbulent |
+| `system/fvSolution` | `PIMPLE {}` block; solvers for `p`, `rho`, and transport fields |
+| `0/U` | Velocity — all patches |
+| `0/p` | Absolute pressure (Pa) |
+| `0/T` | Temperature (K) |
+| `constant/thermophysicalProperties` | REQUIRED — see selection rules below |
+| `constant/turbulenceProperties` | Required when turbulence model is active |
+| `0/k`, `0/omega`, `0/nut`, `0/alphat` | kOmegaSST + energy active |
+| `0/k`, `0/epsilon`, `0/nut`, `0/alphat` | kEpsilon + energy active |
+| `system/fvOptions` | **REQUIRED** — always generate with `limitTemperature` to prevent negative-T divergence |
 
-> **`0/rho`**: do NOT generate — rho is `NO_READ`; derived from `thermo.rho()`. However, `rho { }` MUST be in `fvSolution/solvers`.  
-> **`0/h` / `0/e`**: **NEVER generate these files.** The thermo package initialises h/e from `0/T` internally. Providing 0/h causes `Negative initial temperature T0` crashes.  
-> **`0/alphat`**: MUST generate when turbulence + energy are both active; use `compressible::alphatWallFunction` on walls.
+### Files you must NEVER generate for this solver
 
-## constant/thermophysicalProperties template
+- `0/rho` — derived from `thermo.rho()` at runtime (`NO_READ`).
+- `0/h` / `0/e` — the thermo package initialises the energy field from `0/T`
+  internally.  Providing `0/h` causes `Negative initial temperature T0` because
+  OpenFOAM back-converts h→T against its own reference state.
+- `constant/g` — not needed for `rhoPimpleFoam` (use `buoyantPimpleFoam` for
+  buoyancy-driven flows).
 
+> **`rho` solver entry**: even though `0/rho` is not a file, `rhoPimpleFoam`
+> solves `rhoEqn` internally and looks up `rho` in `fvSolution/solvers` at
+> runtime.  Omitting it causes
+> `"Entry 'rho' not found in dictionary system/fvSolution/solvers"`.
+> Always include the diagonal entry (see fvSolution template below).
+
+> **`0/alphat`**: MUST be generated whenever turbulence AND energy are both
+> active.  Use `compressible::alphatWallFunction` on wall patches.
+
+---
+
+## Thermophysical model selection (CONFIG-DRIVEN)
+
+Build `constant/thermophysicalProperties` from `validated_config` only.
+
+### Step 1 — honour explicit config
+
+If `validated_config` (or `validated_config.physics`) already specifies
+`thermoType`, `equationOfState`, or `transport`, use those values **as-is**.
+Do not override them.
+
+### Step 2 — conservative defaults when config is silent
+
+| Fluid condition | Default thermoType | Default EOS | Default transport |
+|---|---|---|---|
+| compressible gas | `hePsiThermo` | `perfectGas` | `const` (or `sutherland`) |
+| liquid with heat transfer OR cryogenic (T < 200 K) | `heRhoThermo` | `icoPolynomial` | `const` |
+| isothermal liquid (no heat transfer) | `heRhoThermo` | `rhoConst` | `const` |
+
+**NEVER use `rhoConst` for cryogenic liquids (LN2, LH2, LOX) or when temperature varies significantly.**
+For `icoPolynomial`: `rhoCoeffs<8> (a0 a1 0 0 0 0 0 0)` where ρ(T) = a0 + a1·T.
+Typical slopes: LN2/LOX (77–120 K) −4.7 kg/m³/K; LH2 (<35 K) −0.7; water/oil >250 K −0.5.
+Compute `a0 = ρ_inlet − a1 × T_inlet` from CaseSpec values.
+
+Use `thermo hConst` unless `validated_config` supplies JANAF coefficients, in
+which case use `janaf`.
+
+### Step 3 — energy field name
+
+The `energy` keyword controls which variable name the solver transports:
+
+| `energy` setting in `thermoType{}` | Energy variable | Use in fvSchemes / fvSolution |
+|---|---|---|
+| `sensibleInternalEnergy` | `e` | `div(phi,e)`, regex `(U\|e\|…)` |
+| `sensibleEnthalpy` | `h` | `div(phi,h)`, regex `(U\|h\|…)` |
+
+Default when not otherwise specified: `sensibleEnthalpy` → `h`.
+
+### thermophysicalProperties templates
+
+**Gas (perfectGas)**:
 ```
 thermoType
 {
     type            hePsiThermo;
     mixture         pureMixture;
-    transport       sutherland;      // or const; sutherland preferred for compressible
-    thermo          janaf;           // or hConst
+    transport       const;            // or sutherland
+    thermo          hConst;           // ← MUST be 'thermo' (not 'thermodynamics')
     equationOfState perfectGas;
     specie          specie;
-    energy          sensibleInternalEnergy;  // -> energy field name is "e"
-                                             // use sensibleEnthalpy  -> field name is "h"
+    energy          sensibleEnthalpy;
 }
-
 mixture
 {
-    specie
+    specie      { nMoles 1; molWeight 28.97; }
+    thermodynamics { Cp 1005; Hf 0; }   // ← MUST be 'thermodynamics' (not 'thermo')
+    transport   { mu 1.8e-5; Pr 0.72; }
+}
+```
+
+**Cryogenic/temperature-varying liquid (icoPolynomial)**:
+⚠️  `icoPolynomial` is ONLY valid with `transport=polynomial` + `thermo=hPolynomial`.
+```
+thermoType
+{
+    type            heRhoThermo;
+    mixture         pureMixture;
+    transport       polynomial;      // MUST be polynomial
+    thermo          hPolynomial;     // MUST be hPolynomial
+    equationOfState icoPolynomial;
+    specie          specie;
+    energy          sensibleEnthalpy;
+}
+mixture
+{
+    specie      { nMoles 1; molWeight 28.97; }
+    thermodynamics                   // hPolynomial: CpCoeffs<8> + Hf + Sf (NOT plain Cp)
     {
-        nMoles          1;
-        molWeight       28.97;   // Air: 28.97 | LN2: 28.014
-    }
-    thermodynamics
-    {
-        Cp              1005;    // J/kg/K — from fluid config (used if hConst)
         Hf              0;
+        Sf              0;
+        CpCoeffs<8>     (2042 0 0 0 0 0 0 0);
     }
-    transport
+    transport                        // polynomial: muCoeffs + kappaCoeffs (NOT mu/Pr)
     {
-        mu              1.8e-5;  // Dynamic viscosity — from fluid config (used if const)
-        Pr              0.72;    // Prandtl number: mu*Cp/lambda
+        muCoeffs<8>     (1.58e-4 0 0 0 0 0 0 0);
+        kappaCoeffs<8>  (0.323 0 0 0 0 0 0 0);  // kappa = mu*Cp/Pr
+    }
+    equationOfState
+    {
+        // a0 = ρ_inlet − a1*T_inlet; LN2 at 77K, ρ=808: a0=1169.9, a1=−4.7
+        rhoCoeffs<8>    (1169.9 -4.7 0 0 0 0 0 0);
     }
 }
 ```
 
-> **Energy field name rule**: if `energy sensibleInternalEnergy` → field is `e`; if `energy sensibleEnthalpy` → field is `h`. This determines which `div(phi,e)` / `div(phi,h)` and solver entries to generate.
-
----
-
-## Thermophysical Model Selection
-
-If the user is simulating a fluid, apply the following logic to select the correct thermophysical model:
-
-### Single-Phase Gas
-**Condition**: Operating temperature is significantly above the fluid's boiling point (e.g., air or N₂ at room temperature).  
-**Model**:
-```
-type            hePsiThermo;
-equationOfState perfectGas;
-thermo          hConst;    // or janaf for variable Cp
-transport       sutherland; // or const
-```
-
-### Single-Phase Liquid — Stable (water, oil, sub-cooled fluids far from boiling point)
-**Condition**: Fluid is a **stable liquid that does NOT boil** at the operating temperature (e.g., water at 20 °C, oil at 50 °C, water cooling circuit well below 100 °C).  
-**Model**:
-```
-type            heRhoThermo;    // NOT hePsiThermo — rhoConst requires heRhoThermo
-equationOfState rhoConst;       // constant density — ONLY valid when T change is small
-thermo          hConst;
-transport       const;
-```
-> ⚠️ **Set `0/p` outlet to the actual operating pressure (e.g., `101325` Pa). NEVER use `0`.** With `rhoConst`, pressure is decoupled from density — an outlet of 0 Pa creates unphysical negative pressures that propagate into temperature divergence.
-
-### Single-Phase Liquid — Cryogenic (LN₂, LH₂, LOX, or any fluid below ~200 K)
-**Condition**: Fluid is a **cryogenic liquid** (LN₂, LH₂, LOX, etc.) or the operating temperature is below ~200 K.
-
-> 🚫 **NEVER use `equationOfState rhoConst` for cryogenic fluids.** LN₂ boils at 77 K, LH₂ at 20 K — a hot wall (e.g., 300–400 K) will cause the fluid temperature to rise dramatically above the boiling point, making `rhoConst` (constant density) physically wrong. The solver will produce wildly incorrect results or crash with `Negative Temperature`.
-
-**Model** (temperature-varying density):
-```
-type            heRhoThermo;
-equationOfState icoPolynomial;  // T-dependent ρ — provide rhoCoeffs polynomial
-thermo          hConst;
-transport       const;
-energy          sensibleEnthalpy;
-```
-Alternatively, if the user intends to model phase-change (LN₂ boiling), escalate to a two-phase solver (`interFoam` or `compressibleInterFoam`) and flag the user.
-
-### Cryogenic Safety Rule
-**Applies to**: any cryogenic fluid (LN₂, LOX, LH₂, etc.) or any case where cold initial conditions coexist with warm wall/inlet boundaries (ΔT > 50 K with cold side below 200 K).  
-**Constraint**: Always generate `constant/fvOptions` containing a `limitTemperature` source. This prevents the `Negative initial temperature T0` / `Negative Temperature` crash that occurs during the first ~100 iterations when numerical overshoot drives `T → 0` or negative.
-
----
-
-## constant/fvOptions template (Cryogenic / Liquid cases)
-
-```
-FoamFile
-{
-    version     2.0;
-    format      ascii;
-    class       dictionary;
-    location    "constant";
-    object      fvOptions;
-}
-
-temperatureLimiter
-{
-    type            limitTemperature;
-    active          yes;
-
-    selectionMode   all;
-
-    min             1;       // absolute floor [K] — blocks T going to 0 or negative
-    max             100000;  // effectively unlimited ceiling
-}
-```
-
-> `limitTemperature` is a standard OpenFOAM `fvOption`. It clips the temperature field each iteration. This is a **safety net only** — if T is still hitting the floor after iteration ~200 the root cause (wrong BCs, wrong EOS, wrong pressure outlet) must be fixed.
+> **Key naming**: inside `thermoType{}` the keyword is `thermo  hConst;`
+> Inside `mixture{}` the sub-dict is `thermodynamics { Cp …; }` — not `thermo`.
 
 ---
 
 ## fvSolution template
-
-> **Solver selection rule:** `GAMG` for symmetric elliptic equations (pressure `p`).
-> `smoothSolver` / `PBiCGStab` for asymmetric transport equations (`U`, `h`/`e`, turbulence).
 
 ```
 solvers
@@ -151,14 +159,12 @@ solvers
     p
     {
         solver          GAMG;
-        smoother        GaussSeidel;
+        smoother        GaussSeidel;   // NEVER DIC — crashes with SIGFPE on divergence
         tolerance       1e-7;
         relTol          0.01;
     }
     pFinal      { $p; relTol 0; }
 
-    // ✅ REQUIRED — rhoPimpleFoam solves rhoEqn; OpenFOAM looks up this entry at runtime.
-    // Missing it causes: "Entry 'rho' not found in dictionary system/fvSolution/solvers"
     rho
     {
         solver      diagonal;
@@ -167,18 +173,19 @@ solvers
     }
     rhoFinal    { $rho; relTol 0; }
 
-    // Energy field: use "h" if energy=sensibleEnthalpy, "e" if energy=sensibleInternalEnergy
-    // Include alphat only if turbulence + energy both active
-    "(U|h|e|k|omega|epsilon|alphat)"
+    // h or e — match the energy keyword in thermophysicalProperties
+    "(U|h|k|omega|epsilon|alphat)"
     {
-        solver          smoothSolver;
-        smoother        symGaussSeidel;
+        solver          PBiCGStab;
+        preconditioner  DILU;
         tolerance       1e-6;
         relTol          0.1;
     }
-    "(U|h|e|k|omega|epsilon|alphat)Final"
+    "(U|h|k|omega|epsilon|alphat)Final"
     {
-        $U;
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-6;
         relTol          0;
     }
 }
@@ -194,55 +201,154 @@ PIMPLE
 
 relaxationFactors
 {
+    // Under-relaxation helps transient stability with nOuterCorrectors > 1.
+    // Remove or set to 1.0 for pure transient runs with nOuterCorrectors 1.
     fields      { p 0.3; rho 0.05; }
-    equations   { U 0.9; h 0.7; e 0.7; k 0.9; omega 0.9; epsilon 0.9; }
+    equations   { U 0.9; h 0.7; k 0.9; omega 0.9; epsilon 0.9; }
 }
 ```
 
-## fvSchemes template
+> **Energy field in regex**: use `h` or `e` to match the `energy` setting.
+> If the model uses `sensibleInternalEnergy`, replace `h` with `e` in the
+> regex groups above.
+
+> **Final block**: repeat solver settings explicitly — do NOT use `$"(U|h|…)"` alias
+> syntax; OpenFOAM cannot dereference regex-named entries via `$` and will crash.
+
+---
+
+## fvSchemes template (robust)
+
+**Why `bounded Gauss upwind` as default instead of `none`:** OpenFOAM with
+`default none` crashes fatally on any div term not explicitly listed — including
+internal transient fields like `Ekp` or any turbulence model auxiliary. Using
+`bounded Gauss upwind` as a safe fallback prevents these crashes while the
+important terms are overridden explicitly with higher-order schemes.
 
 ```
 ddtSchemes      { default Euler; }
 gradSchemes     { default Gauss linear; }
+
 divSchemes
 {
-    default             none;
-    div(phi,U)          Gauss linearUpwind grad(U);
-    div(phi,e)          Gauss linearUpwind grad(e);   // if sensibleInternalEnergy
-    div(phi,h)          Gauss linearUpwind grad(h);   // if sensibleEnthalpy
-    div(phi,K)          Gauss linearUpwind grad(K);
-    div(phi,k)          Gauss linearUpwind grad(k);
-    div(phi,omega)      Gauss linearUpwind grad(omega);
-    div(phi,epsilon)    Gauss linearUpwind grad(epsilon);
+    // Safe default: bounded upwind covers any internal term the solver requests
+    // without crashing on missing entries.
+    default                             bounded Gauss upwind;
+
+    div(phi,U)                          bounded Gauss linearUpwind grad(U);
+
+    // energy convection — emit ONLY the one matching thermoType.energy
+    div(phi,h)                          bounded Gauss linearUpwind grad(h);   // sensibleEnthalpy
+    // div(phi,e)                       bounded Gauss linearUpwind grad(e);   // sensibleInternalEnergy
+
+    // kinetic energy and pressure-work terms — REQUIRED for compressible energy eqn
+    div(phi,K)                          bounded Gauss linearUpwind grad(K);
+    div(phi,Ekp)                        bounded Gauss upwind;
+    div(phid,p)                         Gauss limitedLinear 1;
+
+    // turbulence convection (include only fields that actually exist)
+    div(phi,k)                          bounded Gauss linearUpwind grad(k);
+    div(phi,omega)                      bounded Gauss linearUpwind grad(omega);
+    div(phi,epsilon)                    bounded Gauss linearUpwind grad(epsilon);
+
+    // viscous stress — must use dev2, not dev
     div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;
-    div(phid,p)         Gauss limitedLinear 1;
 }
-laplacianSchemes { default Gauss linear corrected; }
+
+laplacianSchemes     { default Gauss linear corrected; }
 interpolationSchemes { default linear; }
-snGradSchemes   { default corrected; }
-wallDist        { method meshWave; }
+snGradSchemes        { default corrected; }
+
+// Include wallDist ONLY when turbulence is enabled (RAS/LES)
+wallDist { method meshWave; }
 ```
 
-## Critical rules
+> Emit **only one** of `div(phi,h)` / `div(phi,e)` — whichever matches the
+> `energy` setting. Do not emit both.
+>
+> `div(phi,K)` and `div(phid,p)` are **mandatory** for `rhoPimpleFoam`. Omitting
+> them with `default none` causes a fatal crash. They are harmless with
+> `default bounded Gauss upwind` but should always be listed explicitly.
 
-1. `0/p` is ABSOLUTE pressure in Pa (not kinematic). Inlet/outlet values from config × density if given in bar: 1 bar = 100 000 Pa.
-2. `0/T` is **ALWAYS required** and contains temperature values **in Kelvin**. This is the ONLY energy-related field file you generate.
-3. **NEVER generate `0/h` or `0/e`** — the thermo package initialises the energy field from `0/T` at startup. Providing them causes `Negative initial temperature T0` (OpenFOAM back-converts h→T and gets a nonsensical value). Standard tutorials (e.g., `$FOAM_TUTORIALS/compressible/rhoPimpleFoam/`) all omit `0/h`.
-4. In `fvSolution` and `fvSchemes`, the energy variable is **`e`** (sensibleInternalEnergy) or **`h`** (sensibleEnthalpy) — never `T`. Match the regex group and `div` scheme to the `energy` setting in `thermophysicalProperties`.
-5. When turbulence + energy are both active, generate `0/alphat` with `compressible::alphatWallFunction` on walls. Missing `alphat` will cause runtime errors.
-6. Fix aliasing: `Final` solver groups must reference their own group (`$U;`), not a different variable. Do NOT write `omegaFinal { $U; }` if omega is in a regex group — use the `"...Final"` regex alias instead.
-7. **CRITICAL — `rho` solver entry is REQUIRED in `fvSolution/solvers`**: `rhoPimpleFoam` solves `rhoEqn` internally. Omitting it causes `"Entry 'rho' not found in dictionary system/fvSolution/solvers"`. Always include:
-   ```
-   rho      { solver diagonal; tolerance 1e-12; relTol 0; }
-   rhoFinal { $rho; relTol 0; }
-   ```
-8. Do NOT generate `constant/g` for rhoPimpleFoam.
-9. Fill `thermophysicalProperties` with actual Cp, mu, molWeight from the fluid config.
-10. `Pr = mu * Cp / lambda` where `lambda` is thermal conductivity.
-11. For cryogenic fluids (LN2): use `heRhoThermo` + `incompressiblePerfectGas` if density varies but Mach << 1, otherwise `hePsiThermo` + `perfectGas`.
-12. `startFrom startTime; startTime 0;` — NEVER latestTime.
-13. In `thermoType{}`: the key is `thermo  hConst;` (NOT `thermodynamics`). In `mixture{}`: the sub-dict is `thermodynamics { Cp ...; }` (NOT `thermo`).
-14. **Fluid phase model selection**: Use `hePsiThermo` + `perfectGas` for gases. Use `heRhoThermo` + `rhoConst` for **stable liquids only** (water, oil — well below their boiling point). Mixing `hePsiThermo` + `rhoConst` causes runtime errors.
-15. **🚫 FORBIDDEN: `rhoConst` for cryogenic fluids (LN₂, LH₂, LOX, T < 200 K)**: These fluids have large density variation with temperature and can undergo phase change. Using `rhoConst` produces physically wrong results and causes Negative Temperature crashes. Use `icoPolynomial` instead (T-dependent density polynomial).
-16. **Liquid outlet pressure**: When `equationOfState rhoConst` or `icoPolynomial`, always set `0/p` outlet to the actual operating pressure (e.g., 101325 Pa). Never set it to 0 — this causes unphysical pressure fields that generate Negative Temperature divergence.
-17. **`constant/fvOptions` with `limitTemperature`**: **MUST generate** for ALL cryogenic or low-temperature simulations (fluid T < 200 K, or cold fluid against hot wall ΔT > 50 K). Add `constant/fvOptions` to the list of generated files in your response. The system will also auto-inject it if missing, but generating it explicitly is preferred.
+---
+
+## Numerical safety net (fvOptions)
+
+**Always generate `system/fvOptions`** — temperature can diverge to negative values
+during early PIMPLE iterations due to numerical overshoot on boundary interfaces.
+Use this template:
+
+```
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      fvOptions;
+}
+
+temperatureLimiter
+{
+    type            limitTemperature;
+    active          yes;
+    selectionMode   all;
+    min             1;        // K — numerical floor, not a physical constraint
+    max             100000;   // K — effectively unlimited
+}
+```
+
+---
+
+## flowRateInletVelocity (compressible transient)
+
+For `rhoPimpleFoam`, density is derived from the thermo package — `0/rho` is not a
+file.  At **iteration 0**, `rho` has not yet been computed, so `rhoInlet` provides
+the fallback density for converting kg/s → m³/s.
+
+```
+inlet
+{
+    type            flowRateInletVelocity;
+    massFlowRate    <value_in_kg_per_s>;   // MANDATORY — actual kg/s value
+    // rho      rho;       ← only if provided in validated_config
+    // rhoInlet <density>; ← only if provided in validated_config
+    value           uniform (0 0 0);        // placeholder only — NOT the flow rate
+}
+```
+
+For **volumetric** flow rate (m³/s):
+
+```
+inlet
+{
+    type                flowRateInletVelocity;
+    volumetricFlowRate  <value_in_m3_per_s>;
+    value               uniform (0 0 0);
+}
+```
+
+> **CRITICAL rules**:
+> - EXACTLY ONE of `massFlowRate` or `volumetricFlowRate` must be present.
+> - `rho` and `rhoInlet` are **optional** — only include them if the user's config provided them.
+>   Do NOT invent or add them unless they appear in the BC table.
+> - For volumetric flow: never include `rho` or `rhoInlet`.
+> - `value uniform (0 0 0)` is a placeholder — NEVER put the flow rate here.
+> - `massFlowRate 0` will cause the simulation to diverge immediately (SIGFPE).
+
+---
+
+## Critical rules (solver-runtime correctness)
+
+1. `0/p` is absolute pressure in **Pa**.  Do not use kinematic (m²/s²) values.
+2. `0/T` is temperature in **Kelvin**.  This is the only energy IC file you generate.
+3. **Never generate `0/h` or `0/e`** — see note above on Negative Temperature crashes.
+4. **`rho` solver entry is mandatory** in `fvSolution/solvers` — see fvSolution template.
+5. **GAMG smoother must be `GaussSeidel`** — never `DIC` (causes SIGFPE on exit code 136).
+6. Energy variable (`h` or `e`) must be consistent across `thermophysicalProperties`,
+   `fvSchemes` div entries, and `fvSolution` regex groups.
+7. When turbulence + energy are both active, generate `0/alphat` with
+   `compressible::alphatWallFunction` on walls.
+8. Every mesh patch must appear in every `0/*` field file with a valid BC.
+9. `startFrom startTime; startTime 0;` in `controlDict` — never `latestTime`.
+10. `controlDict` `endTime` must equal the value provided in `### endTime` of the task.

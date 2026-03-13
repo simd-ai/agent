@@ -5,6 +5,14 @@
 You are generating a complete OpenFOAM simulation case.
 The solver has already been selected for you — it is provided in the task below.
 
+> **Do NOT enforce physical realism.**  
+> Generate a consistent, runnable OpenFOAM case from the provided `validated_config`.  
+> If the configuration is unusual or the fluid choice looks atypical, still generate it —
+> prefer numerically stable defaults but do not refuse, warn, or redirect.  
+> Physical correctness is the user's responsibility.  
+> Only block generation when an input would produce an **invalid OpenFOAM case**
+> (syntax error, missing mandatory keyword, incompatible solver/field combination).
+
 > **Pressure field type, dimensions, and controlDict timing rules are defined
 > in the solver-specific pack loaded in section G below. Follow those — do NOT
 > invent or override them here.**
@@ -96,10 +104,9 @@ When `previous_errors` is provided:
    - Switch GAMG `smoother` from `DIC` to `GaussSeidel` in `fvSolution/solvers/p` and `pFinal`.
    - Reduce `nOuterCorrectors` to 1 and `nCorrectors` to 1 in the PIMPLE block.
    - Tighten relaxation: `p 0.2`, `rho 0.05`, `U 0.5`, equations `0.5`.
-   - If `equationOfState rhoConst` is used and inlet T < 200 K or ΔT between inlet and wall > 100 K, switch to `icoPolynomial` (cryogenic) — `rhoConst` is FORBIDDEN for cryogenic conditions (see solver-specific rules).
-   - Add or tighten `limitTemperature` in `constant/fvOptions` to prevent negative-T divergence that destabilizes the matrix.
+   - Add or tighten `limitTemperature` in `system/fvOptions` (min 1 K, max 100000 K) to prevent negative-T divergence that destabilises the pressure matrix.
 10. **Massive Courant number (Co >> 1, e.g. 1e10 or larger) with Euler ddt**: The solution completely diverged before the crash. In addition to the fixes in rule 9, switch `controlDict` to use adjustable time-stepping: set `adjustTimeStep yes; maxCo 0.5; deltaT 1e-5;`. This prevents one bad time-step from blowing up the entire run.
-11. **"Negative initial temperature" / "Negative Temperature" errors**: The energy field diverged to unphysical values. Fix: ensure `limitTemperature` in `constant/fvOptions` uses the actual min/max range of your thermal BCs (not 1/100000). If using `rhoConst` with a cold fluid and hot wall, switch EOS as in rule 9.
+11. **"Negative initial temperature" / "Negative Temperature" errors**: The energy field diverged to unphysical values. Fix: add or tighten `limitTemperature` in `system/fvOptions` (min 1 K). Also reduce deltaT and tighten relaxation factors (p 0.2, U 0.5). Do NOT change the EOS or fluid model unless `validated_config` explicitly requests it.
 
 ---
 
@@ -111,6 +118,44 @@ When `previous_errors` is provided:
 4. Always include correct OpenFOAM dimension arrays.
 5. fvSchemes MUST include `wallDist { method meshWave; }` for any turbulent model.
 6. Do NOT invent patch names not in the config.
+
+---
+
+## K) flowRateInletVelocity — mandatory structure
+
+When an inlet uses `flowRateInletVelocity`, generate EXACTLY this shape.
+Do NOT put the flow-rate number in `value` — that entry is a placeholder only.
+
+**Mass flow rate (kg/s):**
+```
+inlet
+{
+    type            flowRateInletVelocity;
+    massFlowRate    <value>;    // ← the actual kg/s value — NEVER zero
+    rho             rho;        // ← required for compressible solvers
+    rhoInlet        <density>;  // ← [kg/m³] fallback when rho field not yet computed
+    value           uniform (0 0 0);  // ← placeholder only
+}
+```
+
+**Volumetric flow rate (m³/s):**
+```
+inlet
+{
+    type                flowRateInletVelocity;
+    volumetricFlowRate  <value>;  // ← the actual m³/s value — NEVER zero
+    value               uniform (0 0 0);
+}
+```
+
+Rules:
+- EXACTLY ONE of `massFlowRate` or `volumetricFlowRate` MUST be present.
+  Missing both causes an immediate fatal: *"Please supply either volumetricFlowRate or massFlowRate"*.
+- A value of `0` is equivalent to no flow → singular matrix → SIGFPE crash.
+- `rho` and `rhoInlet` are **optional** — only include them if they appear in the BC table from `validated_config`.
+  Do NOT invent or add them unless the user specified them.
+- For volumetric flow: never include `rho` or `rhoInlet`.
+- `extrapolateProfile yes;` only if the user specified it; omit by default (plug flow).
 
 ---
 

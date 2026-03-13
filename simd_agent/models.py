@@ -297,23 +297,63 @@ class VelocityBCV1(BaseModel):
     )
     magnitude: float | None = Field(default=None, description="Velocity magnitude (m/s)")
     direction: list[float] | None = Field(default=None, description="Flow direction [x, y, z]")
-    
+    # flowRateInletVelocity — Option-1 (mutually exclusive with volumetric_flow_rate)
+    mass_flow_rate: float | None = Field(
+        default=None, alias="massFlowRate",
+        description="Mass flow rate [kg/s] for flowRateInletVelocity"
+    )
+    # flowRateInletVelocity — Option-2
+    volumetric_flow_rate: float | None = Field(
+        default=None, alias="volumetricFlowRate",
+        description="Volumetric flow rate [m³/s] for flowRateInletVelocity"
+    )
+    # flowRateInletVelocity — optional: name of density field (default 'rho')
+    rho_field: str | None = Field(
+        default=None, alias="rho",
+        description="Name of density field used to convert mass→volumetric flow rate"
+    )
+    # flowRateInletVelocity — optional: density initialisation value when the density
+    # field is not yet available (e.g. iteration 0).  Required for compressible solvers.
+    rho_inlet: float | None = Field(
+        default=None, alias="rhoInlet",
+        description="Density initialisation value [kg/m³] for compressible flowRateInletVelocity"
+    )
+    # flowRateInletVelocity — optional: extrapolate velocity profile from interior cells
+    extrapolate_profile: bool | None = Field(
+        default=None, alias="extrapolateProfile",
+        description="Extrapolate velocity profile from interior (default false = plug flow)"
+    )
+
     class Config:
         populate_by_name = True
-    
+
+    def is_flow_rate_inlet(self) -> bool:
+        return self.type == "flowRateInletVelocity"
+
+    def get_flow_rate(self) -> tuple[str, float] | None:
+        """Return (key_name, value) for flow-rate inlets, or None."""
+        if self.mass_flow_rate is not None:
+            return ("massFlowRate", self.mass_flow_rate)
+        if self.volumetric_flow_rate is not None:
+            return ("volumetricFlowRate", self.volumetric_flow_rate)
+        if self.is_flow_rate_inlet() and isinstance(self.value, (int, float)):
+            return ("massFlowRate", float(self.value))
+        return None
+
     def get_velocity_vector(self) -> list[float] | None:
         """Get velocity as [Ux, Uy, Uz] vector."""
         if isinstance(self.value, list) and len(self.value) == 3:
             return self.value
         if self.magnitude is not None and self.direction:
-            # Normalize direction and scale by magnitude
             import math
             d = self.direction
             norm = math.sqrt(sum(x**2 for x in d))
             if norm > 0:
                 return [self.magnitude * x / norm for x in d]
+        # For flow-rate inlets the scalar value is the flow rate, NOT a velocity.
+        if self.is_flow_rate_inlet():
+            return None
         if isinstance(self.value, (int, float)):
-            # Assume x-direction
             return [float(self.value), 0.0, 0.0]
         return None
     
@@ -568,7 +608,7 @@ class ConfigValidationResult(BaseModel):
 
 class Constraints(BaseModel):
     """Constraints for the run."""
-    max_retries: int = Field(default=3, ge=1, le=10)
+    max_retries: int = Field(default=7, ge=1, le=10)
     solver_preference: str | None = None
     mesh_preference: str | None = None
     timeout_seconds: int = Field(default=300, ge=30, le=3600)
@@ -638,10 +678,14 @@ class EventTypes:
     RUN_FAILED = "run_failed"
     SIMULATION_NOT_CLEAR = "simulation_not_clear"
     
-    # Config validation (NEW)
+    # Config validation
     CONFIG_RECEIVED = "config_received"
     CONFIG_INCOMPLETE = "config_incomplete"
     CONFIG_NORMALIZED = "config_normalized"
+    # Emitted after lint + solver selection — carries the final split config the
+    # frontend should persist to the `simulation_config` Neon table so that the
+    # chat service can read cfd_physics / cfd_solver / cfd_fluid / cfd_turbulence.
+    SIMULATION_CONFIG_READY = "simulation_config_ready"
     
     # Linting
     LINT_STARTED = "lint_started"

@@ -1,83 +1,105 @@
 # Solver Pack: icoFoam  ·  OpenFOAM v2406
 
 **Type**: Transient · Incompressible · Laminar (Newtonian) · PISO  
-**Primary pressure field**: `p` (kinematic pressure, dimensions `[0 2 -2 0 0 0 0]`)  
+**Pressure field**: `p` (kinematic pressure), dimensions `[0 2 -2 0 0 0 0]`  
 **Energy equation**: ❌ No — do NOT generate `0/T`  
-**Turbulence**: ❌ NONE — do NOT generate `0/k`, `0/omega`, `0/epsilon`, `0/nut`, or `constant/turbulenceProperties`  
+**Turbulence**: ❌ NONE — do NOT generate turbulence fields or `constant/turbulenceProperties`  
 **Gravity**: ❌ No — do NOT generate `constant/g`
 
-## OpenFOAM tutorial notes (important)
-
-- icoFoam is used for laminar, isothermal, incompressible flow. 2D is achieved via a 1-cell-thick mesh and an `empty` `frontAndBack` patch. (Tutorial 2.1)
-- For icoFoam, the only physical property required is kinematic viscosity `nu` in `constant/transportProperties`.
-- For temporal stability/accuracy with icoFoam, choose `deltaT` so Courant number Co < 1.
-- icoFoam uses the PISO algorithm (`pisoControl` in solver source).
+---
 
 ## A) Required files (minimum working)
 
 | File | Notes |
 |------|-------|
-| `system/controlDict` | `application icoFoam;` · deltaT · endTime = physical time |
-| `system/fvSchemes` | Euler ddt; linear interpolation; no wallDist needed |
-| `system/fvSolution` | MUST include `PISO { }` block — NOT `SIMPLE` or `PIMPLE` |
+| `system/controlDict` | `application icoFoam;` · `deltaT` + `endTime` are physical time |
+| `system/fvSchemes` | Euler ddt; linear schemes; no wallDist |
+| `system/fvSolution` | MUST include `PISO { }` block (NOT SIMPLE/PIMPLE) |
 | `0/U` | Velocity — all patches |
-| `0/p` | Kinematic pressure `[0 2 -2 0 0 0 0]` — all patches |
+| `0/p` | Kinematic pressure — all patches |
 | `constant/transportProperties` | MUST include `nu` only |
 
 Do NOT generate:
 - `constant/turbulenceProperties`
 - `constant/g`
 - `0/T`
-- any turbulence fields (`k` / `omega` / `epsilon` / `nut`)
+- `0/k`, `0/omega`, `0/epsilon`, `0/nut`
+
+---
 
 ## B) Time control rules (transient)
 
-- `endTime` is PHYSICAL TIME (not iteration count).
-- `controlDict` MUST use:
-  ```
-  startFrom   startTime;
-  startTime   0;
-  stopAt      endTime;
-  endTime     <config.solver.endTime>;   // physical time
-  ```
-- `deltaT` MUST be chosen/provided from `config.solver.delta_t` and should satisfy Co < 1.
+- `endTime` is PHYSICAL TIME (seconds), not iteration count.
+- `deltaT` is a physical time step (seconds).
+
+`controlDict` MUST use:
+
+```
+application icoFoam;
+
+startFrom   startTime;
+startTime   0;
+stopAt      endTime;
+
+deltaT      <solver.delta_t>;
+endTime     <solver.endTime>;
+
+writeControl  timeStep;
+writeInterval <solver.write_interval>;
+
+runTimeModifiable true;
+
+// Optional stability guard (recommended)
+adjustTimeStep yes;
+maxCo 0.9;
+```
 
 Never use `startFrom latestTime` unless explicitly requested.
 
-## C) 2D handling (frontAndBack)
+---
 
-If the mesh has a patch with `patch_type == empty` (commonly `frontAndBack`), then:
-- In **every** `0/*` field file (here: `0/U` and `0/p`), that patch MUST be:
-  ```
-  { type empty; }
-  ```
-- The mesh must be 1 cell thick in the 3rd direction and the empty patches must be planar.
+## C) 2D handling (empty patches)
 
-If the mesh `patch_type` is NOT `empty`, you MUST NOT use `type empty;` for that patch.
+If the mesh contains any patch with `patch_type == empty` (commonly `frontAndBack`):
+- In **every** generated `0/*` file (here: `0/U` and `0/p`), that patch MUST be:
+```
+type empty;
+```
+- Never invent patch names; use exact mesh patch names from config.
+
+If the mesh patch type is NOT `empty`, you MUST NOT use `type empty;` for that patch.
+
+---
 
 ## D) Patch names are the source of truth
 
 - Use EXACT patch names from `config.mesh.patches[].name` (case-sensitive).
-- Never invent or rename patches (e.g. do NOT create `front_and_back`).
-- Every patch must appear in BOTH `0/U` and `0/p` (OpenFOAM crashes if missing entries).
+- Every patch must appear in BOTH `0/U` and `0/p`.
 
-## E) fvSolution template (PISO)
+---
+
+## E) fvSolution template (PISO) — robust
+
+Rules:
+- Pressure is symmetric elliptic → use `GAMG` (robust) or `PCG` (small cases).
+- `pRefCell/pRefValue` only when pressure system is all-Neumann (no fixedValue p anywhere).
 
 ```
 solvers
 {
     p
     {
-        solver          PCG;
-        preconditioner  DIC;
+        solver          GAMG;
+        smoother        GaussSeidel;
         tolerance       1e-6;
         relTol          0.05;
     }
     pFinal
     {
         $p;
-        relTol          0;
+        relTol 0;
     }
+
     U
     {
         solver          smoothSolver;
@@ -89,42 +111,52 @@ solvers
 
 PISO
 {
-    nCorrectors             2;
+    nCorrectors              2;
     nNonOrthogonalCorrectors 0;
-    pRefCell                0;
-    pRefValue               0;
+
+    // Include ONLY if needed (all-Neumann pressure):
+    // pRefCell  0;
+    // pRefValue 0;
 }
 ```
+
+---
 
 ## F) fvSchemes template (safe defaults)
 
 ```
 ddtSchemes      { default Euler; }
 gradSchemes     { default Gauss linear; }
+
 divSchemes
 {
     default     none;
     div(phi,U)  Gauss linear;
 }
+
 laplacianSchemes     { default Gauss linear corrected; }
 interpolationSchemes { default linear; }
 snGradSchemes        { default corrected; }
 ```
 
-## G) constant/transportProperties
+---
 
-Must define `nu` (kinematic viscosity) only. Example:
+## G) constant/transportProperties (correct syntax)
+
+Must define ONLY kinematic viscosity `nu`:
 
 ```
-nu  nu [0 2 -1 0 0 0 0]  <value>;
+transportModel  Newtonian;
+nu              [0 2 -1 0 0 0 0] <nu_value>;
 ```
+
+---
 
 ## Critical rules
 
 1. icoFoam is LAMINAR. Never add turbulence files.
-2. `transportProperties` needs only `nu` (no turbulence viscosity).
-3. Use Co < 1 (Courant number): `deltaT` should satisfy Co = U·deltaT/cellSize < 1.
-4. `PISO` block — NOT `SIMPLE` or `PIMPLE`.
-5. Do NOT generate `constant/turbulenceProperties`.
-6. For 2D cases: `frontAndBack` (or equivalent `empty` patch) must use `type empty;` in all field files, and the mesh must be 1 cell thick in the 3rd direction.
-7. All patch names must exactly match `config.mesh.patches[].name` — every patch must appear in both `0/U` and `0/p`.
+2. `constant/transportProperties` contains only `nu`.
+3. Use `PISO {}` (NOT SIMPLE or PIMPLE).
+4. `0/U` and `0/p` must include all mesh patches with exact names.
+5. For 2D meshes: any `empty` patch must be `{ type empty; }` in every `0/*` file.
+6. Time settings are physical (`deltaT`, `endTime`), not iteration counts.

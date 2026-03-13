@@ -1,139 +1,244 @@
 # Solver: interFoam  ·  OpenFOAM v2406
 
-**Type**: Transient · Incompressible · Two-phase VOF (Volume of Fluid)  
-**Pressure field**: `p_rgh` (pressure minus hydrostatic contribution, dimensions `[1 -1 -2 0 0 0 0]`)  
-**Energy equation**: ❌ No — do NOT generate `0/T`  
-**Gravity file**: ✅ ALWAYS generate `constant/g` (even if gravity = false → use `(0 0 0)`)  
-**Alpha field**: ✅ `0/alpha.<phase1Name>` — name MUST match config phases (e.g. `alpha.water`, `alpha.liquid`)
+**Type**: Transient · Incompressible · Two-phase VOF · MULES + interface compression  
+**Pressure field**: `p_rgh` (kinematic pressure minus hydrostatic head), dimensions `[0 2 -2 0 0 0 0]` → MUST generate `0/p_rgh`  
+**Energy equation**: ❌ No → do NOT generate `0/T`  
+**Gravity file**: ✅ REQUIRED → MUST generate `constant/g` (use `(0 0 0)` if gravity=false)
 
-## Phase naming (CRITICAL)
+---
 
-- Let `phase1Name` and `phase2Name` come from `config.phases` (preferred).
-- If not provided, default to `(water air)`.
-- Alpha file MUST be `0/alpha.<phase1Name>`.
-- Do NOT invent `alpha.phase1` unless `phase1Name == "phase1"`.
+## A) Required files (minimum working)
 
-## Required files
-
+### system/
 | File | Notes |
-|------|-------|
-| `system/controlDict` | `application interFoam;` · `startFrom startTime; startTime 0;` · `adjustTimeStep yes;` |
-| `system/fvSchemes` | VOF div schemes for alpha (vanLeer); `interpolationSchemes { default linear; }` only |
-| `system/fvSolution` | `PIMPLE { }` with alpha controls (`nAlphaCorr`, `nAlphaSubCycles`, `cAlpha`) inside |
-| `0/U` | Velocity — all patches |
-| `0/p_rgh` | Modified pressure `[1 -1 -2 0 0 0 0]` — all patches |
-| `0/alpha.<phase1Name>` | Volume fraction `[0 0 0 0 0 0 0]` — 0=phase2, 1=phase1 |
-| `constant/g` | Gravity vector — ALWAYS required |
-| `constant/transportProperties` | Two-phase: phases, nu, rho, sigma (surface tension) |
-| `constant/turbulenceProperties` | ONLY if turbulent; otherwise laminar |
-| `0/k`, `0/omega`, `0/nut` | ONLY if turbulence enabled (e.g. kOmegaSST) |
+|------|------|
+| `system/controlDict` | `application interFoam;` · transient time control |
+| `system/fvSchemes` | transient + VOF schemes (see template) |
+| `system/fvSolution` | PIMPLE block + alpha (MULES) controls |
 
-## constant/g template
+### constant/
+| File | Notes |
+|------|------|
+| `constant/g` | REQUIRED (even if zero) |
+| `constant/phaseProperties` | Preferred for v2406 multiphase configuration |
+| `constant/transportProperties` | Only generate if your runtime expects this instead of phaseProperties |
+| `constant/turbulenceProperties` | Always generate (`laminar` / `RAS` / `LES`) |
+
+### 0/
+| File | Notes |
+|------|------|
+| `0/U` | Velocity |
+| `0/p_rgh` | Kinematic `p_rgh` |
+| `0/alpha.<phase1Name>` | Volume fraction for phase1 |
+| `0/k`, `0/omega`, `0/nut` | Only if turbulence model needs them (e.g. kOmegaSST) |
+| `0/k`, `0/epsilon`, `0/nut` | Only if kEpsilon |
+
+---
+
+## B) Phase naming (CRITICAL)
+
+Let `phase1Name` and `phase2Name` come from config (`validated_config.physics.phases[]`).
+
+If not provided, default:
+- `phase1Name = water`
+- `phase2Name = air`
+
+Alpha file MUST be:
+- `0/alpha.<phase1Name>` (example: `0/alpha.water`)
+
+Never invent `alpha.phase1` unless the phase name is literally `phase1`.
+
+---
+
+## C) constant/g
 
 ```
-dimensions      [0 1 -2 0 0 0 0];
-value           (0 -9.81 0);    // or (0 0 0) if gravity=false
+dimensions [0 1 -2 0 0 0 0];
+value      (0 -9.81 0);  // or (0 0 0) if gravity=false
 ```
 
-## constant/transportProperties template (two-phase)
+---
+
+## D) constant/phaseProperties (preferred, v2406)
+
+Provide phases, surface tension, and per-phase properties as required by your project convention.
+Keep it simple and syntactically valid.
+
+Example minimal pattern (adapt names/values from config):
 
 ```
-phases (water air);   // use actual phase1Name phase2Name from config
+phases ( <phase1Name> <phase2Name> );
 
-water
+<phase1Name>
 {
     transportModel  Newtonian;
-    nu              1e-6;     // kinematic viscosity [m2/s]
-    rho             1000;     // density [kg/m3]
+    nu              [0 2 -1 0 0 0 0] <nu1>;
+    rho             [1 -3 0 0 0 0 0] <rho1>;
 }
 
-air
+<phase2Name>
 {
     transportModel  Newtonian;
-    nu              1.48e-5;  // air kinematic viscosity
-    rho             1;
+    nu              [0 2 -1 0 0 0 0] <nu2>;
+    rho             [1 -3 0 0 0 0 0] <rho2>;
 }
 
-sigma           0.07;  // surface tension [N/m]  — set to 0 if not applicable
+sigma           [1 0 -2 0 0 0 0] <sigma>;
 ```
 
-## controlDict time-step control (recommended)
+If your runtime uses `constant/transportProperties` for two-phase instead, generate that file instead (but do not generate both unless runtime expects both).
 
-interFoam is sensitive to the interface Courant number. Prefer automatic time-stepping:
+---
 
+## E) constant/turbulenceProperties (always generate)
+
+- laminar:
 ```
-adjustTimeStep  yes;
-maxCo           1;
-maxAlphaCo      0.5;   // often tighter than maxCo for stability
-maxDeltaT       <cap>; // problem-dependent
+simulationType laminar;
 ```
 
-Do NOT hardcode `maxCo 0.9` without also setting `maxAlphaCo`.
+- RAS:
+```
+simulationType RAS;
+RAS
+{
+    RASModel        <modelName>;
+    turbulence      on;
+    printCoeffs     on;
+}
+```
 
-## fvSolution template
+- LES:
+```
+simulationType LES;
+LES
+{
+    LESModel        <modelName>;
+    turbulence      on;
+    printCoeffs     on;
+}
+```
+
+Only generate `0/k`, `0/omega`/`0/epsilon`, `0/nut` when turbulence is enabled AND the chosen model requires them.
+
+---
+
+## F) controlDict time-step control (recommended)
+
+Use automatic timestep control for stability:
+
+- `adjustTimeStep yes;`
+- `maxCo <= 1;`
+- `maxAlphaCo <= 1;` (often 0.5–1.0)
+- `maxDeltaT <cap>;`
+
+Never use `startFrom latestTime`.
+
+---
+
+## G) fvSolution: PIMPLE + alpha (MULES) controls
+
+Rules:
+- Must include `PIMPLE {}`.
+- For interFoam, MULES alpha controls (`nAlphaCorr`, `nAlphaSubCycles`, `cAlpha`) go **inside** the `PIMPLE` block — NOT as linear solver entries.
+- Do not use isoAdvection controls here (those belong in interIsoFoam).
+
+Robust template:
 
 ```
 solvers
 {
-    "pcorr.*"   { solver PCG; preconditioner DIC; tolerance 1e-5; relTol 0; }
-    p_rgh       { solver PCG; preconditioner DIC; tolerance 1e-7; relTol 0.05; }
-    p_rghFinal  { $p_rgh; relTol 0; }
-    U           { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-6; relTol 0; }
-    k           { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-6; relTol 0; }
-    omega       { $k; }
+    p_rgh
+    {
+        solver          GAMG;
+        smoother        GaussSeidel;
+        tolerance       1e-7;
+        relTol          0.01;
+    }
+    p_rghFinal { $p_rgh; relTol 0; }
+
+    "(U|k|omega|epsilon)"
+    {
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        tolerance       1e-6;
+        relTol          0.1;
+    }
+    "(U|k|omega|epsilon)Final"
+    {
+        $U;
+        relTol 0;
+    }
 }
 
 PIMPLE
 {
-    momentumPredictor        yes;
-    nOuterCorrectors         1;
-    nCorrectors              2;
+    momentumPredictor   yes;
+    nOuterCorrectors    1;
+    nCorrectors         2;
     nNonOrthogonalCorrectors 0;
 
-    // alpha algorithm controls (NOT a linear-solver block)
-    nAlphaCorr      2;
+    // Alpha (MULES) controls
+    nAlphaCorr      1;
     nAlphaSubCycles 1;
     cAlpha          1;
+
+    // pRefCell/pRefValue only if all-Neumann pressure
+    // pRefCell  0;
+    // pRefValue 0;
 }
 ```
 
-> **Note**: `nAlphaCorr`, `nAlphaSubCycles`, and `cAlpha` belong **inside** the `PIMPLE` (or `PISO`) algorithm block — NOT as a linear solver entry under `solvers { }`.
+---
 
-## fvSchemes template (VOF-specific)
+## H) fvSchemes (VOF-specific, robust)
+
+Avoid `divSchemes default none` brittleness. Use a stable default and explicitly set alpha terms:
 
 ```
 ddtSchemes      { default Euler; }
 gradSchemes     { default Gauss linear; }
+
 divSchemes
 {
-    default                                     none;
-    div(rhoPhi,U)                               Gauss linearUpwind grad(U);
-    div(phi,alpha)                              Gauss vanLeer;    // bounded alpha transport
-    div(phirb,alpha)                            Gauss linear;     // smoother interface compression
-    div(((rho*nuEff)*dev2(T(grad(U)))))         Gauss linear;
-    // include turbulence terms only if turbulence enabled:
-    // div(phi,k)     Gauss linearUpwind grad(k);
-    // div(phi,omega) Gauss linearUpwind grad(omega);
+    default                             bounded Gauss upwind;
+
+    // momentum
+    div(phi,U)                          bounded Gauss linearUpwind grad(U);
+
+    // alpha advection + compression
+    div(phi,alpha)                      Gauss vanLeer;
+    div(phirb,alpha)                    Gauss linear;
+
+    // viscous term
+    div((nuEff*dev2(T(grad(U)))))       Gauss linear;
 }
-laplacianSchemes { default Gauss linear corrected; }
+
+laplacianSchemes     { default Gauss linear corrected; }
 interpolationSchemes { default linear; }
-snGradSchemes   { default corrected; }
-wallDist        { method meshWave; }
+snGradSchemes        { default corrected; }
+
+// include wallDist only when turbulence enabled / wall functions used
+wallDist             { method meshWave; }
 ```
 
-## 2D mesh — empty patches
+---
 
-If the mesh has a patch with `type empty` (e.g. `frontAndBack`), that patch MUST appear as `{ type empty; }` in `0/U`, `0/p_rgh`, and `0/alpha.<phase1Name>`. Use the exact mesh patch name — never invent one.
+## I) 2D mesh constraint patches
+
+If the mesh includes an `empty` patch (e.g. `frontAndBack`):
+- In `0/U`, `0/p_rgh`, `0/alpha.<phase1Name>` that patch MUST be `{ type empty; }`.
+- Never invent patch names; use exact mesh patch names from config.
+
+---
 
 ## Critical rules
 
-1. **`p_rgh` NOT `p`** — interFoam reads `p_rgh`. `0/p_rgh` is required; `0/p` is optional (post-processing only).
-2. `constant/g` is ALWAYS required, even when gravity=false (set value to `(0 0 0)`).
-3. Alpha field name MUST match the first phase name from config: `alpha.water`, `alpha.liquid`, etc.
-4. `div(phi,alpha)` MUST use `Gauss vanLeer` for bounded alpha transport.
-5. `div(phirb,alpha)` should use `Gauss linear` (smoother interface option — NOT vanLeer).
-6. `interpolationSchemes` block is `{ default linear; }` only — do NOT add `interface interfaceCompression`.
-7. Alpha algorithm controls (`nAlphaCorr`, `nAlphaSubCycles`, `cAlpha`) go inside the `PIMPLE`/`PISO` block, NOT as a linear-solver entry.
-8. Use `adjustTimeStep yes;` with both `maxCo` and `maxAlphaCo` in `controlDict`.
-9. `startFrom startTime; startTime 0;` — NEVER `latestTime`.
-10. For inlet alpha: `alpha.<phase1Name> = 1` if pure phase1; `0` if pure phase2.
+1. Generate `0/p_rgh` (dimensions `[0 2 -2 0 0 0 0]`), `0/U`, and `0/alpha.<phase1Name>`.
+2. Always generate `constant/g` (use `(0 0 0)` if gravity disabled).
+3. Do NOT generate `0/T` or any thermo files for interFoam.
+4. interFoam uses classic MULES + compression; do not use isoAdvection controls here (that's interIsoFoam).
+5. Use `div(phi,alpha) Gauss vanLeer;` for boundedness; `div(phirb,alpha) Gauss linear;` for compression.
+6. Prefer robust `divSchemes default bounded Gauss upwind;` to avoid missing div entries.
+7. Alpha controls (`nAlphaCorr`, `nAlphaSubCycles`, `cAlpha`) go inside `PIMPLE {}` — NOT under `solvers {}`.
+8. `startFrom startTime; startTime 0;` — NEVER `latestTime`.

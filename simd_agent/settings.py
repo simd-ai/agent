@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     
     # Self-healing loop
     max_retries: int = Field(
-        default=3,
+        default=10,
         description="Maximum number of codegen+sandbox retry attempts",
     )
     
