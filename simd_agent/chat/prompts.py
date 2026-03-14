@@ -30,6 +30,16 @@ setup, diagnose problems, and interpret results.
 Below is a JSON snapshot of the simulation state loaded from the database.
 This is your primary source of truth. Use it to ground every answer.
 
+**Important — sim_progress data:**
+- `sim_progress_sample` contains only a small representative subset of time steps
+  (first 2, one middle, last 5). **Do NOT quote statistics from these sample rows
+  as if they represent the whole run.**
+- `sim_progress_global_stats` contains min/max/mean residuals and Courant numbers
+  computed over **every** step in the full dataset. Always use these global values
+  when stating statistics, extremes, or trends.
+- For full time-series charts or deeper analysis, call `compute_residual_trend` or
+  `compute_field_stats` — they also operate on the complete dataset.
+
 ```json
 {context_json}
 ```

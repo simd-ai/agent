@@ -70,7 +70,7 @@ class ToolResultEvent(BaseModel):
 
 class ArtifactEvent(BaseModel):
     type: Literal["artifact"] = "artifact"
-    kind: Literal["markdown", "chart", "report"]
+    kind: Literal["markdown", "chart", "report", "report_request"]
     content: Any
 
 

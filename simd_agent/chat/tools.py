@@ -118,6 +118,61 @@ class SimulationSnapshot:
                     f: r.get("final") for f, r in last_res.items()
                 }
                 d["last_sim_time"] = prog[-1].get("sim_time")
+
+            # ── Global statistics over the FULL sim_progress ─────────────────
+            # The sample above is truncated for context size; these aggregates
+            # ensure the LLM always sees accurate min/max/mean computed over
+            # every step — not just the 8 shown in sim_progress_sample.
+            field_finals: dict[str, list[float]] = {}
+            field_initials: dict[str, list[float]] = {}
+            max_courant: float | None = None
+            for step in prog:
+                for f, r in step.get("residuals", {}).items():
+                    for bucket, key in ((field_finals, "final"), (field_initials, "initial")):
+                        raw = r.get(key)
+                        if raw is not None:
+                            try:
+                                v = float(raw)
+                                if v > 0:
+                                    bucket.setdefault(f, []).append(v)
+                            except (TypeError, ValueError):
+                                pass
+                co = step.get("courant", {})
+                if co:
+                    try:
+                        cv = float(co.get("max") or 0)
+                        if cv > 0 and (max_courant is None or cv > max_courant):
+                            max_courant = cv
+                    except (TypeError, ValueError):
+                        pass
+
+            residual_global: dict[str, Any] = {}
+            for f, vals in field_finals.items():
+                residual_global[f] = {
+                    "final_min":  min(vals),
+                    "final_max":  max(vals),
+                    "final_mean": sum(vals) / len(vals),
+                    "final_last": vals[-1],
+                    "steps_with_data": len(vals),
+                }
+            for f, vals in field_initials.items():
+                entry = residual_global.setdefault(f, {})
+                entry["initial_min"]  = min(vals)
+                entry["initial_max"]  = max(vals)
+                entry["initial_last"] = vals[-1]
+
+            global_stats: dict[str, Any] = {
+                "total_steps": total,
+                "sim_time_range": {
+                    "start": prog[0].get("sim_time"),
+                    "end":   prog[-1].get("sim_time"),
+                },
+            }
+            if residual_global:
+                global_stats["residuals"] = residual_global
+            if max_courant is not None:
+                global_stats["max_courant_number"] = max_courant
+            d["sim_progress_global_stats"] = global_stats
         if self.generated_files:
             d["generated_file_paths"] = list(self.generated_files.keys())
         if self.agent_run:
@@ -212,13 +267,21 @@ def compute_field_stats(args: dict[str, Any], snap: SimulationSnapshot) -> dict[
                     finals.append(_safe_float(r["final"], None) or 0)
 
             if finals:
-                results[comp] = {
-                    "final_residual_last": finals[-1],
-                    "final_residual_min":  min(finals),
-                    "final_residual_max":  max(finals),
-                    "final_residual_mean": sum(finals) / len(finals),
-                    "time_steps_sampled": len(finals),
-                }
+                stat: dict[str, Any] = {"time_steps_sampled": len(finals)}
+                errors: dict[str, str] = {}
+                for key, fn in (
+                    ("final_residual_last", lambda v: v[-1]),
+                    ("final_residual_min",  min),
+                    ("final_residual_max",  max),
+                    ("final_residual_mean", lambda v: sum(v) / len(v)),
+                ):
+                    try:
+                        stat[key] = fn(finals)
+                    except Exception as exc:
+                        errors[key] = str(exc)
+                if errors:
+                    stat["errors"] = errors
+                results[comp] = stat
 
         # Build time-series trend chart.
         # Use the SAME format as compute_residual_trend:
@@ -938,11 +1001,144 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
 
     report_md = "\n\n---\n\n".join(parts) if parts else "No simulation data available yet."
 
+    # ── Build report_request_payload ─────────────────────────────────────────
+    # Tells the frontend which 3-D field views to render + capture as images,
+    # which convergence charts to embed, and which key metrics to show.
+    # The frontend uses VTK.js renderWindow.captureNextImage() for each field.
+
+    # Colourmap defaults per field (frontend falls back to "turbo" if absent)
+    _COLORMAPS: dict[str, str] = {
+        "U": "turbo", "p": "turbo", "p_rgh": "turbo",
+        "T": "coolwarm", "h": "coolwarm",
+        "k": "viridis", "omega": "plasma", "epsilon": "plasma",
+        "nut": "plasma", "mut": "plasma", "alphat": "plasma",
+        "alpha": "blues",
+    }
+
+    vtk_fields: list[dict[str, Any]] = []
+    if isinstance(snap.vtk_result, dict):
+        vtk_fields = snap.vtk_result.get("fields", []) or []
+
+    # Determine which fields to show based on scope/focus
+    scope = "specific" if focus else "full"
+    field_screenshots: list[dict[str, Any]] = []
+    if vtk_fields:
+        # For a specific-field report, filter to the focused field if possible
+        display_fields = vtk_fields
+        if focus and scope == "specific":
+            focused = [f for f in vtk_fields if f.get("name", "").lower() in focus.lower()]
+            if focused:
+                display_fields = focused
+
+        for fdata in display_fields:
+            fname = fdata.get("name") or fdata.get("field") or ""
+            if not fname:
+                continue
+            colormap = _COLORMAPS.get(fname, "turbo")
+            field_range = (
+                [fdata["min"], fdata["max"]]
+                if fdata.get("min") is not None and fdata.get("max") is not None
+                else None
+            )
+            if transient:
+                # Show BOTH initial state (first timestep) and final state
+                field_screenshots.append({
+                    "field_name": fname,
+                    "label": f"{fname} — Initial State",
+                    "timestep": "first",
+                    "colormap": colormap,
+                    "range": field_range,
+                    "caption": f"{fname} at the start of the simulation (t = first timestep)",
+                })
+                field_screenshots.append({
+                    "field_name": fname,
+                    "label": f"{fname} — Final State",
+                    "timestep": None,   # null = latest frame
+                    "colormap": colormap,
+                    "range": field_range,
+                    "caption": f"{fname} at the end of the simulation",
+                })
+            else:
+                # Steady-state: only one state (the converged solution)
+                field_screenshots.append({
+                    "field_name": fname,
+                    "label": f"{fname} — Converged Solution",
+                    "timestep": None,
+                    "colormap": colormap,
+                    "range": field_range,
+                    "caption": f"Steady-state {fname} distribution",
+                })
+
+    # Convergence charts to embed
+    convergence_charts: list[dict[str, Any]] = []
+    if snap.sim_progress:
+        # Always include residuals
+        residual_fields = sorted({
+            f
+            for step in snap.sim_progress
+            for f in step.get("residuals", {}).keys()
+        })
+        chart_fields = residual_fields if not (focus and scope == "specific") else [
+            f for f in residual_fields if f.lower().startswith(focus[:2].lower())
+        ] or residual_fields
+        convergence_charts.append({
+            "type": "residuals",
+            "fields": chart_fields or None,
+            "label": "Residual Convergence",
+            "caption": None,
+        })
+        # Courant number for transient runs
+        if transient and any(s.get("courant") for s in snap.sim_progress):
+            convergence_charts.append({
+                "type": "courant",
+                "fields": None,
+                "label": "Courant Number",
+                "caption": None,
+            })
+        # Continuity error if present
+        if any(s.get("continuity") for s in snap.sim_progress):
+            convergence_charts.append({
+                "type": "continuity",
+                "fields": None,
+                "label": "Continuity Error",
+                "caption": None,
+            })
+
+    # Key scalar metrics for the report header
+    metrics: list[dict[str, Any]] = []
+    solver_name = snap.solver.get("solver") or snap.physics.get("solver")
+    if solver_name:
+        metrics.append({"label": "Solver", "value": solver_name, "unit": None})
+    if snap.sim_progress:
+        last_step = snap.sim_progress[-1]
+        if transient:
+            last_t = last_step.get("sim_time")
+            if last_t is not None:
+                metrics.append({"label": "Simulation Time", "value": str(last_t), "unit": "s"})
+        metrics.append({"label": "Iterations", "value": str(len(snap.sim_progress)), "unit": None})
+        courant = last_step.get("courant", {})
+        if courant.get("max") is not None:
+            metrics.append({"label": "Final Max Courant", "value": str(courant["max"]), "unit": None})
+        last_res = last_step.get("residuals", {})
+        for fname, r in last_res.items():
+            rv = r.get("final") if transient else r.get("initial")
+            if rv is not None:
+                metrics.append({"label": f"Final {fname} Residual", "value": f"{rv:.3e}", "unit": None})
+
+    report_request_payload: dict[str, Any] = {
+        "title": f"{'Full' if scope == 'full' else focus.title() if focus else 'Full'} Simulation Report",
+        "summary": "",   # LLM fills this in its text response; frontend renders from markdown
+        "field_screenshots": field_screenshots,
+        "convergence_charts": convergence_charts,
+        "metrics": metrics,
+        "scope": scope,
+    }
+
     return {
         "report_markdown": report_md,
         "sections_included": sections,
         "report_data": {
-            "solver": snap.solver.get("solver") or snap.physics.get("solver"),
+            "solver": solver_name,
             "status": snap.agent_run.get("status"),
             "re": snap.physics.get("Re") or snap.physics.get("reynoldsNumber"),
             "flow_type": snap.physics.get("flowType") or snap.physics.get("flowRegime"),
@@ -953,6 +1149,7 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
             "last_residuals": snap.sim_progress[-1].get("residuals") if snap.sim_progress else None,
             "total_iterations": len(snap.sim_progress),
         },
+        "report_request_payload": report_request_payload,
     }
 
 

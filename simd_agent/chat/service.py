@@ -246,6 +246,16 @@ class ChatService:
                     # Strip large keys — LLM only needs a short acknowledgement
                     keys_to_strip.extend(["report_markdown", "report_data"])
 
+                if "report_request_payload" in result_data:
+                    # Emit a "report_request" artifact so the frontend knows which
+                    # 3-D field screenshots to capture (via VTK.js captureNextImage)
+                    # and which charts + metrics to assemble into the full report.
+                    yield ArtifactEvent(
+                        kind="report_request",
+                        content=result_data["report_request_payload"],
+                    ).model_dump()
+                    keys_to_strip.append("report_request_payload")
+
                 llm_result = {k: v for k, v in result_data.items() if k not in keys_to_strip}
                 if "report_markdown" in result_data:
                     llm_result["report_generated"] = True
