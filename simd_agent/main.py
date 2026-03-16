@@ -37,6 +37,7 @@ from simd_agent.models import (
 )
 from simd_agent.settings import get_settings
 from simd_agent.store import EventStore
+from simd_agent.watch_bus import get_watch_bus
 
 # Configure logging
 logging.basicConfig(
@@ -577,13 +578,13 @@ async def websocket_run(websocket: WebSocket):
                 pass
     
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected for run {run_id}")
-        
-        # Update run status if possible
-        try:
-            await store.update_run_status(run_id, RunStatus.FAILED)
-        except Exception:
-            pass
+        # Client closed the tab / refreshed — the orchestrator keeps running
+        # server-side. Do NOT mark as failed; the client can reconnect via
+        # /ws/watch/{run_id} to receive missed events and live updates.
+        logger.info(
+            f"[WS] Client disconnected for run {run_id} — "
+            "orchestrator continues running; use /ws/watch/{run_id} to reconnect"
+        )
     
     except Exception as e:
         logger.exception(f"WebSocket error for run {run_id}: {e}")
@@ -654,16 +655,162 @@ async def get_run(run_id: str) -> dict[str, Any]:
 async def get_run_events(run_id: str) -> dict[str, Any]:
     """Get events for a run."""
     from uuid import UUID
-    
+
     try:
         run_uuid = UUID(run_id)
     except ValueError:
         return {"error": "Invalid run ID format"}
-    
+
     store = EventStore()
     events = await store.get_events(run_uuid)
-    
+
     return {"events": [e.model_dump() for e in events]}
+
+
+# ── Run status (quick REST check used by the frontend on page load) ───────────
+
+@app.get("/api/runs/{run_id}/status")
+async def get_run_status(run_id: str) -> dict[str, Any]:
+    """Quick status check — client calls this on page load to decide whether
+    to open a /ws/watch connection for a still-running simulation."""
+    try:
+        run_uuid = UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid run ID format")
+
+    store = EventStore()
+    run = await store.get_run(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    last_seq = await store.get_last_seq(run_uuid)
+
+    return {
+        "run_id": run_id,
+        "status": run.status.value,
+        "last_seq": last_seq,
+        "progress": None,
+    }
+
+
+# ── Reconnectable watch WebSocket ─────────────────────────────────────────────
+
+_TERMINAL_STATUSES = {
+    RunStatus.SUCCEEDED,
+    RunStatus.FAILED,
+    RunStatus.CANCELLED,
+    RunStatus.NOT_CLEAR,
+    RunStatus.CONFIG_INCOMPLETE,
+}
+
+_TERMINAL_EVENT_TYPES = frozenset(
+    {"final", "run_succeeded", "run_failed", "simulation_not_clear"}
+)
+
+
+@app.websocket("/ws/watch/{run_id}")
+async def websocket_watch(websocket: WebSocket, run_id: str, last_seq: int = 0):
+    """Reconnectable observer for a running or already-completed simulation.
+
+    Protocol
+    --------
+    1. Client connects (optionally with ?last_seq=N to skip already-seen events).
+    2. Server replays all events with seq > last_seq from the DB (marked with
+       "replayed": true so the client can skip animations).
+    3. If the run is already in a terminal state, server sends a run_complete
+       sentinel and closes.
+    4. Otherwise the server forwards live events as they arrive (via WatchBus).
+    5. When the run reaches a terminal event the server closes the connection.
+    """
+    await websocket.accept()
+
+    try:
+        run_uuid = UUID(run_id)
+    except ValueError:
+        await websocket.send_json({"type": "error", "message": "Invalid run ID"})
+        await websocket.close(code=1003)
+        return
+
+    store = EventStore()
+
+    # ── Phase 1: replay missed events ────────────────────────────────────────
+    try:
+        missed = await store.get_events_since(run_uuid, last_seq)
+        for ev in missed:
+            msg = {
+                "run_id": str(ev.run_id),
+                "seq": ev.seq,
+                "ts": ev.ts.isoformat() if ev.ts else None,
+                "level": ev.level.value,
+                "type": ev.type,
+                "message": ev.message,
+                "payload": ev.payload,
+                "replayed": True,
+            }
+            await websocket.send_json(msg)
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        logger.error(f"[WS/watch] Replay error for {run_id}: {e}")
+
+    # ── Phase 2: check terminal state before subscribing ─────────────────────
+    run = await store.get_run(run_uuid)
+    if run is None or run.status in _TERMINAL_STATUSES:
+        try:
+            status_val = run.status.value if run else "not_found"
+            await websocket.send_json({"type": "run_complete", "status": status_val})
+        except Exception:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        return
+
+    # ── Phase 3: subscribe to live events ────────────────────────────────────
+    bus = get_watch_bus()
+    queue = await bus.subscribe(run_id)
+
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_loop(websocket, get_settings().ws_heartbeat_interval)
+    )
+
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(queue.get(), timeout=60.0)
+                await websocket.send_json(message)
+
+                # Close after delivering the terminal event so the client has
+                # time to process it before the connection disappears.
+                if message.get("type") in _TERMINAL_EVENT_TYPES:
+                    await asyncio.sleep(0.3)
+                    break
+
+            except asyncio.TimeoutError:
+                # Periodic timeout — re-check if run finished while we waited
+                run = await store.get_run(run_uuid)
+                if run and run.status in _TERMINAL_STATUSES:
+                    await websocket.send_json(
+                        {"type": "run_complete", "status": run.status.value}
+                    )
+                    break
+
+    except WebSocketDisconnect:
+        logger.info(f"[WS/watch] Client disconnected for run {run_id}")
+    except Exception as e:
+        logger.exception(f"[WS/watch] Unhandled error for run {run_id}: {e}")
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        await bus.unsubscribe(run_id, queue)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ── Local VTK cache ──────────────────────────────────────────────────────────

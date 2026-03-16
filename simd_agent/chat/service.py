@@ -101,7 +101,6 @@ class ChatService:
         suggested_actions = self._suggest_actions(snap, request.message)
         yield DoneEvent(suggested_actions=suggested_actions).model_dump()
 
-        sim_id = request.simulation_id or request.context.simulation_id
         if sim_id:
             await persist_chat_message(sim_id, "assistant", full_response_text, suggested_actions)
 

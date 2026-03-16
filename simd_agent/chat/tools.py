@@ -382,9 +382,8 @@ def compute_field_stats(args: dict[str, Any], snap: SimulationSnapshot) -> dict[
 
 
 _TRANSIENT_SOLVERS = {
-    "pimplefoam", "pisofoam", "icofoam", "interfoam", "interisofoam",
-    "rhopimplefoam", "compressibleinterfoam", "compressibleinterisofoam",
-    "compressiblemultiphaseinterfoam",
+    "pimplefoam", "pisofoam",
+    "rhopimplefoam", "buoyantpimplefoam",
 }
 
 
@@ -418,7 +417,7 @@ def compute_residual_trend(args: dict[str, Any], snap: SimulationSnapshot) -> di
     X-axis is simulation time (sim_time) when available — matching the
     /api/runs/{id}/timesteps format — with iteration as fallback.
 
-    For transient solvers (pimpleFoam, icoFoam…): shows inner-loop FINAL
+    For transient solvers (pimpleFoam, rhoPimpleFoam…): shows inner-loop FINAL
     residuals. For steady-state (simpleFoam…): shows INITIAL residuals.
     No convergence assessment is performed.
     """
@@ -634,14 +633,22 @@ def _plain_solver_explanation(solver_name: str, transient: bool) -> str:
             "with the ability to model density changes in the fluid. It is used when the "
             "flow is both fast (compressible effects matter) and time-dependent."
         )
-    if "interfoam" in s or "interisofoam" in s:
+    if "buoyantsimplefoam" in s:
         return (
-            "The solver chosen is **interFoam**. "
-            "This solver is designed for two-phase flows — situations where two different "
-            "fluids (such as water and air) coexist and interact. It tracks the boundary "
-            "(called the interface) between the two fluids as it moves and deforms over time."
+            "The solver chosen is **buoyantSimpleFoam**. "
+            "This is a steady-state solver for buoyancy-driven (natural convection) flow. "
+            "It accounts for density variations due to temperature, enabling it to model "
+            "heat-driven circulation, HVAC systems, and gravity-influenced thermal flows."
         )
-    if "pisofoam" in s or "icofoam" in s:
+    if "buoyantpimplefoam" in s:
+        return (
+            "The solver chosen is **buoyantPimpleFoam**. "
+            "This is a time-stepping solver for buoyancy-driven flow. It captures how "
+            "temperature-driven density differences create and evolve flow over time — "
+            "suitable for transient natural convection, thermal stratification, and "
+            "time-varying heat source scenarios."
+        )
+    if "pisofoam" in s:
         return (
             f"The solver chosen is **{solver_name}**. "
             "This is a time-stepping solver for incompressible flow, advancing the "
@@ -801,6 +808,66 @@ def _plain_bc_explanation(patches: dict[str, Any]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Helpers for extracting validated_config fields
+# ---------------------------------------------------------------------------
+
+def _extract_validated_config(snap: SimulationSnapshot) -> dict[str, Any]:
+    """Return the validated_config dict from final_result (authoritative source).
+    Falls back to empty dict if not present."""
+    fr = snap.final_result
+    if isinstance(fr, dict):
+        vc = fr.get("validated_config")
+        if isinstance(vc, dict):
+            return vc
+    return {}
+
+
+def _vc_solver_name(vc: dict[str, Any], snap: SimulationSnapshot) -> str:
+    """Get solver name from validated_config → final_result.solver → frontend context."""
+    # validated_config.solver.type (SolverV1 serialized)
+    vc_solver = vc.get("solver") or {}
+    if isinstance(vc_solver, dict):
+        name = vc_solver.get("type") or vc_solver.get("solver_type")
+        if name:
+            return str(name)
+    # final_result.solver (top-level string set by orchestrator)
+    fr = snap.final_result
+    if isinstance(fr, dict):
+        name = fr.get("solver")
+        if name:
+            return str(name)
+    # fallback to frontend context
+    return snap.solver.get("solver") or snap.physics.get("solver") or "N/A"
+
+
+def _vc_turbulence_model(vc: dict[str, Any], snap: SimulationSnapshot) -> str:
+    """Get turbulence model from validated_config (authoritative)."""
+    # validated_config.turbulence.model
+    vc_turb = vc.get("turbulence") or {}
+    if isinstance(vc_turb, dict):
+        m = vc_turb.get("model")
+        if m:
+            return str(m)
+    # validated_config.physics.turbulence_model
+    vc_phys = vc.get("physics") or {}
+    if isinstance(vc_phys, dict):
+        m = vc_phys.get("turbulence_model")
+        if m:
+            return str(m)
+    # fallback to frontend context
+    return snap.turbulence.get("model") or "N/A"
+
+
+def _vc_flow_regime(vc: dict[str, Any], snap: SimulationSnapshot) -> str:
+    vc_phys = vc.get("physics") or {}
+    if isinstance(vc_phys, dict):
+        r = vc_phys.get("flow_regime") or vc_phys.get("flowRegime") or vc_phys.get("flowType")
+        if r:
+            return str(r)
+    return snap.physics.get("flowType") or snap.physics.get("flowRegime") or "N/A"
+
+
 def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str, Any]:
     """Produce a structured report (markdown + typed data block) for the simulation.
 
@@ -823,113 +890,181 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
         elif "result" in focus or "output" in focus:
             sections = ["summary", "results", "residuals"]
         else:
-            # Full report — include everything that has data
             sections = ["summary", "physics", "mesh", "boundary_conditions",
                         "residuals", "results"]
 
     parts: list[str] = []
-
-    solver_name = snap.solver.get("solver") or snap.physics.get("solver") or "N/A"
-    regime = snap.physics.get("flowType") or snap.physics.get("flowRegime") or "N/A"
-    re_num = snap.physics.get("Re") or snap.physics.get("reynoldsNumber") or "N/A"
-    turb_model = snap.turbulence.get("model") or "N/A"
     transient = _is_transient(snap)
+
+    # ── Authoritative config from validated_config ────────────────────────────
+    vc = _extract_validated_config(snap)
+    solver_name = _vc_solver_name(vc, snap)
+    turb_model  = _vc_turbulence_model(vc, snap)
+    regime      = _vc_flow_regime(vc, snap)
+    re_num      = snap.physics.get("Re") or snap.physics.get("reynoldsNumber") or "N/A"
 
     # ── Summary ──────────────────────────────────────────────────────────────
     if "summary" in sections:
-        status = snap.agent_run.get("status", "N/A")
-        started = snap.agent_run.get("started_at", "N/A")
+        fr = snap.final_result if isinstance(snap.final_result, dict) else {}
+        status   = fr.get("status") or snap.agent_run.get("status", "N/A")
+        duration = fr.get("duration_seconds")
+        iters    = fr.get("iterations")
+        retries  = fr.get("retries")
+        summary  = fr.get("summary") or ""
+        started  = snap.agent_run.get("started_at", "N/A")
         completed = snap.agent_run.get("completed_at", "N/A")
-        parts.append(
-            "## Simulation Summary\n\n"
-            "| Property | Value |\n|---|---|\n"
+
+        rows = (
             f"| Solver | `{solver_name}` |\n"
             f"| Flow regime | {regime} |\n"
             f"| Reynolds number | {re_num} |\n"
             f"| Turbulence model | {turb_model} |\n"
             f"| Run status | **{status}** |\n"
-            f"| Started | {started} |\n"
-            f"| Completed | {completed} |"
         )
+        if iters is not None:
+            rows += f"| Iterations | {iters} |\n"
+        if retries is not None:
+            rows += f"| Retries | {retries} |\n"
+        if duration is not None:
+            rows += f"| Duration | {duration} s |\n"
+        rows += f"| Started | {started} |\n| Completed | {completed} |"
+
+        summary_section = f"## Simulation Summary\n\n| Property | Value |\n|---|---|\n{rows}"
+        if summary:
+            summary_section += f"\n\n{summary}"
+        parts.append(summary_section)
 
     # ── Plain-language explanation ─────────────────────────────────────────────
     explanation_parts: list[str] = []
-
-    solver_expl = _plain_solver_explanation(solver_name, transient)
-    if solver_expl:
-        explanation_parts.append(solver_expl)
-
-    re_expl = _plain_reynolds_explanation(re_num, regime)
-    if re_expl:
-        explanation_parts.append(re_expl)
-
-    turb_expl = _plain_turbulence_explanation(turb_model)
-    if turb_expl:
-        explanation_parts.append(turb_expl)
-
+    for fn, arg in [
+        (_plain_solver_explanation, (solver_name, transient)),
+        (_plain_reynolds_explanation, (re_num, regime)),
+        (_plain_turbulence_explanation, (turb_model,)),
+    ]:
+        expl = fn(*arg)  # type: ignore[call-arg]
+        if expl:
+            explanation_parts.append(expl)
     if explanation_parts:
-        parts.append(
-            "## About This Simulation\n\n"
-            + "\n\n".join(explanation_parts)
-        )
+        parts.append("## About This Simulation\n\n" + "\n\n".join(explanation_parts))
 
-    # ── Physics ───────────────────────────────────────────────────────────────
-    if "physics" in sections and snap.physics:
-        rows = "\n".join(f"| {k} | {v} |" for k, v in snap.physics.items())
-        if snap.fluid:
-            fluid_rows = "\n".join(f"| {k} | {v} |" for k, v in snap.fluid.items())
-            rows += "\n" + fluid_rows
-        parts.append(f"## Physics & Fluid Properties\n\n| Setting | Value |\n|---|---|\n{rows}")
+    # ── Physics & Fluid ───────────────────────────────────────────────────────
+    if "physics" in sections:
+        vc_phys  = vc.get("physics") or {}
+        vc_fluid = vc.get("fluid") or {}
+        # Fall back to frontend context if validated_config is empty
+        if not vc_phys:
+            vc_phys = snap.physics
+        if not vc_fluid:
+            vc_fluid = snap.fluid
+
+        _PHYS_LABELS: dict[str, str] = {
+            "flow_regime": "Flow regime", "flowRegime": "Flow regime", "flowType": "Flow regime",
+            "time_scheme": "Time scheme", "compressibility": "Compressibility",
+            "heat_transfer": "Heat transfer", "gravity": "Gravity / buoyancy",
+            "multiphase": "Multiphase",
+        }
+        _FLUID_LABELS: dict[str, str] = {
+            "name": "Fluid", "density": "Density (kg/m³)",
+            "kinematic_viscosity": "Kinematic viscosity (m²/s)",
+            "dynamic_viscosity": "Dynamic viscosity (Pa·s)",
+            "specific_heat": "Specific heat Cp (J/kg·K)",
+            "thermal_conductivity": "Thermal conductivity (W/m·K)",
+            "temperature": "Reference temperature (K)",
+        }
+        phys_rows = "\n".join(
+            f"| {_PHYS_LABELS.get(k, k)} | {v} |"
+            for k, v in vc_phys.items()
+            if v not in (None, "", [], {}, False)
+        )
+        fluid_rows = "\n".join(
+            f"| {_FLUID_LABELS.get(k, k)} | {v} |"
+            for k, v in vc_fluid.items()
+            if v not in (None, "", [], {})
+        )
+        all_rows = "\n".join(filter(None, [phys_rows, fluid_rows]))
+        if all_rows:
+            parts.append(f"## Physics & Fluid Properties\n\n| Setting | Value |\n|---|---|\n{all_rows}")
 
     # ── Mesh ──────────────────────────────────────────────────────────────────
-    if "mesh" in sections and snap.mesh_info:
-        mi = snap.mesh_info
-        has_errors = mi.get("hasErrors", False)
-        quality_note = "Issues detected — see messages below" if has_errors else "No issues detected"
-        mesh_expl = (
-            "\n\nThe mesh is the grid that divides the simulation domain into small cells. "
-            "The solver computes the flow equations separately in each cell, then assembles "
-            "the full picture. A finer mesh (more cells) generally gives more accurate "
-            "results but requires more computation time. "
-            "Aspect ratio measures how stretched a cell is — very elongated cells can "
-            "reduce accuracy. Skewness measures how distorted a cell is from an ideal shape."
-        )
-        parts.append(
-            "## Mesh Quality\n\n"
-            f"- **Cells:** {mi.get('cells', 'N/A')}\n"
-            f"- **Faces:** {mi.get('faces', 'N/A')}\n"
-            f"- **Points:** {mi.get('points', 'N/A')}\n"
-            f"- **Max aspect ratio:** {mi.get('maxAspectRatio', 'N/A')}\n"
-            f"- **Max skewness:** {mi.get('maxSkewness', 'N/A')}\n"
-            f"- **Quality:** {quality_note}"
-            + mesh_expl
-        )
-        if mi.get("messages"):
-            msgs = "\n".join(f"  - {m}" for m in mi["messages"])
-            parts[-1] += f"\n\n**checkMesh messages:**\n{msgs}"
+    if "mesh" in sections:
+        # Try validated_config.mesh first, fall back to snap.mesh_info
+        vc_mesh = vc.get("mesh") or {}
+        mi = vc_mesh if vc_mesh else snap.mesh_info
+        if mi:
+            has_errors = mi.get("hasErrors", False) or mi.get("has_errors", False)
+            quality_note = "Issues detected — see messages below" if has_errors else "No issues detected"
+            cells = mi.get("cells") or mi.get("numCells", "N/A")
+            faces = mi.get("faces") or mi.get("numFaces", "N/A")
+            points = mi.get("points") or mi.get("numPoints", "N/A")
+            parts.append(
+                "## Mesh Quality\n\n"
+                f"- **Cells:** {cells}\n"
+                f"- **Faces:** {faces}\n"
+                f"- **Points:** {points}\n"
+                f"- **Max aspect ratio:** {mi.get('max_aspect_ratio') or mi.get('maxAspectRatio', 'N/A')}\n"
+                f"- **Max skewness:** {mi.get('max_skewness') or mi.get('maxSkewness', 'N/A')}\n"
+                f"- **Quality:** {quality_note}\n\n"
+                "The mesh divides the domain into cells where the solver computes flow equations. "
+                "A finer mesh (more cells) gives more accurate results at higher computational cost. "
+                "Low aspect ratio and skewness indicate a well-formed mesh."
+            )
+            msgs = mi.get("messages")
+            if msgs:
+                parts[-1] += "\n\n**checkMesh messages:**\n" + "\n".join(f"  - {m}" for m in msgs)
 
     # ── Boundary Conditions ───────────────────────────────────────────────────
-    if "boundary_conditions" in sections and snap.patches:
+    if "boundary_conditions" in sections:
+        # Use validated_config.boundary_conditions (authoritative) then snap.patches
+        vc_bcs = vc.get("boundary_conditions") or {}
+        patches = vc_bcs if vc_bcs else snap.patches
+
         bc_lines = []
-        for pname, pdata in snap.patches.items():
-            if isinstance(pdata, dict):
-                u_type = (pdata.get("U") or {}).get("type", "—")
-                p_type = (pdata.get("p") or {}).get("type", "—")
-                bc_lines.append(
-                    f"| **{pname}** | U: `{u_type}` | p: `{p_type}` |"
-                )
+        for pname, pdata in patches.items():
+            if not isinstance(pdata, dict):
+                continue
+            # validated_config BCs have nested velocity/pressure sub-dicts
+            vel = pdata.get("velocity") or pdata.get("U") or {}
+            prs = pdata.get("pressure") or pdata.get("p") or {}
+            tmp = pdata.get("temperature") or pdata.get("T") or {}
+            patch_type = pdata.get("patch_type") or pdata.get("patchType") or "—"
+
+            u_type = (vel.get("type") if isinstance(vel, dict) else None) or "—"
+            p_type = (prs.get("type") if isinstance(prs, dict) else None) or "—"
+            t_val  = tmp.get("value") if isinstance(tmp, dict) else None
+            t_str  = f"{t_val} K" if t_val is not None else "—"
+
+            bc_lines.append(f"| **{pname}** | {patch_type} | `{u_type}` | `{p_type}` | {t_str} |")
+
         if bc_lines:
-            bc_expl = _plain_bc_explanation(snap.patches)
             bc_section = (
                 "## Boundary Conditions\n\n"
-                "| Patch | Velocity (U) | Pressure (p) |\n|---|---|---|\n"
+                "| Patch | Type | Velocity (U) | Pressure (p) | Temperature |\n|---|---|---|---|---|\n"
                 + "\n".join(bc_lines)
             )
+            bc_expl = _plain_bc_explanation(patches)
             if bc_expl:
                 bc_section += f"\n\n{bc_expl}"
             parts.append(bc_section)
 
-    # ── Residuals ─────────────────────────────────────────────────────────────
+    # ── Solver Settings ───────────────────────────────────────────────────────
+    if "physics" in sections:
+        vc_solver_cfg = vc.get("solver") or {}
+        if isinstance(vc_solver_cfg, dict):
+            _SOLVER_LABELS: dict[str, str] = {
+                "type": "Solver", "max_iterations": "Max iterations",
+                "end_time": "End time", "delta_t": "Time step (ΔT)",
+                "write_interval": "Write interval",
+                "convergence_criteria": "Convergence criteria",
+            }
+            solver_rows = "\n".join(
+                f"| {_SOLVER_LABELS.get(k, k)} | {v} |"
+                for k, v in vc_solver_cfg.items()
+                if v is not None and k not in ("type",)  # type already in summary
+            )
+            if solver_rows:
+                parts.append(f"## Solver Settings\n\n| Parameter | Value |\n|---|---|\n{solver_rows}")
+
+    # ── Residuals table ───────────────────────────────────────────────────────
     if "residuals" in sections and snap.sim_progress:
         last = snap.sim_progress[-1]
         residuals = last.get("residuals", {})
@@ -945,59 +1080,51 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
                 else:
                     key_residual = r.get("initial", "N/A")
                     key_label = str(key_residual)
-                rows_list.append(
-                    f"| {f} | {r.get('initial', 'N/A')} | {key_label} |"
-                )
-            rows = "\n".join(rows_list)
+                rows_list.append(f"| {f} | {r.get('initial', 'N/A')} | {key_label} |")
 
             if transient and last_sim_time is not None:
-                residual_heading = (
-                    f"## Solver Residuals — Final Time Step (t = {last_sim_time:.4g} s) "
-                    f"— {total_iters} steps total\n\n"
-                    "> **Transient simulation**: the inner-loop final residual (shown in bold) "
-                    "reflects how accurately the solver resolved each time step. "
-                    "The initial residual naturally varies with the physics and is shown for reference.\n\n"
+                heading = (
+                    f"## Residuals — Final Time Step (t = {last_sim_time:.4g} s, "
+                    f"{total_iters} steps total)\n\n"
+                    "> Inner-loop final residual (bold) shows per-step convergence quality.\n\n"
                 )
             else:
-                residual_heading = (
-                    f"## Solver Residuals — Final Iteration ({last.get('iteration', total_iters)}"
-                    f" / {total_iters})\n\n"
+                heading = (
+                    f"## Residuals — Final Iteration "
+                    f"({last.get('iteration', total_iters)} / {total_iters})\n\n"
                 )
 
-            residual_expl = (
-                "\n\nResiduals are a measure of how well the solver has satisfied the "
-                "governing equations in each cell of the mesh. Think of them as the "
-                "remaining 'error' in the solution at each step — smaller residuals mean "
-                "the equations are being satisfied more precisely. "
-                "They are reported on a logarithmic scale, so a value of 1e-6 is far "
-                "smaller (better) than 1e-3."
-            )
-
             parts.append(
-                residual_heading
-                + "| Field | Initial | Final (key metric) |\n|---|---|---|\n"
-                + rows
-                + residual_expl
+                heading
+                + "| Field | Initial | Final |\n|---|---|---|\n"
+                + "\n".join(rows_list)
+                + "\n\nSmaller residuals (e.g. 1e-6) indicate the solver has more fully converged. "
+                "Values are on a logarithmic scale."
             )
 
         courant = last.get("courant", {})
-        if courant:
+        if courant and not transient:
             parts.append(
                 f"**Courant number** — mean: {courant.get('mean', 'N/A')}, "
-                f"max: {courant.get('max', 'N/A')}\n\n"
-                "The Courant number (also called the CFL number) relates the fluid speed "
-                "to the time step size and cell size. Keeping it below 1 ensures the "
-                "simulation remains numerically stable in time-stepping solvers."
+                f"max: {courant.get('max', 'N/A')}"
             )
 
-    # ── Final Results ──────────────────────────────────────────────────────────
+    # ── Final Results summary (clean — no raw dumps) ──────────────────────────
     if "results" in sections and snap.final_result:
-        fr = snap.final_result
-        if isinstance(fr, dict):
-            rows = "\n".join(f"| {k} | {v} |" for k, v in fr.items())
-            parts.append(f"## Final Results\n\n| Field | Value |\n|---|---|\n{rows}")
-        else:
-            parts.append(f"## Final Results\n\n```json\n{json.dumps(fr, indent=2, default=str)}\n```")
+        fr = snap.final_result if isinstance(snap.final_result, dict) else {}
+        _SHOW_KEYS = ("status", "solver", "case_type", "iterations", "retries",
+                      "duration_seconds", "summary")
+        result_rows = [
+            f"| {k.replace('_', ' ').title()} | {fr[k]} |"
+            for k in _SHOW_KEYS
+            if fr.get(k) not in (None, "", [])
+        ]
+        if result_rows:
+            parts.append(
+                "## Results Summary\n\n"
+                "| Field | Value |\n|---|---|\n"
+                + "\n".join(result_rows)
+            )
 
     report_md = "\n\n---\n\n".join(parts) if parts else "No simulation data available yet."
 
@@ -1030,43 +1157,60 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
             if focused:
                 display_fields = focused
 
+        _FIELD_UNITS: dict[str, str] = {
+            "U": "m/s", "p": "Pa", "p_rgh": "Pa", "T": "K",
+            "k": "m²/s²", "omega": "1/s", "epsilon": "m²/s³",
+            "nut": "m²/s", "alphat": "kg/m·s",
+        }
+
         for fdata in display_fields:
             fname = fdata.get("name") or fdata.get("field") or ""
             if not fname:
                 continue
             colormap = _COLORMAPS.get(fname, "turbo")
-            field_range = (
-                [fdata["min"], fdata["max"]]
-                if fdata.get("min") is not None and fdata.get("max") is not None
-                else None
-            )
+
+            # Handle both field formats:
+            #   Frontend (SimVtkResult.fields): {"name":"p", "range":[0,1.5], "num_components":1}
+            #   Server/DB format:               {"name":"p", "min":0, "max":1.5}
+            raw_range = fdata.get("range")
+            if isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:
+                field_range = [float(raw_range[0]), float(raw_range[1])]
+            elif fdata.get("min") is not None and fdata.get("max") is not None:
+                field_range = [float(fdata["min"]), float(fdata["max"])]
+            else:
+                field_range = None
+
+            unit = _FIELD_UNITS.get(fname, "")
+            unit_str = f" ({unit})" if unit else ""
+
             if transient:
-                # Show BOTH initial state (first timestep) and final state
+                last_step = snap.sim_progress[-1] if snap.sim_progress else {}
+                t_final = last_step.get("sim_time", "")
+                t_label = f" (t = {t_final} s)" if t_final != "" else ""
                 field_screenshots.append({
                     "field_name": fname,
-                    "label": f"{fname} — Initial State",
+                    "label": f"{fname}{unit_str} — Initial State",
                     "timestep": "first",
                     "colormap": colormap,
                     "range": field_range,
-                    "caption": f"{fname} at the start of the simulation (t = first timestep)",
+                    "caption": f"{fname} at the start of the simulation (first timestep)",
                 })
                 field_screenshots.append({
                     "field_name": fname,
-                    "label": f"{fname} — Final State",
+                    "label": f"{fname}{unit_str} — Final State{t_label}",
                     "timestep": None,   # null = latest frame
                     "colormap": colormap,
                     "range": field_range,
-                    "caption": f"{fname} at the end of the simulation",
+                    "caption": f"{fname} at the end of the simulation{t_label}",
                 })
             else:
-                # Steady-state: only one state (the converged solution)
                 field_screenshots.append({
                     "field_name": fname,
-                    "label": f"{fname} — Converged Solution",
+                    "label": f"{fname}{unit_str} — Converged Solution",
                     "timestep": None,
                     "colormap": colormap,
                     "range": field_range,
-                    "caption": f"Steady-state {fname} distribution",
+                    "caption": f"Steady-state {fname}{unit_str} distribution",
                 })
 
     # Convergence charts to embed
@@ -1106,9 +1250,8 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
 
     # Key scalar metrics for the report header
     metrics: list[dict[str, Any]] = []
-    solver_name = snap.solver.get("solver") or snap.physics.get("solver")
-    if solver_name:
-        metrics.append({"label": "Solver", "value": solver_name, "unit": None})
+    metrics.append({"label": "Solver", "value": solver_name, "unit": None})
+    metrics.append({"label": "Turbulence model", "value": turb_model, "unit": None})
     if snap.sim_progress:
         last_step = snap.sim_progress[-1]
         if transient:
@@ -1134,18 +1277,17 @@ def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str,
         "scope": scope,
     }
 
+    fr = snap.final_result if isinstance(snap.final_result, dict) else {}
     return {
         "report_markdown": report_md,
         "sections_included": sections,
         "report_data": {
             "solver": solver_name,
-            "status": snap.agent_run.get("status"),
-            "re": snap.physics.get("Re") or snap.physics.get("reynoldsNumber"),
-            "flow_type": snap.physics.get("flowType") or snap.physics.get("flowRegime"),
-            "turbulence_model": snap.turbulence.get("model"),
-            "mesh": snap.mesh_info,
-            "final_result": snap.final_result,
-            "vtk_result": snap.vtk_result,
+            "turbulence_model": turb_model,
+            "flow_regime": regime,
+            "status": fr.get("status") or snap.agent_run.get("status"),
+            "iterations": fr.get("iterations"),
+            "duration_seconds": fr.get("duration_seconds"),
             "last_residuals": snap.sim_progress[-1].get("residuals") if snap.sim_progress else None,
             "total_iterations": len(snap.sim_progress),
         },

@@ -263,6 +263,18 @@ class PrecheckService:
             "",
             "When time_scheme='transient': set end_time = extracted seconds (e.g. '2s' → 2.0).",
             "If the user does not specify a duration, leave end_time null (system defaults to 5s).",
+            "Note: end times above 10s are automatically capped to 10s by the system.",
+            "For steady-state simulations the system caps iterations to 1000.",
+            "",
+            "=== SOLVER SELECTION — SINGLE-PHASE vs TWO-PHASE ===",
+            "pimpleFoam is a SINGLE-PHASE solver. It assumes the entire domain is already",
+            "filled with one fluid from t=0 and simulates transient velocity development.",
+            "It cannot represent a moving fluid-front or filling process.",
+            "",
+            "For filling / moving-interface cases (fluid entering an empty or partially empty",
+            "domain, fill front, air displacement, slug front) set time_scheme='transient'.",
+            "Multiphase (VOF/filling) solvers are not currently supported.",
+            "Use transient single-phase flow with appropriate BCs instead.",
             "",
             "=== CRITICAL PLANNING RULES ===",
             "- Plan EACH patch independently.",
@@ -823,33 +835,48 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
         _multiphase = any(kw in prompt_lower for kw in
                           ("two-phase", "two phase", "multiphase", "interface", "vof",
                            "free surface", "water-air", "oil-water", "liquid-gas"))
-        if phase_change_detected:
-            # Phase-change cases: two-phase (liquid + vapour) → compressibleInterFoam
-            openfoam_solver = "compressibleInterFoam"
-        elif _multiphase:
-            if is_compressible or has_heat:
-                openfoam_solver = "compressibleInterFoam"
-            else:
-                openfoam_solver = "interFoam"
-        elif is_compressible or has_heat:
+
+        # Filling / moving fluid-front keywords: pimpleFoam assumes a domain already full
+        # of one fluid — it cannot model a fill front or air displacement.
+        _FILLING_KEYWORDS = (
+            "fill", "filling", "empty pipe", "empty domain", "initially empty",
+            "fluid entering", "fluid front", "fill front", "slug front",
+            "flood", "priming", "invasion", "invading",
+        )
+        _filling = any(kw in prompt_lower for kw in _FILLING_KEYWORDS)
+
+        if is_compressible or has_heat:
             openfoam_solver = "rhoPimpleFoam" if is_transient else "rhoSimpleFoam"
         elif not is_transient:
             openfoam_solver = "simpleFoam"
-        elif flow_regime == "laminar":
-            openfoam_solver = "icoFoam"
         else:
             openfoam_solver = "pimpleFoam"
 
         # Use LLM-provided end_time when transient; default to 5s if not specified
+        # Cap transient simulations to 10s and steady-state to 1000 iterations.
+        _MAX_TRANSIENT_END_TIME = 10.0
+        _MAX_STEADY_ITERATIONS = 1000
+
         _end_time: float | None = boundary_plan.get("end_time") if is_transient else None
+        _max_iterations: int | None = None
+        _end_time_capped_warning: str | None = None
+
         if is_transient:
             _end_time = float(_end_time) if _end_time else 5.0
+            if _end_time > _MAX_TRANSIENT_END_TIME:
+                _end_time_capped_warning = (
+                    f"Requested simulation duration ({_end_time:.4g} s) exceeds the "
+                    f"{_MAX_TRANSIENT_END_TIME:.4g} s cap. End time set to "
+                    f"{_MAX_TRANSIENT_END_TIME:.4g} s."
+                )
+                _end_time = _MAX_TRANSIENT_END_TIME
             _delta_t = max(1e-4, _end_time / 1000.0)
             _write_interval = max(_delta_t, _end_time / 100.0)
         else:
             _end_time = None
             _delta_t = None
             _write_interval = None
+            _max_iterations = _MAX_STEADY_ITERATIONS
 
         suggested_config = SuggestedConfig(
             case_type=self._detect_case_type(prompt_lower),
@@ -868,6 +895,7 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
                 end_time=_end_time,
                 delta_t=_delta_t,
                 write_interval=_write_interval,
+                max_iterations=_max_iterations,
             ),
             fluid=fluid,
             turbulence=TurbulenceSettings(
@@ -886,6 +914,17 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
         for spec in patch_specs.values():
             all_assumptions.extend(spec.get("assumptions") or [])
             all_warnings.extend(spec.get("warnings") or [])
+
+        if _filling and not _multiphase and not phase_change_detected:
+            all_warnings.append(
+                f"Filling / moving fluid-front detected. pimpleFoam assumes the domain is "
+                f"already full of one fluid and cannot model a fill front or air displacement. "
+                f"Using '{openfoam_solver}' (VOF two-phase solver) which tracks the interface "
+                "between the incoming fluid and the air it displaces."
+            )
+
+        if _end_time_capped_warning:
+            all_warnings.append(_end_time_capped_warning)
 
         if phase_change_detected:
             all_warnings.append(

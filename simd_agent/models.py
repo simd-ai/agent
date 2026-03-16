@@ -752,6 +752,7 @@ class EventTypes:
     # Self-healing
     ERROR_SUMMARY = "error_summary"
     RETRYING = "retrying"
+    SIM_PROGRESS_RESET = "sim_progress_reset"  # emitted before retry; tells frontend to clear residuals
     
     # Final — always carries op ("CFD_LINT" | "CFD_CODEGEN_RUN") so the frontend
     # can route the result to the correct section (validation vs simulation).

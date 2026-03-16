@@ -12,6 +12,7 @@ from fastapi import WebSocket
 
 from simd_agent.models import AgentEvent, EventLevel, EventTypes
 from simd_agent.store import EventStore
+from simd_agent.watch_bus import get_watch_bus
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,13 @@ class EventBus:
                 logger.debug(f"[EVENT #{seq}] Persisted to database")
             except Exception as e:
                 logger.error(f"[EVENT #{seq}] Failed to persist event: {e}")
-        
+
+        # Broadcast to any /ws/watch subscribers for this run
+        try:
+            get_watch_bus().publish_nowait(str(self.run_id), event.to_ws_message())
+        except Exception as e:
+            logger.debug(f"[EVENT #{seq}] WatchBus publish error (non-fatal): {e}")
+
         # Send via WebSocket (skip if already closed)
         if not self._ws_closed:
             try:
@@ -692,6 +699,20 @@ class EventBus:
             },
         )
     
+    async def emit_sim_progress_reset(self, attempt: int) -> AgentEvent:
+        """Emit sim_progress_reset event.
+
+        Signals the frontend to discard all accumulated sim_progress data
+        (both in-memory and in the DB) before a new simulation attempt starts.
+        Sent right before emit_codegen_started on every retry so the new run's
+        residuals do not mix with data from the failed attempt.
+        """
+        return await self.emit_info(
+            EventTypes.SIM_PROGRESS_RESET,
+            f"Clearing simulation progress for retry (attempt {attempt})",
+            {"attempt": attempt},
+        )
+
     async def emit_sim_failed(
         self,
         sim_run_id: str,

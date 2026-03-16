@@ -159,15 +159,15 @@ class ErrorSummarizer:
     ) -> ErrorSummary | None:
         """Use Gemini to diagnose the OpenFOAM error with full case context."""
         try:
-            import google.generativeai as genai
+            from google import genai as google_genai
+            from google.genai import types as genai_types
             settings = get_settings()
             api_key = getattr(settings, "gemini_api_key", None)
             model_name = getattr(settings, "gemini_model", "gemini-2.0-flash-001")
             if not api_key:
                 return None
 
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
+            client = google_genai.Client(api_key=api_key)
 
             # Build the diagnosis prompt
             file_listing = ""
@@ -203,7 +203,11 @@ class ErrorSummarizer:
                 "CONFIDENCE: <0.0-1.0>"
             )
 
-            resp = await asyncio.to_thread(model.generate_content, prompt)
+            resp = await client.aio.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(temperature=0.2),
+            )
             text = resp.text or ""
             logger.info(f"[DIAGNOSE] LLM response:\n{text[:500]}")
 

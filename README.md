@@ -56,11 +56,10 @@ LOG_LEVEL=INFO
 ### Running the Service
 
 ```bash
-# Development
-uvicorn simd_agent.main:app --reload --host 0.0.0.0 --port 8000
 
-# Production
-uvicorn simd_agent.main:app --host 0.0.0.0 --port 8000 --workers 10
+uvicorn simd_agent.main:app --host 0.0.0.0 --port 8000 --workers 4
+
+sudo journalctl -u simd-agent -n 50 --no-pager
 ```
 
 ### Running Tests

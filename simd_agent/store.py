@@ -221,10 +221,10 @@ class EventStore:
     
     async def get_events(self, run_id: UUID) -> list[EventRow]:
         """Get all events for a run.
-        
+
         Args:
             run_id: The run ID
-            
+
         Returns:
             List of events ordered by sequence
         """
@@ -234,7 +234,7 @@ class EventStore:
                 {"run_id": run_id},
             )
             rows = result.mappings().all()
-            
+
             return [
                 EventRow(
                     id=row["id"],
@@ -248,3 +248,48 @@ class EventStore:
                 )
                 for row in rows
             ]
+
+    async def get_events_since(self, run_id: UUID, last_seq: int) -> list[EventRow]:
+        """Get events for a run with seq > last_seq (for reconnect replay).
+
+        Args:
+            run_id: The run ID
+            last_seq: Return only events with seq strictly greater than this value
+
+        Returns:
+            List of events ordered by sequence
+        """
+        async with get_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT * FROM events WHERE run_id = :run_id AND seq > :seq ORDER BY seq"
+                ),
+                {"run_id": run_id, "seq": last_seq},
+            )
+            rows = result.mappings().all()
+
+            return [
+                EventRow(
+                    id=row["id"],
+                    run_id=row["run_id"],
+                    seq=row["seq"],
+                    ts=row["ts"],
+                    level=EventLevel(row["level"]),
+                    type=row["type"],
+                    message=row["message"],
+                    payload=row["payload"] or {},
+                )
+                for row in rows
+            ]
+
+    async def get_last_seq(self, run_id: UUID) -> int:
+        """Return the highest event seq for a run (0 if no events yet)."""
+        async with get_session() as session:
+            result = await session.execute(
+                text(
+                    "SELECT COALESCE(MAX(seq), 0) AS last_seq FROM events WHERE run_id = :run_id"
+                ),
+                {"run_id": run_id},
+            )
+            row = result.mappings().first()
+            return int(row["last_seq"]) if row else 0

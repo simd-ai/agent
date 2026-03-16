@@ -358,12 +358,6 @@ class CodeVerifier:
                         message=f"{solver} requires a PIMPLE block in fvSolution.",
                         fix_suggestion="Add 'PIMPLE { ... }' to system/fvSolution.",
                     ))
-                elif solver == "icoFoam" and "PISO" not in fv_sol:
-                    issues.append(VerificationIssue(
-                        severity="warning", category="missing_algorithm_block",
-                        message="icoFoam requires a PISO block in fvSolution.",
-                        fix_suggestion="Add 'PISO { ... }' to system/fvSolution.",
-                    ))
                 elif solver in P_RGH_SOLVERS and "PIMPLE" not in fv_sol:
                     issues.append(VerificationIssue(
                         severity="warning", category="missing_algorithm_block",

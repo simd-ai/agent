@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from simd_agent.chat.db import upsert_simulation_config
 from simd_agent.run.error_summarizer import ErrorSummarizer
 from simd_agent.run.event_bus import EventBus
 from simd_agent.run.linting import CFDLinter
@@ -418,31 +419,67 @@ class Orchestrator:
             },
         )
 
-        # ── Emit simulation_config_ready ─────────────────────────────────────
-        # Publish the final, normalised config split by DB column so the frontend
-        # can UPSERT simulation_config (cfd_physics / cfd_solver / cfd_fluid /
-        # cfd_turbulence) into Neon.  The chat service reads from these columns.
-        # We do this once, right after lint + solver selection, so we have the
-        # most accurate values before any codegen retry loop mutates state.
+        # ── Emit simulation_config_ready and persist directly to DB ──────────
+        # 1. Emit the WS event so the frontend can sync its local state.
+        # 2. Also write directly to the simulation_config Neon table so the
+        #    chat service can read the config without depending on the frontend
+        #    relaying the event.
         _vc = self._lint_result.validated_config or {}
-        # "solver" may be a bare string (solver name) or a full settings dict
-        # depending on which path produced the config (precheck vs direct submit).
+        _nc = self._lint_result.normalized_config  # SimulationConfigV1 | None
+
+        # Build a rich physics dict from the normalized config (the flat
+        # validated_config has no nested "physics" key).
+        if _nc:
+            _physics_section = _nc.physics.model_dump()
+        else:
+            _physics_section = {
+                "flow_regime":    _vc.get("flow_regime", "turbulent"),
+                "time_scheme":    _vc.get("time_stepping", "steady"),
+                "compressibility": _vc.get("compressibility", "incompressible"),
+                "heat_transfer":  _vc.get("heat_transfer", False),
+                "gravity":        _vc.get("gravity", False),
+                "multiphase":     _vc.get("multiphase", False),
+            }
+
+        # Build solver section — inject the authoritative solver name.
         _raw_solver = _vc.get("solver", {})
         _solver_section = dict(_raw_solver) if isinstance(_raw_solver, dict) else {}
-        # Always inject the authoritative solver name chosen by SolverSelector so
-        # the chat agent and simulation_config_ready event reflect the real solver.
         _solver_section["solver"] = solver
+
+        # Turbulence: empty for laminar flow so the chat agent never reports a
+        # turbulence model for laminar simulations.
+        _is_laminar = (
+            _vc.get("flow_regime", "turbulent") == "laminar"
+            or (_nc and _nc.physics.flow_regime and
+                _nc.physics.flow_regime.value == "laminar")
+        )
+        _turbulence_section = {} if _is_laminar else _vc.get("turbulence", {})
+
+        _fluid_section = _vc.get("fluid", {})
+
         sim_id = (
             self.request.simulation_config.get("simulation_id")
             or self.request.simulation_config.get("simulationId")
         )
+
         await self.event_bus.emit_simulation_config_ready(
-            physics=_vc.get("physics", {}),
+            physics=_physics_section,
             solver=_solver_section,
-            fluid=_vc.get("fluid", {}),
-            turbulence=_vc.get("turbulence", {}),
+            fluid=_fluid_section,
+            turbulence=_turbulence_section,
             simulation_id=sim_id,
         )
+
+        # Persist directly to the simulation_config table so the chat service
+        # has the config available immediately (no frontend relay required).
+        if sim_id:
+            await upsert_simulation_config(
+                simulation_id=sim_id,
+                physics=_physics_section,
+                solver=_solver_section,
+                fluid=_fluid_section,
+                turbulence=_turbulence_section,
+            )
 
         # Get mesh_id from simulation config.
         # simulation_config["mesh"] can be a dict or a bare mesh-ID string.
@@ -463,6 +500,12 @@ class Orchestrator:
                 _current_patch_files = list(self._missing_files_for_patch)
                 _current_affected_files = list(self._error_recovery_affected_files)
                 self._error_recovery_affected_files = []  # consumed — reset immediately
+
+                # ── On retry: tell frontend to clear stale sim_progress data ──
+                # A new simulation attempt is about to start; the residuals from the
+                # failed run must not mix with the new run's data.
+                if self._iteration > 1:
+                    await self.event_bus.emit_sim_progress_reset(self._iteration)
 
                 # ── Generate code ──
                 await self.event_bus.emit_codegen_started(

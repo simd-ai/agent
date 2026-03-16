@@ -23,8 +23,8 @@ from simd_agent.run.case_spec import CaseSpec, build_case_spec
 
 logger = logging.getLogger(__name__)
 
-PROMPTS_DIR = Path(__file__).parent / "prompts" / "packs" / "simd"
-SOLVERS_DIR = PROMPTS_DIR / "solvers"
+PROMPTS_DIR = Path(__file__).parent.parent / "prompts" / "packs" / "simd"
+SOLVERS_DIR = PROMPTS_DIR / "solvers" / "single-phase"
 FLUIDS_DIR  = PROMPTS_DIR / "fluids"
 
 # Maps fluid name fragments → fluid pack filename (without .md)
@@ -215,37 +215,17 @@ def validate_generated_files(
             del fixed_files["0/p_rgh"]
 
     elif solver in P_RGH_SOLVERS:
-        # Compressible two-phase solvers (compressibleInterFoam, compressibleInterIsoFoam,
-        # compressibleMultiphaseInterFoam) read BOTH 0/p (absolute pressure, MUST_READ) and
-        # 0/p_rgh (modified pressure).  Keep both; synthesise missing one if needed.
-        _is_compressible_inter = solver in ENERGY_SOLVERS and solver in P_RGH_SOLVERS
-        if _is_compressible_inter:
-            if "0/p_rgh" in fixed_files and "0/p" not in fixed_files:
-                # Synthesise 0/p from 0/p_rgh (same BCs, same dimensions [1 -1 -2 0 0 0 0])
-                content = fixed_files["0/p_rgh"].replace("object      p_rgh;", "object      p;").replace("object p_rgh;", "object p;")
-                fixed_files["0/p"] = content
-                issues.append(ValidationIssue("warning", "0/p", f"'{solver}' needs both 0/p and 0/p_rgh. Synthesised 0/p from 0/p_rgh."))
-            elif "0/p" in fixed_files and "0/p_rgh" not in fixed_files:
-                # Synthesise 0/p_rgh from 0/p
-                content = fixed_files["0/p"].replace("object      p;", "object      p_rgh;").replace("object p;", "object p_rgh;")
-                fixed_files["0/p_rgh"] = content
-                issues.append(ValidationIssue("warning", "0/p_rgh", f"'{solver}' needs both 0/p and 0/p_rgh. Synthesised 0/p_rgh from 0/p."))
-            # If both exist — correct, leave as-is
-        else:
-            # Incompressible two-phase (interFoam, interIsoFoam): need p_rgh only
-            if "0/p" in fixed_files and "0/p_rgh" not in fixed_files:
-                issues.append(ValidationIssue(
-                    "error", "0/p",
-                    f"'{solver}' requires 0/p_rgh, not 0/p. Renaming.",
-                    fix="Renamed 0/p → 0/p_rgh"
-                ))
-                content = fixed_files.pop("0/p")
-                content = content.replace("object      p;", "object      p_rgh;")
-                content = content.replace("object p;", "object p_rgh;")
-                fixed_files["0/p_rgh"] = content
-            if "0/p" in fixed_files and "0/p_rgh" in fixed_files:
-                issues.append(ValidationIssue("warning", "0/p", "Both 0/p and 0/p_rgh exist for incompressible solver. Removing 0/p."))
-                del fixed_files["0/p"]
+        # buoyantSimpleFoam / buoyantPimpleFoam: need BOTH 0/p_rgh (solved) and 0/p (calculated).
+        # p_rgh is the primary solved pressure; p is derived as p = p_rgh + rho*(g·x).
+        if "0/p_rgh" in fixed_files and "0/p" not in fixed_files:
+            content = fixed_files["0/p_rgh"].replace("object      p_rgh;", "object      p;").replace("object p_rgh;", "object p;")
+            fixed_files["0/p"] = content
+            issues.append(ValidationIssue("warning", "0/p", f"'{solver}' needs both 0/p_rgh and 0/p. Synthesised 0/p from 0/p_rgh."))
+        elif "0/p" in fixed_files and "0/p_rgh" not in fixed_files:
+            content = fixed_files["0/p"].replace("object      p;", "object      p_rgh;").replace("object p;", "object p_rgh;")
+            fixed_files["0/p_rgh"] = content
+            issues.append(ValidationIssue("warning", "0/p_rgh", f"'{solver}' needs both 0/p_rgh and 0/p. Synthesised 0/p_rgh from 0/p."))
+        # If both exist — correct, leave as-is
 
     # ── Check 3: Remove unneeded thermo/gravity files for simple solvers ──
     if solver in P_SOLVERS and solver not in THERMO_SOLVERS:
@@ -496,7 +476,7 @@ def validate_generated_files(
     #              If "none", flow rate is treated as volumetric.
     #   `rhoInlet`— optional scalar: startup fallback when density field not in DB.
     #
-    # For incompressible solvers (icoFoam, pimpleFoam, simpleFoam) — NO rho field:
+    # For incompressible solvers (pimpleFoam, simpleFoam) — NO rho field:
     #   • `rho 880;`  → FOAM FATAL IO ERROR: "expected word, found double 880"
     #   • `rho rho;` (without rhoInlet) → FOAM crash: rho field not found, no fallback
     #   • `massFlowRate + rhoInlet` → VALID per docs (fallback scalar; no `rho` word needed)
@@ -505,7 +485,8 @@ def validate_generated_files(
     # Strategy: convert massFlowRate → volumetricFlowRate when rho is available (cleanest).
     # If no rho in config, strip rho <word> and leave massFlowRate + rhoInlet (also valid).
     # The `constant` qualifier is REQUIRED in OF 2406 for Function1<scalar> values.
-    _INCOMPRESSIBLE_SOLVERS = {"icoFoam", "pimpleFoam", "simpleFoam"}
+    _INCOMPRESSIBLE_SOLVERS = {"pimpleFoam", "simpleFoam"}
+    _COMPRESSIBLE_RHO_SOLVERS = {"rhoPimpleFoam", "rhoSimpleFoam", "buoyantPimpleFoam", "buoyantSimpleFoam"}
     _u_content = fixed_files.get("0/U", "")
     if _u_content and "flowRateInletVelocity" in _u_content:
         _u_fixed = _u_content
@@ -581,10 +562,9 @@ def validate_generated_files(
         # Build the CaseSpec from config to get canonical deltaT and transient flag
         _cs_solver_props = {
             "simpleFoam": False, "rhoSimpleFoam": False,
-            "pimpleFoam": True, "rhoPimpleFoam": True, "icoFoam": True,
-            "interFoam": True, "interIsoFoam": True,
-            "compressibleInterFoam": True, "compressibleInterIsoFoam": True,
-            "compressibleMultiphaseInterFoam": True,
+            "buoyantSimpleFoam": False,
+            "pimpleFoam": True, "rhoPimpleFoam": True,
+            "buoyantPimpleFoam": True,
         }
         _is_transient = _cs_solver_props.get(solver, True)
         _canonical_dt = float(config.get("delta_t") or 0.001)
@@ -640,25 +620,14 @@ def validate_generated_files(
     # ── Check 3c-fvOptions: Auto-inject system/fvOptions for compressible energy solvers ──
     # Temperature can diverge to negative values during early iterations due to numerical
     # overshoot on boundary interfaces.  A limitTemperature fvOption acts as a safety net
-    # for rho* single-phase solvers.
-    #
-    # IMPORTANT: compressibleInterFoam / compressibleInterIsoFoam / compressibleMultiphaseInterFoam
-    # use twoPhaseMixtureThermo which does NOT implement he().  limitTemperature calls he()
-    # at startup → "Not implemented: twoPhaseMixtureThermo::he()" → FOAM aborting.
-    # fvOptions with limitTemperature must NEVER be used with these solvers.
-    _COMPRESSIBLE_RHO_SOLVERS = {
+    # for all compressible single-phase energy solvers.
+    _FVOPTIONS_ENERGY_SOLVERS = {
         "rhoPimpleFoam", "rhoSimpleFoam",
-        "compressibleInterFoam", "compressibleInterIsoFoam", "compressibleMultiphaseInterFoam",
-    }
-    # Subset that supports limitTemperature (single-phase rho solvers only)
-    _RHO_SINGLE_PHASE_SOLVERS = {"rhoPimpleFoam", "rhoSimpleFoam"}
-    # Two-phase inter solvers: limitTemperature NOT supported — delete if LLM generates it
-    _COMPRESSIBLE_INTER_SOLVERS = {
-        "compressibleInterFoam", "compressibleInterIsoFoam", "compressibleMultiphaseInterFoam",
+        "buoyantSimpleFoam", "buoyantPimpleFoam",
     }
     _eos_ceiling: float | None = None
     _t_floor: float = 1.0
-    if solver in _COMPRESSIBLE_RHO_SOLVERS:
+    if solver in _FVOPTIONS_ENERGY_SOLVERS:
         # Compute BC temperature floor and EOS ceiling — used by both the fallback
         # injection (when LLM omitted fvOptions) and the clamp check (when LLM generated
         # it but chose a max above the icoPolynomial zero-density point).
@@ -696,23 +665,7 @@ def validate_generated_files(
             except (TypeError, ValueError):
                 pass
 
-        if solver in _COMPRESSIBLE_INTER_SOLVERS:
-            # Delete any LLM-generated fvOptions — limitTemperature is incompatible
-            # with twoPhaseMixtureThermo (he() not implemented → FOAM aborting at startup).
-            if "system/fvOptions" in fixed_files:
-                del fixed_files["system/fvOptions"]
-                issues.append(ValidationIssue(
-                    "warning", "system/fvOptions",
-                    f"Removed system/fvOptions for '{solver}': limitTemperature calls he() on "
-                    "twoPhaseMixtureThermo which does not implement it → 'Not implemented' "
-                    "FOAM FATAL ERROR at startup. fvOptions must not be used with this solver.",
-                    fix="Deleted system/fvOptions (incompatible with twoPhaseMixtureThermo)"
-                ))
-                logger.info(
-                    f"[VALIDATE] Deleted system/fvOptions for {solver}: "
-                    "limitTemperature incompatible with twoPhaseMixtureThermo"
-                )
-        elif "system/fvOptions" not in fixed_files and solver in _RHO_SINGLE_PHASE_SOLVERS:
+        if "system/fvOptions" not in fixed_files:
             # Fallback injection — only when wall is genuinely hotter than inlet.
             # Isothermal (wall_T ≈ inlet_T) and adiabatic (no wall T) do not need
             # fvOptions: temperature never drifts above inlet T → EOS ceiling is safe.
@@ -783,9 +736,8 @@ def validate_generated_files(
 
     # ── Check 3c2: Enforce EOS ceiling on LLM-generated fvOptions ────────────
     # If the LLM generated system/fvOptions but chose a max temperature above the
-    # icoPolynomial zero-density point, clamp it.  Only applies to rho* single-phase
-    # solvers — compressibleInterFoam/etc. cannot use fvOptions at all (see above).
-    if solver in _RHO_SINGLE_PHASE_SOLVERS and "system/fvOptions" in fixed_files:
+    # icoPolynomial zero-density point, clamp it.
+    if solver in _FVOPTIONS_ENERGY_SOLVERS and "system/fvOptions" in fixed_files:
         if _eos_ceiling is not None:
             _fvo = fixed_files["system/fvOptions"]
             import re as _re_fvo
@@ -889,74 +841,6 @@ def validate_generated_files(
             fixed_files[_tf] = _tc_fixed
             logger.debug(f"[VALIDATE] Stripped deprecated nMoles from {_tf}")
 
-    # ── Check 3d3: sensibleEnthalpy → sensibleInternalEnergy for native liquid path ──
-    # The native liquidProperties path (properties liquid;) MUST use sensibleInternalEnergy.
-    # Using sensibleEnthalpy causes SIGFPE in heRhoThermo constructor (powf64 in
-    # libthermophysicalProperties.so) on OF 2406 ESI.
-    # Also fix paired vapour files: when any liquid file uses native path,
-    # all vapour (perfectGas) files in the same case must also use sensibleInternalEnergy.
-    _INTER_THERMO_SOLVERS = {
-        "compressibleInterFoam",
-        "compressibleInterIsoFoam",
-        "compressibleMultiphaseInterFoam",
-    }
-    if solver in _INTER_THERMO_SOLVERS:
-        # Pass 1: find any native liquid file; fix energy form if wrong
-        _has_native_liquid = False
-        for _tf in list(fixed_files):
-            if not _tf.startswith("constant/thermophysicalProperties"):
-                continue
-            _tc = fixed_files[_tf]
-            if "properties" in _tc and "liquid" in _tc:
-                _has_native_liquid = True
-                if "sensibleEnthalpy" in _tc:
-                    _tc_fixed = _tc.replace("sensibleEnthalpy", "sensibleInternalEnergy")
-                    fixed_files[_tf] = _tc_fixed
-                    issues.append(ValidationIssue(
-                        file=_tf,
-                        severity="error",
-                        check="3d3",
-                        description=(
-                            "Native liquidProperties (properties liquid;) requires "
-                            "energy sensibleInternalEnergy — sensibleEnthalpy causes "
-                            "SIGFPE in heRhoThermo constructor on OF 2406."
-                        ),
-                        fix="Changed energy sensibleEnthalpy → sensibleInternalEnergy."
-                    ))
-
-        # Pass 2: if native liquid present, fix all vapour (perfectGas) files too
-        if _has_native_liquid:
-            for _tf in list(fixed_files):
-                if not _tf.startswith("constant/thermophysicalProperties"):
-                    continue
-                _tc = fixed_files[_tf]
-                if "perfectGas" not in _tc:
-                    continue
-                _tc_fixed = _tc
-                changed = False
-                if "sensibleEnthalpy" in _tc_fixed:
-                    _tc_fixed = _tc_fixed.replace("sensibleEnthalpy", "sensibleInternalEnergy")
-                    changed = True
-                if "thermo          hConst" in _tc_fixed:
-                    _tc_fixed = _tc_fixed.replace("thermo          hConst", "thermo          eConst")
-                    changed = True
-                if "thermo      hConst" in _tc_fixed:
-                    _tc_fixed = _tc_fixed.replace("thermo      hConst", "thermo      eConst")
-                    changed = True
-                if changed:
-                    fixed_files[_tf] = _tc_fixed
-                    issues.append(ValidationIssue(
-                        file=_tf,
-                        severity="warning",
-                        check="3d3",
-                        description=(
-                            "Vapour phase paired with native liquid must use "
-                            "sensibleInternalEnergy + eConst for energy consistency."
-                        ),
-                        fix="Changed to sensibleInternalEnergy + eConst. "
-                            "Verify Cv value matches the fluid (not Cp)."
-                    ))
-
     # ── Check 3e: alphatWallFunction → compressible::alphatWallFunction ──────
     # OpenFOAM 2406 ESI compressible solvers require the namespace-qualified BC type.
     # Plain 'alphatWallFunction' is rejected: "Unknown patchField type alphatWallFunction
@@ -982,211 +866,6 @@ def validate_generated_files(
                 f"[VALIDATE] Auto-fixed alphatWallFunction → compressible::alphatWallFunction "
                 f"in 0/alphat for {solver}"
             )
-
-    # ── Check 3f: alpha.* solver block — inject missing linear solver settings ──
-    # OpenFOAM 2406 requires a 'solver' keyword in every fvSolution/solvers block,
-    # including alpha.* MULES blocks.  The LLM often generates only MULES-specific
-    # keys (nAlphaCorr, cAlpha, MULESCorr, etc.) without 'solver'/'smoother'/
-    # 'tolerance', causing:
-    #   "Entry 'solver' not found in dictionary fvSolution/solvers/alpha.<phase>.*"
-    # Fix: inject solver settings into any alpha.* block that lacks them.
-    _INTER_ALPHA_SOLVERS = {
-        "compressibleInterFoam",
-        "compressibleInterIsoFoam",
-        "compressibleMultiphaseInterFoam",
-        "interFoam",
-        "interIsoFoam",
-    }
-    if solver in _INTER_ALPHA_SOLVERS and "system/fvSolution" in fixed_files:
-        _fvs_alpha = fixed_files["system/fvSolution"]
-        # Find every "alpha.*" block; check if it already has 'solver'
-        _alpha_block_re = re.compile(
-            r'("alpha\.[^"]*\.\*"|alpha\.[^\s{]+\s*)\s*\{([^}]*)\}',
-            re.DOTALL,
-        )
-        _alpha_solver_line = (
-            "\n        solver          smoothSolver;"
-            "\n        smoother        symGaussSeidel;"
-            "\n        tolerance       1e-8;"
-            "\n        relTol          0;"
-        )
-        def _inject_alpha_solver(m: "re.Match") -> str:  # type: ignore[name-defined]
-            header = m.group(1)
-            body = m.group(2)
-            if re.search(r'\bsolver\b', body):
-                return m.group(0)  # already has solver key
-            return f"{header}\n    {{{_alpha_solver_line}\n{body}    }}"
-        _fvs_alpha_fixed = _alpha_block_re.sub(_inject_alpha_solver, _fvs_alpha)
-        if _fvs_alpha_fixed != _fvs_alpha:
-            fixed_files["system/fvSolution"] = _fvs_alpha_fixed
-            issues.append(ValidationIssue(
-                "warning", "system/fvSolution",
-                "Auto-injected linear solver settings (solver/smoother/tolerance) into alpha.* "
-                "block(s). OpenFOAM 2406 requires 'solver' in every fvSolution/solvers entry "
-                "including MULES alpha blocks — missing it causes 'Entry solver not found' fatal error.",
-                fix="Injected solver/smoother/tolerance into alpha.* blocks"
-            ))
-            logger.info(
-                f"[VALIDATE] Injected linear solver settings into alpha.* fvSolution block(s) "
-                f"for {solver}"
-            )
-
-    # ── Check 3g: Force divSchemes default to 'none' for compressible inter solvers ──
-    # Two failure modes on the 'default' divSchemes entry for compressibleInterFoam etc.:
-    #
-    # (A) "bounded Gauss upwind" → "unknown div scheme bounded" — 'bounded' is only
-    #     valid for named scalar/vector terms; Tensor fields fall back to default and
-    #     don't pass through the bounded dispatch.
-    #
-    # (B) "Gauss upwind" → "attempt to read beyond EOF at divSchemes/default" — the
-    #     'upwind' interpolation scheme in OF 2406 reads a flux field name from the
-    #     token stream when applied to Tensor fields that fall back to default.
-    #     With no flux name present, it reads past the end of the token stream.
-    #
-    # Correct fix: use 'none' as the default.  This forces all div terms to be
-    # explicitly listed (which the LLM already does for all important fields).
-    # Any unlisted field will get a clear "no default divScheme" error rather than
-    # a silent EOF or unknown-scheme crash.
-    _INTER_DIV_SOLVERS = {
-        "compressibleInterFoam",
-        "compressibleInterIsoFoam",
-        "compressibleMultiphaseInterFoam",
-        "interFoam",
-        "interIsoFoam",
-    }
-    if solver in _INTER_DIV_SOLVERS and "system/fvSchemes" in fixed_files:
-        _fvsch = fixed_files["system/fvSchemes"]
-        # Replace the default entry with 'Gauss linear' — handles multiple failure modes:
-        # (A) 'bounded Gauss upwind' → "unknown div scheme bounded"
-        # (B) 'Gauss upwind'  → "attempt to read beyond EOF" (upwind reads flux field name
-        #                        from stream; stream empty after 'upwind' → EOF)
-        # (C) 'none'          → ALSO causes "attempt to read beyond EOF" in OF 2406:
-        #                        OF treats 'none' as a scheme name, calls the base divScheme
-        #                        constructor which tries to read the interpolation scheme
-        #                        → stream empty → EOF.
-        # Correct value: 'Gauss linear' — safe for all field types (scalar/vector/tensor/symmTensor).
-        _BAD_DEFAULT_PAT = re.compile(
-            r'(divSchemes\s*\{[^}]*?\bdefault\s+)'
-            r'(?:bounded\s+)?(?:Gauss\s+\S+[^;\n]*|none)\s*;',
-            re.DOTALL,
-        )
-        _fvsch_fixed = _BAD_DEFAULT_PAT.sub(r'\1Gauss linear;', _fvsch, count=1)
-
-        # Also ensure div(rhoPhi,he) is listed — in OF 2406 the enthalpy field
-        # uses the internal name 'he' (not 'h') in some code paths, so both
-        # div(rhoPhi,h) and div(rhoPhi,he) must be present.
-        if "div(rhoPhi,h)" in _fvsch_fixed and "div(rhoPhi,he)" not in _fvsch_fixed:
-            _fvsch_fixed = _fvsch_fixed.replace(
-                "div(rhoPhi,h)",
-                "div(rhoPhi,he)\n    div(rhoPhi,h)",
-                1,
-            )
-
-        if _fvsch_fixed != _fvsch:
-            fixed_files["system/fvSchemes"] = _fvsch_fixed
-            issues.append(ValidationIssue(
-                "warning", "system/fvSchemes",
-                f"Auto-fixed divSchemes for '{solver}': set default to 'Gauss linear' "
-                "(safe for all field types) and ensured both div(rhoPhi,he) and div(rhoPhi,h) "
-                "are listed. 'none', 'Gauss upwind', and 'bounded Gauss upwind' all cause "
-                "'attempt to read beyond EOF' or 'unknown div scheme' errors in OF 2406.",
-                fix="divSchemes default → Gauss linear; added div(rhoPhi,he)"
-            ))
-            logger.info(
-                f"[VALIDATE] divSchemes default set to 'Gauss linear' for {solver}, "
-                "div(rhoPhi,he) ensured"
-            )
-
-    # ── Check 3h: PIMPLE nOuterCorrectors ≥ 2 for compressible inter solvers ──────
-    # compressibleInterFoam/InterIsoFoam/MultiphaseInterFoam use icoPolynomial for the
-    # liquid phase — ρ = f(T) only, zero acoustic compressibility.  With nOuterCorrectors=1
-    # (PISO mode), the T → ρ → p → U coupling is unresolved within each timestep, causing
-    # Co to spike from ~0.4 to >18 in a single step, then explode exponentially (404 → 4.6e6)
-    # and T crashing to -552 K within 5 timesteps.  Also enforce nNonOrthogonalCorrectors ≥ 1
-    # and momentumPredictor yes so U is bounded each outer iteration.
-    _INTER_PIMPLE_SOLVERS = {
-        "compressibleInterFoam",
-        "compressibleInterIsoFoam",
-        "compressibleMultiphaseInterFoam",
-        "interFoam",
-        "interIsoFoam",
-    }
-    if solver in _INTER_PIMPLE_SOLVERS and "system/fvSolution" in fixed_files:
-        _fvs_pimple = fixed_files["system/fvSolution"]
-        _fvs_pimple_fixed = _fvs_pimple
-
-        # Fix nOuterCorrectors < 2
-        _outer_match = re.search(r'(nOuterCorrectors\s+)(\d+)\s*;', _fvs_pimple_fixed)
-        if _outer_match:
-            _outer_val = int(_outer_match.group(2))
-            if _outer_val < 2:
-                _fvs_pimple_fixed = _fvs_pimple_fixed.replace(
-                    _outer_match.group(0),
-                    f"{_outer_match.group(1)}2;",
-                    1,
-                )
-
-        # Fix nNonOrthogonalCorrectors < 1
-        _nonorth_match = re.search(r'(nNonOrthogonalCorrectors\s+)(\d+)\s*;', _fvs_pimple_fixed)
-        if _nonorth_match:
-            _nonorth_val = int(_nonorth_match.group(2))
-            if _nonorth_val < 1:
-                _fvs_pimple_fixed = _fvs_pimple_fixed.replace(
-                    _nonorth_match.group(0),
-                    f"{_nonorth_match.group(1)}1;",
-                    1,
-                )
-
-        # Fix momentumPredictor no → yes
-        _mom_match = re.search(r'(momentumPredictor\s+)(no)\s*;', _fvs_pimple_fixed)
-        if _mom_match:
-            _fvs_pimple_fixed = _fvs_pimple_fixed.replace(
-                _mom_match.group(0),
-                f"{_mom_match.group(1)}yes;",
-                1,
-            )
-
-        if _fvs_pimple_fixed != _fvs_pimple:
-            fixed_files["system/fvSolution"] = _fvs_pimple_fixed
-            issues.append(ValidationIssue(
-                "warning", "system/fvSolution",
-                f"Auto-fixed PIMPLE settings for '{solver}': nOuterCorrectors → ≥2, "
-                "nNonOrthogonalCorrectors → ≥1, momentumPredictor → yes. "
-                "icoPolynomial liquid (zero compressibility) requires outer PIMPLE iterations "
-                "to couple T→ρ→p→U; PISO mode causes Co to explode within 3 timesteps.",
-                fix="nOuterCorrectors≥2; nNonOrthogonalCorrectors≥1; momentumPredictor yes"
-            ))
-            logger.info(
-                f"[VALIDATE] PIMPLE settings corrected for {solver}: "
-                "nOuterCorrectors≥2, nNonOrthogonalCorrectors≥1, momentumPredictor yes"
-            )
-
-    # ── Check 3i: maxCo ≤ 0.5 for compressible inter solvers ─────────────────────
-    # maxCo 1.0 allows the Courant number to spike to ~18 before adaptive timestep
-    # reacts, at which point PISO-mode pressure correction can no longer bound velocity.
-    # 0.5 is the safe upper limit for these solvers.
-    if solver in _INTER_PIMPLE_SOLVERS and "system/controlDict" in fixed_files:
-        _cd = fixed_files["system/controlDict"]
-        _cd_fixed = _cd
-        for _co_key in ("maxCo", "maxAlphaCo"):
-            _co_match = re.search(rf'({re.escape(_co_key)}\s+)([\d.]+)\s*;', _cd_fixed)
-            if _co_match:
-                _co_val = float(_co_match.group(2))
-                if _co_val > 0.5:
-                    _cd_fixed = _cd_fixed.replace(
-                        _co_match.group(0),
-                        f"{_co_match.group(1)}0.5;",
-                        1,
-                    )
-        if _cd_fixed != _cd:
-            fixed_files["system/controlDict"] = _cd_fixed
-            issues.append(ValidationIssue(
-                "warning", "system/controlDict",
-                f"Auto-fixed maxCo/maxAlphaCo → 0.5 for '{solver}'. "
-                "maxCo > 0.5 allows Co spikes that cause unrecoverable velocity divergence.",
-                fix="maxCo 0.5; maxAlphaCo 0.5"
-            ))
-            logger.info(f"[VALIDATE] maxCo/maxAlphaCo clamped to 0.5 for {solver}")
 
     # ── Check 3b: Remove invented "front_and_back" patches ──
     # The LLM sometimes invents a "front_and_back" (with underscores) patch
@@ -1482,7 +1161,10 @@ def validate_generated_files(
     # fvOptions — only when wall is hotter than inlet (actual heat exchange).
     # Reuse the same wall-heats-fluid determination from the pre-strip above.
     # _strip_wall_heats_fluid was computed from the same config just above.
-    _RHO_SINGLE_PHASE_FVOPTIONS_V = {"rhoPimpleFoam", "rhoSimpleFoam"}
+    _RHO_SINGLE_PHASE_FVOPTIONS_V = {
+        "rhoPimpleFoam", "rhoSimpleFoam",
+        "buoyantSimpleFoam", "buoyantPimpleFoam",
+    }
     if solver in _RHO_SINGLE_PHASE_FVOPTIONS_V and _strip_wall_heats_fluid:
         required_files.append("system/fvOptions")
 
@@ -1496,13 +1178,11 @@ def validate_generated_files(
     # ── Check 6: fvSolution solver algorithm ──
     fv_solution = fixed_files.get("system/fvSolution", "")
     if fv_solution:
-        if solver in ("simpleFoam", "rhoSimpleFoam") and "SIMPLE" not in fv_solution:
+        if solver in ("simpleFoam", "rhoSimpleFoam", "buoyantSimpleFoam") and "SIMPLE" not in fv_solution:
             issues.append(ValidationIssue("warning", "system/fvSolution", f"{solver} requires a SIMPLE block in fvSolution."))
-        elif solver in ("pimpleFoam", "rhoPimpleFoam") and "PIMPLE" not in fv_solution:
+        elif solver in ("pimpleFoam", "rhoPimpleFoam", "buoyantPimpleFoam") and "PIMPLE" not in fv_solution:
             issues.append(ValidationIssue("warning", "system/fvSolution", f"{solver} requires a PIMPLE block in fvSolution."))
-        elif solver == "icoFoam" and "PISO" not in fv_solution:
-            issues.append(ValidationIssue("warning", "system/fvSolution", "icoFoam requires a PISO block in fvSolution."))
-        elif solver in P_RGH_SOLVERS and "PIMPLE" not in fv_solution:
+        elif solver in P_RGH_SOLVERS and solver not in ("buoyantSimpleFoam", "buoyantPimpleFoam") and "PIMPLE" not in fv_solution:
             issues.append(ValidationIssue("warning", "system/fvSolution", f"{solver} (VOF) requires a PIMPLE block in fvSolution."))
     
     # ── Check 7: wallDist in fvSchemes (required for kOmegaSST, kEpsilon, etc.) ──
@@ -1524,15 +1204,19 @@ def validate_generated_files(
     # explicitly anyway so the intent is clear and crash-proof regardless of default choice.
     _COMPRESSIBLE_ENERGY_SOLVERS = {
         "rhoSimpleFoam", "rhoPimpleFoam",
-        "compressibleInterFoam", "compressibleInterIsoFoam",
-        "compressibleMultiphaseInterFoam",
+        "buoyantSimpleFoam", "buoyantPimpleFoam",
+    }
+    # Subset that requires div(phid,p): rho* solvers only.
+    # buoyant solvers use p_rgh as primary — div(phid,p) is NOT present/needed.
+    _PHID_P_REQUIRED_SOLVERS = {
+        "rhoSimpleFoam", "rhoPimpleFoam",
     }
     fv_schemes = fixed_files.get("system/fvSchemes", "")
     if fv_schemes and solver in _COMPRESSIBLE_ENERGY_SOLVERS and "divSchemes" in fv_schemes:
         missing_terms: list[tuple[str, str]] = []
         if "div(phi,K)" not in fv_schemes:
             missing_terms.append(("div(phi,K)", "bounded Gauss upwind"))
-        if "div(phid,p)" not in fv_schemes:
+        if solver in _PHID_P_REQUIRED_SOLVERS and "div(phid,p)" not in fv_schemes:
             missing_terms.append(("div(phid,p)", "Gauss limitedLinear 1"))
 
         if missing_terms:
@@ -1782,10 +1466,7 @@ def validate_generated_files(
         import re as _re
 
         # Detect compressible solver — rho field is available at runtime
-        _is_compressible_solver = solver in {
-            "rhoPimpleFoam", "rhoSimpleFoam", "compressibleInterFoam",
-            "compressibleInterIsoFoam", "compressibleMultiphaseInterFoam",
-        }
+        _is_compressible_solver = solver in _COMPRESSIBLE_ENERGY_SOLVERS
 
         # Pull rho and fluid density from config if available
         _fluid_rho: float | None = None
@@ -2319,12 +2000,13 @@ def build_required_files_list(solver: str, config: dict[str, Any]) -> list[str]:
         if solver in ENERGY_SOLVERS:
             required.append("0/alphat")
 
-    # fvOptions (limitTemperature) — only for single-phase rho* solvers when wall is
-    # HOTTER than inlet (actual heat exchange that could push T above EOS ceiling).
+    # fvOptions (limitTemperature) — for energy solvers when wall is HOTTER than inlet
+    # (actual heat exchange that could push T above EOS ceiling).
     # Isothermal (wall_T ≈ inlet_T) and adiabatic (no wall T) do not need fvOptions.
-    # compressibleInter* solvers use twoPhaseMixtureThermo (he() not implemented) →
-    # "FOAM FATAL ERROR" at startup if fvOptions is included.
-    _RHO_SINGLE_PHASE_FVOPTIONS = {"rhoPimpleFoam", "rhoSimpleFoam"}
+    _RHO_SINGLE_PHASE_FVOPTIONS = {
+        "rhoPimpleFoam", "rhoSimpleFoam",
+        "buoyantSimpleFoam", "buoyantPimpleFoam",
+    }
     _brl_inlet_t: float | None = None
     _brl_wall_temps: list[float] = []
     for _brl_pname, _brl_pbc in (config.get("boundary_conditions") or {}).items():
@@ -2398,8 +2080,8 @@ _FILE_HINTS: dict[str, str] = {
         "Generate `system/fvSolution`.\n"
         "Must include:\n"
         "  • solvers block — p/pFinal, U, turbulence fields, h/T if energy solver\n"
-        "  • algorithm block: SIMPLE (simpleFoam/rhoSimpleFoam), "
-        "PIMPLE (pimpleFoam/rhoPimpleFoam/VOF), or PISO (icoFoam)\n"
+        "  • algorithm block: SIMPLE (simpleFoam/rhoSimpleFoam/buoyantSimpleFoam), "
+        "or PIMPLE (pimpleFoam/rhoPimpleFoam/buoyantPimpleFoam)\n"
         "  • relaxationFactors\n"
         "Use the template from the Solver Instructions."
     ),
@@ -2419,7 +2101,7 @@ _FILE_HINTS: dict[str, str] = {
     ),
     "0/p": (
         "Generate `0/p` (pressure field).\n"
-        "Incompressible (simpleFoam, pimpleFoam, icoFoam): "
+        "Incompressible (simpleFoam, pimpleFoam): "
         "dimensions [0 2 -2 0 0 0 0], values in m²/s²\n"
         "Compressible (rhoSimpleFoam, rhoPimpleFoam): "
         "dimensions [1 -1 -2 0 0 0 0], values in Pa\n"
@@ -2432,7 +2114,7 @@ _FILE_HINTS: dict[str, str] = {
     "0/p_rgh": (
         "Generate `0/p_rgh` (modified pressure = p - rho*g*h).\n"
         "Dimensions: [1 -1 -2 0 0 0 0]\n"
-        "Used by hydrostatic / VOF solvers such as compressibleInterFoam.\n"
+        "Used by buoyant solvers (buoyantSimpleFoam, buoyantPimpleFoam).\n"
         "internalField: use `initial_domain_pressure` from the case spec.\n"
         "If initial_domain_pressure is None, fall back to operating_pressure.\n"
         "For fixed-flux boundaries with gravity:\n"
@@ -2446,7 +2128,7 @@ _FILE_HINTS: dict[str, str] = {
         "Generate `0/T` (temperature field).\n"
         "Dimensions: [0 0 0 1 0 0 0], values in Kelvin.\n"
         "Always generate an explicit positive internalField.\n"
-        "CRITICAL: For compressible energy solvers (rhoSimpleFoam, rhoPimpleFoam, compressibleInterFoam, etc.):\n"
+        "CRITICAL: For compressible energy solvers (rhoSimpleFoam, rhoPimpleFoam, buoyantSimpleFoam, buoyantPimpleFoam):\n"
         "  internalField MUST equal `inlet_temperature` from the case spec (NOT 300 K).\n"
         "  Reason: icoPolynomial EOS → ρ(T) = a0 + a1·T. If you write 300K for LN2 (inlet=77K),\n"
         "  ρ = 1167.9 − 4.7×300 = −242 kg/m³ (negative) → SIGFPE on iteration 0 before any limiter runs.\n"
@@ -2535,21 +2217,7 @@ _FILE_HINTS: dict[str, str] = {
     ),
     "constant/thermophysicalProperties": (
         "Generate `constant/thermophysicalProperties`.\n\n"
-        "## For compressibleInterFoam / compressibleInterIsoFoam / compressibleMultiphaseInterFoam\n"
-        "Use THREE files: base (phases/pMin/sigma only) + one per-phase file for each phase.\n\n"
-        "### Liquid phases — PREFERRED: native liquidProperties\n"
-        "  thermoType { type heRhoThermo; mixture pureMixture; properties liquid; energy sensibleInternalEnergy; }\n"
-        "  mixture { <nativeClass>; }   // N2, O2, H2, He, H2O — no coefficient blocks\n"
-        "⚠ CRITICAL: energy MUST be sensibleInternalEnergy (NOT sensibleEnthalpy).\n"
-        "  sensibleEnthalpy causes SIGFPE in heRhoThermo constructor on OF 2406.\n\n"
-        "### Liquid phases — FALLBACK (unknown fluids): icoPolynomial + polynomial transport\n\n"
-        "### Gas/vapour phases paired with native liquid — MUST also use sensibleInternalEnergy:\n"
-        "  thermoType { type heRhoThermo; mixture pureMixture; transport const;\n"
-        "               thermo eConst; equationOfState perfectGas; specie specie;\n"
-        "               energy sensibleInternalEnergy; }\n"
-        "  mixture { specie { molWeight MW; } thermodynamics { Cv <Cv>; Hf 0; } transport { mu ...; Pr ...; } }\n"
-        "  Cv values: N2=743, O2=657, H2=10221, He=3116  (all in J/kg·K)\n\n"
-        "## For rhoSimpleFoam / rhoPimpleFoam (single-phase)\n"
+        "## For rhoSimpleFoam / rhoPimpleFoam (single-phase compressible)\n"
         "EOS SELECTION — pick the FIRST rule that matches:\n"
         "  A. rho <= 200 kg/m³ (gas/vapour): hePsiThermo + perfectGas + const/sutherland\n"
         "  B. rho > 200 AND (has_heat_transfer OR inlet_T != wall_T OR T < 200 K):\n"

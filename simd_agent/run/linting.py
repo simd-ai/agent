@@ -49,11 +49,6 @@ SOLVERS = {
         "regime": ["laminar", "turbulent"],
         "description": "Transient incompressible solver",
     },
-    "icoFoam": {
-        "type": "transient",
-        "regime": ["laminar"],
-        "description": "Transient laminar incompressible solver",
-    },
     "pisoFoam": {
         "type": "transient",
         "regime": ["laminar", "turbulent"],
@@ -400,8 +395,14 @@ class CFDLinter:
         is_transient = config.physics.time_scheme == TimeScheme.TRANSIENT
         is_thermal = config.physics.heat_transfer or case_type == "heat_transfer"
         
-        # Determine recommended solver (no buoyancy for now)
-        if is_transient:
+        # Determine recommended solver
+        # Buoyancy-driven (natural convection): heat transfer + single-phase + incompressible
+        if is_thermal:
+            if is_transient:
+                recommended_solver = "buoyantPimpleFoam"
+            else:
+                recommended_solver = "buoyantSimpleFoam"
+        elif is_transient:
             recommended_solver = "pimpleFoam"
         else:
             recommended_solver = "simpleFoam"
@@ -677,9 +678,19 @@ class CFDLinter:
         _max_iter = config.solver.max_iterations  # e.g. 500 from frontend
         _end_time = config.solver.end_time or _max_iter or 1000
 
+        _is_laminar = (
+            config.physics.flow_regime == FlowRegime.LAMINAR
+            or (turb_model or "").lower() == "laminar"
+            or (config.physics.turbulence_model or "").lower() == "laminar"
+        )
+
         validated = {
             "solver": solver or config.solver.type,
-            "turbulence_model": turb_model or config.physics.turbulence_model or "kEpsilon",
+            # For laminar flow the model is "laminar" (no turbulence equations).
+            # For turbulent flow fall back to kEpsilon if nothing is specified.
+            "turbulence_model": "laminar" if _is_laminar else (
+                turb_model or config.physics.turbulence_model or "kEpsilon"
+            ),
             "time_stepping": config.physics.time_scheme.value,
             "write_interval": config.solver.write_interval,
             # max_iterations: the value the user explicitly set (or default 1000)
@@ -744,7 +755,11 @@ class CFDLinter:
         
         # Add turbulence config — carries pre-computed k/omega/epsilon/nut initial values
         # so the codegen layer never has to guess turbulence field values.
-        if config.turbulence:
+        # For laminar flow no turbulence model is active — skip the turbulence block
+        # entirely so the chat agent and codegen layer do not receive misleading values.
+        if _is_laminar:
+            validated["turbulence"] = {}  # empty signals "no turbulence model"
+        elif config.turbulence:
             tc = config.turbulence
             validated["turbulence"] = {
                 "model":              tc.model,

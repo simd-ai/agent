@@ -70,57 +70,24 @@ _SOLVER_PROPS: dict[str, dict[str, Any]] = {
         "energy": "he",
         "needs_gravity": False,
     },
-    "icoFoam": {
-        "algorithm": "PISO",
-        "pressure_field": "p",
-        "transient": True,
-        "compressible": False,
+    # Buoyancy-driven (natural convection / HVAC / gravity-dominated heat transfer)
+    # Uses heRhoThermo — density varies with T. Solves p_rgh; p is a calculated field.
+    # constant/g REQUIRED. Both 0/p_rgh (primary) and 0/p (calculated) are generated.
+    "buoyantSimpleFoam": {
+        "algorithm": "SIMPLE",
+        "pressure_field": "p_rgh",
+        "transient": False,
+        "compressible": True,    # heRhoThermo: ρ = f(T,p) via perfectGas / icoPolynomial
         "multiphase": False,
-        "energy": "none",
-        "needs_gravity": False,
-    },
-    "interFoam": {
-        "algorithm": "PIMPLE",
-        "pressure_field": "p_rgh",
-        "transient": True,
-        "compressible": False,
-        "multiphase": True,
-        "energy": "none",
-        "needs_gravity": True,
-    },
-    "interIsoFoam": {
-        "algorithm": "PIMPLE",
-        "pressure_field": "p_rgh",
-        "transient": True,
-        "compressible": False,
-        "multiphase": True,
-        "energy": "none",
-        "needs_gravity": True,
-    },
-    "compressibleInterFoam": {
-        "algorithm": "PIMPLE",
-        "pressure_field": "p_rgh",
-        "transient": True,
-        "compressible": True,
-        "multiphase": True,
         "energy": "he",
         "needs_gravity": True,
     },
-    "compressibleInterIsoFoam": {
+    "buoyantPimpleFoam": {
         "algorithm": "PIMPLE",
         "pressure_field": "p_rgh",
         "transient": True,
         "compressible": True,
-        "multiphase": True,
-        "energy": "he",
-        "needs_gravity": True,
-    },
-    "compressibleMultiphaseInterFoam": {
-        "algorithm": "PIMPLE",
-        "pressure_field": "p_rgh",
-        "transient": True,
-        "compressible": True,
-        "multiphase": True,
+        "multiphase": False,
         "energy": "he",
         "needs_gravity": True,
     },
@@ -507,9 +474,7 @@ def build_case_spec(solver: str, validated_config: dict[str, Any]) -> CaseSpec:
 
     # ── N5: Field set ────────────────────────────────────────────────────────
     required_0 = ["U", pressure_field]  # always
-    # compressibleInterFoam/compressibleInterIsoFoam/compressibleMultiphaseInterFoam
-    # read BOTH p (absolute, MUST_READ) AND p_rgh (modified pressure) at startup.
-    # interFoam/interIsoFoam only need p_rgh.
+    # Buoyant solvers read BOTH p_rgh (solved) AND p (absolute, for post-processing).
     if pressure_field == "p_rgh" and compressible:
         required_0.append("p")
     if energy == "he":
@@ -527,15 +492,8 @@ def build_case_spec(solver: str, validated_config: dict[str, Any]) -> CaseSpec:
     required_const: list[str] = []
     if compressible:
         required_const.append("constant/thermophysicalProperties")
-        # compressibleInterFoam family uses per-phase thermo files:
-        # constant/thermophysicalProperties.<phase1> and .<phase2>
-        if multiphase and phase_names_cfg:
-            for _phase in phase_names_cfg:
-                required_const.append(f"constant/thermophysicalProperties.{_phase}")
     else:
         required_const.append("constant/transportProperties")
-    # turbulenceProperties always except icoFoam (laminar, no model needed strictly,
-    # but we include it for safety)
     required_const.append("constant/turbulenceProperties")
     if needs_gravity:
         required_const.append("constant/g")
@@ -643,7 +601,7 @@ def build_case_spec(solver: str, validated_config: dict[str, Any]) -> CaseSpec:
     def _normalize_inlet_u_bc(ibc: dict, _rho: float | None) -> None:
         """Ensure flowRateInletVelocity contains required keys and a safe placeholder value.
 
-        For incompressible solvers (icoFoam, pimpleFoam, simpleFoam):
+        For incompressible solvers (pimpleFoam, simpleFoam):
           - massFlowRate is converted to volumetricFlowRate = mdot / rho so the LLM
             never needs to write a `rho` keyword (those solvers have no rho field).
           - If rho is unavailable, fall back to rhoInlet only (no `rho` word keyword).
@@ -662,7 +620,7 @@ def build_case_spec(solver: str, validated_config: dict[str, Any]) -> CaseSpec:
                 u[key] = ibc[key]
         if "massFlowRate" in u:
             if not compressible:
-                # Incompressible solvers (icoFoam, pimpleFoam, simpleFoam) have NO rho
+                # Incompressible solvers (pimpleFoam, simpleFoam) have NO rho
                 # field — writing `rho rho;` causes a fatal IO error at runtime.
                 # Convert to volumetricFlowRate = mdot / rho so the BC is density-free.
                 if _rho is not None and _rho > 0:
@@ -744,17 +702,6 @@ def build_case_spec(solver: str, validated_config: dict[str, Any]) -> CaseSpec:
             _a0 = rho - _a1 * _T_ref
             fv_options_eos_t_ceiling = abs(_a0) / abs(_a1)
 
-        # limitTemperature fvOption calls he() on the thermo object.
-        # twoPhaseMixtureThermo (used by compressibleInterFoam, compressibleInterIsoFoam,
-        # compressibleMultiphaseInterFoam) does NOT implement he() — including fvOptions
-        # with limitTemperature crashes those solvers immediately at startup:
-        #   "Not implemented: twoPhaseMixtureThermo::he()"
-        _INTER_SOLVERS_NO_FVOPTIONS = {
-            "compressibleInterFoam",
-            "compressibleInterIsoFoam",
-            "compressibleMultiphaseInterFoam",
-        }
-
         # fvOptions limitTemperature is needed ONLY when a wall is genuinely hotter
         # than the inlet fluid — i.e. there is actual heat exchange that could drive
         # the bulk temperature above the icoPolynomial EOS ceiling.
@@ -798,7 +745,7 @@ def build_case_spec(solver: str, validated_config: dict[str, Any]) -> CaseSpec:
                 # which covers most cryogenic inlet temperatures)
                 _wall_heats_fluid = _max_wall_t > 200.0
 
-        if _wall_heats_fluid and solver not in _INTER_SOLVERS_NO_FVOPTIONS:
+        if _wall_heats_fluid:
             _required_system.append("system/fvOptions")
 
     # ── N3-energy: No 0/h or 0/e file is generated ───────────────────────────

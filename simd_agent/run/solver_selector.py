@@ -32,31 +32,29 @@ logger = logging.getLogger(__name__)
 # Canonical allowed-solver set (single source of truth)
 # ─────────────────────────────────────────────────────────────
 
+# ── Supported single-phase solvers ───────────────────────────────────────────
+# Multiphase (interFoam, compressibleInterFoam, etc.) is reserved for a later phase.
+
 # Solvers where pressure is *kinematic* p (m²/s²) — generate 0/p
 P_SOLVERS: set[str] = {
     "simpleFoam",
     "pimpleFoam",
-    "icoFoam",
     "rhoSimpleFoam",
     "rhoPimpleFoam",
 }
 
 # Solvers where pressure is p_rgh (Pa relative) — generate 0/p_rgh + constant/g
 P_RGH_SOLVERS: set[str] = {
-    "interFoam",
-    "interIsoFoam",
-    "compressibleInterFoam",
-    "compressibleInterIsoFoam",
-    "compressibleMultiphaseInterFoam",
+    "buoyantSimpleFoam",
+    "buoyantPimpleFoam",
 }
 
 # Solvers that solve the energy equation and MUST have 0/T
 ENERGY_SOLVERS: set[str] = {
     "rhoSimpleFoam",
     "rhoPimpleFoam",
-    "compressibleInterFoam",
-    "compressibleInterIsoFoam",
-    "compressibleMultiphaseInterFoam",
+    "buoyantSimpleFoam",
+    "buoyantPimpleFoam",
 }
 
 # Solvers that require constant/g (gravity vector)
@@ -169,36 +167,24 @@ def _is_cryogenic_boiling(validated_config: dict[str, Any]) -> bool:
 
 def _heuristic_fallback(validated_config: dict[str, Any]) -> str:
     """Pure-logic fallback when the LLM response is unparseable or invalid."""
-    # Cryogenic boiling → two-phase solver
-    if _is_cryogenic_boiling(validated_config):
-        logger.warning("[SOLVER_SELECT] Heuristic: cryogenic boiling detected → compressibleInterFoam")
-        return "compressibleInterFoam"
-
     f = _extract_flags(validated_config)
 
-    if f["multiphase"] or f["n_phases"] > 1:
-        if f["n_phases"] > 2:
-            return "compressibleMultiphaseInterFoam"
-        if f["compressible"] or f["heat"]:
-            return "compressibleInterFoam"
-        return "interFoam"
-
     # Cryogenic single-phase liquid (LH2, LN2, LOX, LHe, etc.) → always use rho* solver.
-    # Even without explicit heat transfer, cryogenic fluids have density strongly coupled
-    # to temperature.  icoPolynomial EOS in rhoSimpleFoam/rhoPimpleFoam handles this
-    # correctly; simpleFoam/pimpleFoam treat density as constant, which is wrong for
-    # cryogens where ΔT of even a few K can change density by 5-10%.
-    if _is_cryogenic_liquid(validated_config) and not (f["multiphase"] or f["n_phases"] > 1):
+    if _is_cryogenic_liquid(validated_config):
         logger.warning("[SOLVER_SELECT] Heuristic: cryogenic liquid → rho* solver (density-temperature coupling)")
         return "rhoPimpleFoam" if f["transient"] else "rhoSimpleFoam"
 
+    # Buoyancy-driven / natural convection: heat transfer + incompressible
+    if f["heat"] and not f["compressible"]:
+        logger.info("[SOLVER_SELECT] Heuristic: heat transfer + incompressible → buoyant solver")
+        return "buoyantPimpleFoam" if f["transient"] else "buoyantSimpleFoam"
+
+    # Compressible with heat (high-speed)
     if f["heat"] or f["compressible"]:
         return "rhoPimpleFoam" if f["transient"] else "rhoSimpleFoam"
 
     if not f["transient"]:
         return "simpleFoam"
-    if f["laminar"]:
-        return "icoFoam"
     return "pimpleFoam"
 
 
@@ -211,85 +197,69 @@ You are an expert OpenFOAM solver engineer. Your ONLY job is to select the
 single most appropriate OpenFOAM solver from the allowed list below.
 
 ══════════════════════════════════════════════════════════════
-ALLOWED SOLVERS (return EXACTLY one of these names, or null for phase-change):
-  simpleFoam
-  pimpleFoam
-  icoFoam
-  rhoSimpleFoam
-  rhoPimpleFoam
-  interFoam
-  interIsoFoam
-  compressibleInterFoam
-  compressibleInterIsoFoam
-  compressibleMultiphaseInterFoam
+ALLOWED SOLVERS — return EXACTLY one of these names (or null for unsupported cases):
+
+  # No heat transfer, incompressible
+  simpleFoam        — steady-state, standard industrial flows (pipes, ducts, external aero)
+  pimpleFoam        — transient, vortex shedding, moving mesh, pulsating flow
+
+  # High-speed compressible with heat (Mach > 0.3)
+  rhoSimpleFoam     — compressible steady-state, high-speed aerodynamics
+  rhoPimpleFoam     — compressible transient, pressure waves, acoustics
+
+  # Buoyancy-driven (natural/forced convection, gravity-dominated, HVAC)
+  buoyantSimpleFoam — buoyancy steady-state, heated rooms, HVAC, electronic cooling
+  buoyantPimpleFoam — buoyancy transient, smoke spread, fire, ventilation transients
+
+NOTE: Multiphase (interFoam, compressibleInterFoam, etc.) is NOT currently supported.
+If the case requires two or more phases, set solver to null and warn the user.
 ══════════════════════════════════════════════════════════════
 
 ──────────────────────────────────────────────────────────────
 DECISION RULES — apply strictly in this order
 ──────────────────────────────────────────────────────────────
 
-## 1. Phase-change, boiling, cavitation, evaporation, condensation, flash
-Any mention of:
-  - boiling, nucleate boiling, film boiling, pool boiling
-  - cavitation, bubble collapse, vapour pocket
-  - evaporation, condensation, flash evaporation
-  - liquid that becomes gas (or vice-versa) due to pressure or temperature
-  - refrigerant, steam generation, two-phase heat pipe
-  - cryogenic liquid (LN2, LH2, LOX) heated significantly above its boiling point
-    (e.g. LN2 boils at 77 K; a 400 K wall will cause boiling)
-→ DO NOT map to a single-phase solver.
-→ Set solver to null and add a clear warning explaining why.
-→ If the user still needs a best-effort approximation, suggest compressibleInterFoam
-  in the warnings (two-phase: liquid + vapour) with a note that phase-change physics
-  are not modelled.
+## 1. Unsupported cases — set solver to null
+Any of the following → set solver to null with a clear warning:
+  - Multiphase / two-phase flows (water + air, oil + water, VOF interface)
+  - Phase change: boiling, cavitation, evaporation, condensation, flashing
+  - Moving fluid-front / filling / air-displacement scenarios
+  - Cryogenic liquid heated above its boiling point (phase change)
 
-## 2. Number of phases
-Count distinct fluid materials:
-  - One fluid only                                          → single-phase path (§3)
-  - Two immiscible fluids (water + air, oil + water,
-    liquid + gas but NO phase change)                      → two-phase path (§4)
-  - Three or more distinct fluids                          → compressibleMultiphaseInterFoam
+## 2. Single-phase path — Buoyancy / Natural Convection (CHECK FIRST for heat cases)
+Apply when ALL of:
+  - Heat transfer is active
+  - Single-phase only
+  - Low-speed (Mach < 0.3)
+  - Gravity matters: natural convection, heated room, HVAC, chimney, solar collector,
+    electronic cooling, smoke spread, density stratification, buoyancy-driven flow
 
-## 3. Single-phase path
-Compressible signals (any one is sufficient):
-  - Mach number > 0.3, high-speed, supersonic, transonic, shock
-  - Density varies significantly with pressure
-  - User says "compressible" or names rhoSimpleFoam/rhoPimpleFoam
-  - Gas at high pressure differential (> ~10% of absolute pressure)
-  - ⚠ Cryogenic liquid (LH2, LN2, LOX, LHe, LAr — boiling point < 130 K):
-      ALWAYS treat as compressible, even without explicit heat transfer.
-      Reason: density is strongly coupled to temperature (icoPolynomial EOS required).
-      ΔT of a few K changes density by 5–10% — incompressible assumption breaks down.
-      → rhoSimpleFoam (steady) or rhoPimpleFoam (transient)
+  Steady-state  → buoyantSimpleFoam
+  Transient     → buoyantPimpleFoam
 
-Incompressible signals:
-  - Liquid at MODERATE conditions (water, oil, glycol — NOT cryogenic), Mach < 0.1, HVAC
-  - Density constant or nearly constant
+## 3. Single-phase — High-speed Compressible (gravity not dominant)
+Compressible signals (any one):
+  - Mach > 0.3, supersonic, transonic, shock
+  - Density varies significantly with pressure or temperature
+  - Gas at large pressure differential (> ~10% of absolute)
+  - ⚠ Cryogenic liquid (LH2, LN2, LOX, LHe — boiling point < 130 K):
+      ALWAYS compressible; icoPolynomial EOS required.
 
-If compressible:
   Steady-state  → rhoSimpleFoam
   Transient     → rhoPimpleFoam
 
-If incompressible:
-  Steady + turbulent or laminar  → simpleFoam
-  Transient + laminar            → icoFoam
-  Transient + turbulent          → pimpleFoam
+## 4. Single-phase incompressible, no heat transfer
+  - Liquid at moderate conditions (water, oil, glycol — NOT cryogenic)
+  - Density constant, Mach < 0.1, no temperature gradients
 
-## 4. Two-phase path (immiscible, no phase change)
-If at least one phase is compressible OR heat transfer is significant:
-  Use compressibleInterIsoFoam when: sharp interface, isoAdvector, fast impact, thin film.
-  Otherwise: compressibleInterFoam
-
-If both phases incompressible and heat transfer negligible:
-  Use interIsoFoam when: sharp interface, isoAdvector, fast impact, thin film.
-  Otherwise: interFoam
+  Steady-state  → simpleFoam
+  Transient     → pimpleFoam
 
 ## 5. Steady vs transient
-Steady signals: "steady", "RANS", "converge", "time-averaged", "mean flow"
-Transient signals: "transient", "unsteady", "time-varying", "oscillating",
-  "pulsating", "start-up", "filling", "sloshing", "impact"
-When ambiguous + single-phase: default to steady.
-When ambiguous + two-phase: default to transient.
+Steady: "steady", "RANS", "converge", "time-averaged", "mean flow"
+Transient: "transient", "unsteady", "time-varying", "oscillating", "pulsating",
+  "start-up", "smoke spread", "moving parts", "ventilation transient"
+When ambiguous: default to steady.
 
 ──────────────────────────────────────────────────────────────
 OUTPUT FORMAT — return ONLY valid JSON, no other text
@@ -403,9 +373,9 @@ class SolverSelector:
                             + "".join(f"  WARNING: {w}\n" for w in warnings)
                             + f"{'='*70}\n"
                         )
-                        # Use compressibleInterFoam as best-effort approximation
+                        # Phase-change case: multiphase support not yet available; use best heuristic
                         if llm_solver not in ALLOWED_SOLVERS:
-                            llm_solver = "compressibleInterFoam"
+                            llm_solver = _heuristic_fallback(validated_config)
 
                     if llm_solver in ALLOWED_SOLVERS:
                         logger.info(
@@ -539,7 +509,7 @@ class SolverSelector:
                     f"  ⚠ A SINGLE-PHASE SOLVER (rhoPimpleFoam, rhoSimpleFoam) CANNOT MODEL THIS CORRECTLY"
                 )
                 analysis_lines.append(
-                    f"  ⚠ REQUIRED: compressibleInterFoam (two-phase: liquid + vapour)"
+                    f"  ⚠ PHASE CHANGE DETECTED: multiphase solvers not yet supported"
                 )
         elif delta_t > 0:
             analysis_lines.append(f"  BC temperature range: {t_min_bc} K – {t_max_bc} K (ΔT = {delta_t:.1f} K)")

@@ -34,6 +34,52 @@ def _json_safe(v: Any) -> Any:
 # Fetchers
 # ---------------------------------------------------------------------------
 
+async def upsert_simulation_config(
+    simulation_id: str,
+    physics: dict[str, Any],
+    solver: dict[str, Any],
+    fluid: dict[str, Any],
+    turbulence: dict[str, Any],
+    derived: dict[str, Any] | None = None,
+) -> None:
+    """Write the normalised simulation config directly into the simulation_config table.
+
+    Called by the orchestrator right after lint + solver selection so the chat
+    service can read it immediately — without depending on the frontend to relay
+    the simulation_config_ready event.
+
+    turbulence must be empty ({}) for laminar flows.
+    """
+    try:
+        async with get_session() as session:
+            await session.execute(
+                text("""
+                    INSERT INTO simulation_config
+                        (simulation_id, cfd_physics, cfd_solver, cfd_fluid, cfd_turbulence, cfd_derived)
+                    VALUES
+                        (:sid, :physics::jsonb, :solver::jsonb, :fluid::jsonb,
+                         :turbulence::jsonb, :derived::jsonb)
+                    ON CONFLICT (simulation_id) DO UPDATE SET
+                        cfd_physics    = EXCLUDED.cfd_physics,
+                        cfd_solver     = EXCLUDED.cfd_solver,
+                        cfd_fluid      = EXCLUDED.cfd_fluid,
+                        cfd_turbulence = EXCLUDED.cfd_turbulence,
+                        cfd_derived    = EXCLUDED.cfd_derived
+                """),
+                {
+                    "sid":       simulation_id,
+                    "physics":   json.dumps(physics),
+                    "solver":    json.dumps(solver),
+                    "fluid":     json.dumps(fluid),
+                    "turbulence": json.dumps(turbulence),
+                    "derived":   json.dumps(derived or {}),
+                },
+            )
+        logger.info(f"[chat/db] upsert_simulation_config OK — sim={simulation_id}")
+    except Exception as exc:
+        logger.warning(f"[chat/db] upsert_simulation_config failed: {exc}")
+
+
 async def fetch_simulation_config(simulation_id: str) -> dict[str, Any]:
     """Fetch cfd_physics, cfd_solver, cfd_fluid, cfd_turbulence from simulation_config."""
     try:

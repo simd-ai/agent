@@ -600,7 +600,8 @@ BOUNDARY_PLAN_TOOL_SCHEMA = types.Tool(
                             "Physical simulation end time in seconds. "
                             "When time_scheme='transient': extract from the user request if stated "
                             "(e.g. '2s' → 2.0, '0.5 seconds' → 0.5); if not stated, leave null "
-                            "(the system will default to 5.0 s). Null for steady simulations."
+                            "(the system will default to 5.0 s). Null for steady simulations. "
+                            "Note: end times above 10 s are automatically capped to 10 s."
                         ),
                     ),
                     "patches": types.Schema(
