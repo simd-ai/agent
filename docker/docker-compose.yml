@@ -1,0 +1,82 @@
+# ══════════════════════════════════════════════════════════════
+# SIMD Agent — Full Stack
+# ══════════════════════════════════════════════════════════════
+# Usage:
+#   docker compose -f docker/docker-compose.yml up -d
+#
+# Requires .env in the repo root (copy from .env.example).
+# The install.sh script generates this automatically.
+# ══════════════════════════════════════════════════════════════
+
+services:
+  # ── Postgres ─────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: simd
+      POSTGRES_PASSWORD: simd
+      POSTGRES_DB: simd
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U simd"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── SIMD Agent (backend API) ─────────────────────────────────
+  agent:
+    build:
+      context: ..
+      dockerfile: docker/agent.Dockerfile
+    env_file: ../.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://simd:simd@postgres:5432/simd
+      SIMULATION_SERVER_URL: http://runner:8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - agent-storage:/app/storage
+      - agent-progress:/tmp/simd_progress
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Frontend (Next.js) ───────────────────────────────────────
+  frontend:
+    build:
+      context: ../ui
+      dockerfile: ../docker/frontend.Dockerfile
+      args:
+        NEXT_PUBLIC_AGENT_URL: http://localhost:8000
+        NEXT_PUBLIC_AGENT_WS_URL: ws://localhost:8000
+        NEXT_PUBLIC_AUTH_DISABLED: "true"
+    env_file: ../.env
+    environment:
+      # Server-side env vars (not inlined at build time)
+      DATABASE_URL: postgresql://simd:simd@postgres:5432/simd
+    ports:
+      - "3000:3000"
+    depends_on:
+      - agent
+    restart: unless-stopped
+
+  # ── OpenFOAM Runner ──────────────────────────────────────────
+  runner:
+    build:
+      context: ../simulation_server
+      dockerfile: ../docker/runner.Dockerfile
+    volumes:
+      - runner-data:/tmp/simd-runs
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  agent-storage:
+  agent-progress:
+  runner-data:

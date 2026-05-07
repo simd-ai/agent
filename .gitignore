@@ -1,0 +1,13 @@
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+.env
+vir/
+vir312/
+.DS_Store
+/storage/
+skills-lock.json
+*-gcs-key.json
+*-service-account.json
+test_meshes/
+*.msh

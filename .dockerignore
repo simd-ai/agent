@@ -1,0 +1,34 @@
+# Cached simulation data (500MB+)
+storage/
+
+# Environment and secrets
+.env
+*-gcs-key.json
+*-service-account.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+vir/
+vir312/
+
+# Git
+.git/
+.gitignore
+
+# Dev files
+tests/
+scripts/
+.DS_Store
+CLAUDE.md
+skills-lock.json
+
+# Frontend (built separately)
+ui/
+
+# Docker
+docker/
