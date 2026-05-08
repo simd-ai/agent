@@ -1082,6 +1082,7 @@ class Orchestrator:
                 # Use the Gemini model to diagnose the error with full context:
                 # all generated files + error output.  The diagnosis is fed back
                 # into the next generation call as error context.
+                await self.event_bus.emit_diagnosing()
                 await self.event_bus.emit_thinking_started("Diagnosing failure…")
                 try:
                     _diag = await self.error_summarizer.summarize(

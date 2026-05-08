@@ -387,7 +387,7 @@ def _mesh_quality_decisions(
     }
 
     if check_mesh is None:
-        logger.info("[MESH_QUALITY] check_mesh is None → tier='unknown', using PBiCGStab (conservative)")
+        logger.info("[MESH_QUALITY] check_mesh is None → tier='unknown', non-GAMG fallback (conservative)")
         return defaults
 
     # Extract metrics — support both dict and Pydantic model
@@ -404,7 +404,7 @@ def _mesh_quality_decisions(
 
     # If no real data (all None or all zero), return conservative defaults
     if not non_ortho and not skew and not aspect:
-        logger.info("[MESH_QUALITY] All metrics are None/0 → tier='unknown', using PBiCGStab (conservative)")
+        logger.info("[MESH_QUALITY] All metrics are None/0 → tier='unknown', non-GAMG fallback (conservative)")
         return defaults
 
     non_ortho = non_ortho or 0.0

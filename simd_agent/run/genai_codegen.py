@@ -3317,10 +3317,12 @@ class GenAICodeGenerator:
                     f"With deltaT={cs.delta_t} and endTime={end_time_fmt} that is already {n_steps} steps — "
                     f"making it smaller (e.g. 0.0001) would multiply the runtime by 10x with no benefit.\n"
                     f"- writeControl: adjustableRunTime  (pair with adjustTimeStep)\n"
-                    f"- writeInterval: {cs.end_time / 10 if cs.end_time > 0 else 0.1}  (write ~10 snapshots)\n"
+                    f"- writeInterval: {cs.end_time / 30 if cs.end_time > 0 else 0.1}  (write ~30 snapshots)\n"
                 )
             else:
-                adjust_note = ""
+                wi = int(cs.end_time / 20) if cs.end_time > 0 else 100
+                wi = max(wi, 1)
+                adjust_note = f"- writeInterval: {wi}  (write ~20 snapshots)\n"
             return (
                 f"## controlDict guidance\n"
                 f"- application: {cs.solver}\n"
@@ -3693,6 +3695,12 @@ class GenAICodeGenerator:
         # Some plugins (e.g. simpleFoam) build certain files deterministically
         # in validate() — they are NOT in plugin.required_files().  Regenerating
         # them via LLM is wasted compute since validate() will discard the result.
+        #
+        # HOWEVER: if a deterministic file is the ONLY affected file (the error
+        # points exclusively at it), filtering it out leaves only generic files
+        # like controlDict — the self-healing loop can never fix the real issue.
+        # In that case, we must still regenerate OTHER files that could influence
+        # the solver behavior, rather than leaving the loop stuck.
         try:
             from simd_agent.solvers import get_registry as _gr
             _plug = _gr().get(solver)
@@ -3709,7 +3717,25 @@ class GenAICodeGenerator:
                     f"[PARALLEL] Skipping LLM regen for deterministic files: "
                     f"{sorted(_deterministic)}"
                 )
-                affected -= _deterministic
+                # Check if removing deterministic files would leave us with
+                # ONLY system/controlDict or nothing meaningful — that means
+                # the real problem IS in the deterministic builder and
+                # regenerating controlDict alone won't help.
+                _remaining = affected - _deterministic - {
+                    f for f in affected if f.startswith("__surgical:")
+                }
+                if _remaining <= {"system/controlDict"} or not _remaining:
+                    logger.warning(
+                        f"[PARALLEL] Deterministic files {sorted(_deterministic)} "
+                        f"are the primary error targets but are built by the "
+                        f"plugin validator, not the LLM.  Regenerating ALL "
+                        f"LLM-owned files to give the validator fresh input."
+                    )
+                    # Regenerate all plugin-required files so the validator
+                    # gets a fresh set to rebuild deterministic files from.
+                    affected = set(build_required_files_list(solver, validated_config))
+                else:
+                    affected -= _deterministic
 
         logger.info(f"[PARALLEL] Affected files identified from error: {sorted(affected)}")
         return sorted(affected)

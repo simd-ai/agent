@@ -105,6 +105,16 @@ async def integrity_error_handler(request: Request, exc: IntegrityError):
         return JSONResponse(status_code=404, content={"detail": "Referenced resource was deleted"})
     raise exc
 
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """Return a proper JSONResponse for unhandled errors so CORS headers are added."""
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
 # ── API routers (backend is system of record) ───────────────────────────
 from simd_agent.api.users import router as users_router
 from simd_agent.api.simulations import router as simulations_router
@@ -114,6 +124,7 @@ from simd_agent.api.meshes import router as meshes_router
 from simd_agent.api.chat import router as chat_router
 from simd_agent.api.precheck_lint import router as precheck_lint_router
 from simd_agent.api.snapshot import router as snapshot_router
+from simd_agent.api.reports import router as reports_router
 
 app.include_router(users_router)
 app.include_router(simulations_router)
@@ -123,6 +134,7 @@ app.include_router(meshes_router)
 app.include_router(chat_router)
 app.include_router(precheck_lint_router)
 app.include_router(snapshot_router)
+app.include_router(reports_router)
 
 # Mount mesh routes (if available) — mesh files are served from GCS
 if MESH_ENABLED:

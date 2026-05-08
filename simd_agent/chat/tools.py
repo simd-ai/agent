@@ -2479,6 +2479,11 @@ async def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dic
             "U_magnitude", "wallShearStress_magnitude",
         }
 
+        # Derived/internal fields — only shown in expert reports.
+        _DERIVED_FIELDS = {"nut", "alphat", "p_rgh", "phi", "meshPhi", "nuTilda", "mut"}
+        if report_type == "standard":
+            _SKIP_FIELDS = _SKIP_FIELDS | _DERIVED_FIELDS
+
         for fdata in display_fields:
             fname = fdata.get("name") or fdata.get("field") or ""
             if not fname or fname in _SKIP_FIELDS:

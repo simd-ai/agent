@@ -556,6 +556,13 @@ class EventBus:
             persist=False,
         )
 
+    async def emit_diagnosing(self) -> AgentEvent:
+        """Signal frontend: analysing failure before retry."""
+        return await self.emit_info(
+            EventTypes.DIAGNOSING,
+            "Diagnosing simulation failure",
+        )
+
     async def emit_error_summary(
         self,
         root_cause: str,

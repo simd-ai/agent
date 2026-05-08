@@ -770,7 +770,7 @@ class CFDLinter:
                     f"aspect={config.mesh.check_mesh.max_aspect_ratio}"
                 )
             else:
-                logger.info("[LINTER] No checkMesh data on config.mesh → solver will use 'unknown' tier (PBiCGStab)")
+                logger.info("[LINTER] No checkMesh data on config.mesh → solver will use 'unknown' tier (GAMG default)")
             validated["mesh"] = _mesh_dict
         
         # Add turbulence config — carries pre-computed k/omega/epsilon/nut initial values

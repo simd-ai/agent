@@ -40,13 +40,13 @@ Only use names from these tables. Any other name causes a fatal IO error at runt
 
 | Parameter | Typical value | Effect |
 |---|---|---|
-| `nOuterCorrectors` | 1–3 | Outer PIMPLE iterations per time step. 1 = pure PISO (explicit). 2–3 allows larger deltaT. |
-| `nCorrectors` | 1–3 | Inner pressure-velocity corrector iterations. 2 is standard. |
-| `nNonOrthogonalCorrectors` | 1–2 | Extra pressure solves for non-orthogonal meshes. 1 is the safe default, 2 for highly skewed. |
+| `nOuterCorrectors` | 1-3 | Outer PIMPLE iterations per time step. 1 = pure PISO (explicit). 2-3 allows larger deltaT. |
+| `nCorrectors` | 1-3 | Inner pressure-velocity corrector iterations. 2 is standard. |
+| `nNonOrthogonalCorrectors` | 1-2 | Extra pressure solves for non-orthogonal meshes. 1 is the safe default, 2 for highly skewed. |
 | `momentumPredictor` | yes/no | `yes` for high Re; `no` for very low Re or if diverging |
 
 With `nOuterCorrectors > 1`, under-relaxation (< 1) is applied each outer iteration.
-With `nOuterCorrectors 1`, relaxation factors should be `1` (no under-relaxation needed).
+With `nOuterCorrectors 1` (pure PISO), relaxation factors should be `1` (no under-relaxation needed).
 
 ## Relaxation factors
 
@@ -58,6 +58,15 @@ relaxationFactors { equations { ".*" 1; } }
 relaxationFactors { equations { U 0.7; ".*" 0.7; } }
 ```
 
+## Pressure solver selection (handled by validator)
+
+The validator selects the pressure solver based on mesh quality:
+- **Good/moderate mesh** (non-ortho < 50 deg): GAMG with GaussSeidel + coarsestLevelCorr PBiCGStab+DIC
+- **Poor/unknown mesh** (non-ortho >= 50 deg): PBiCGStab with DIC preconditioner
+
+GAMG crashes in `GAMGSolver::scale` on non-orthogonal meshes because coarse-level
+agglomeration creates degenerate matrices. PBiCGStab+DIC is slower but always stable.
+
 ## HARD RULES — no compressible contamination
 
 - **NEVER add a `rho` solver entry** — pimpleFoam has no rho equation.
@@ -65,67 +74,33 @@ relaxationFactors { equations { U 0.7; ".*" 0.7; } }
 - **NEVER use `transonic yes`** — transonic flag is for compressible solvers only.
 - Turbulence regex MUST only include fields that are actually generated. For laminar: just `U`. For turbulent: build from active fields only (k+omega OR k+epsilon — never both).
 
-## Template A — Laminar
+## residualControl — CRITICAL format
 
+PIMPLE's `pimpleControl` REQUIRES each residualControl entry to be a **sub-dictionary**:
 ```
-solvers
+residualControl
 {
-    p
-    {
-        solver          GAMG;
-        smoother        GaussSeidel;
-        tolerance       1e-06;
-        relTol          0.01;
-    }
-    pFinal
-    {
-        $p;
-        relTol          0;
-    }
-
-    U
-    {
-        solver          smoothSolver;
-        smoother        symGaussSeidel;
-        tolerance       1e-06;
-        relTol          0.1;
-    }
-    UFinal
-    {
-        solver          smoothSolver;
-        smoother        symGaussSeidel;
-        tolerance       1e-06;
-        relTol          0;
-    }
-}
-
-PIMPLE
-{
-    nOuterCorrectors    2;
-    nCorrectors         2;
-    nNonOrthogonalCorrectors 1;
-    momentumPredictor   yes;
-
-    // CRITICAL: each entry MUST be a sub-dictionary — NOT a plain scalar.
-    // Plain scalars (p 1e-4;) crash with:
-    //   "Residual data for p must be specified as a dictionary"
-    residualControl
-    {
-        U   { tolerance 1e-4; relTol 0; }
-        p   { tolerance 1e-4; relTol 0; }
-    }
-}
-
-relaxationFactors
-{
-    equations { U 0.7; ".*" 0.7; }
+    U   { tolerance 1e-4; relTol 0; }
+    p   { tolerance 1e-4; relTol 0; }
 }
 ```
 
-## Template B — Turbulent (kOmegaSST / kEpsilon)
+**NEVER use plain scalars** like `p 1e-4;` — they crash with:
+`"Residual data for p must be specified as a dictionary"`
 
-Adjust the regex to match the active turbulence model — k+omega for kOmegaSST, k+epsilon for kEpsilon.
-`$p` alias is safe here because `p` is a plain (non-regex) key.
+This is different from SIMPLE, which accepts plain scalars.
+
+## pFinal / UFinal blocks — CRITICAL
+
+PIMPLE solvers need `Final` solver entries for the last outer corrector iteration.
+`$p` alias is safe because `p` is a plain (non-regex) key.
+**NEVER use `$"(U|k|omega)"` syntax** — OpenFOAM cannot dereference regex-named entries via `$`.
+Repeat solver settings explicitly in Final blocks.
+
+**Note**: fvSolution is generated deterministically by the validator — not by the LLM.
+Any LLM-generated version is replaced.
+
+## Complete template — Turbulent (kOmegaSST)
 
 ```
 solvers
@@ -140,7 +115,7 @@ solvers
         coarsestLevelCorr
         {
             solver          PBiCGStab;
-            preconditioner  none;
+            preconditioner  DIC;
             tolerance       1e-9;
             relTol          0;
         }
@@ -151,20 +126,18 @@ solvers
         relTol          0;
     }
 
-    // kOmegaSST: "(U|k|omega)"   kEpsilon: "(U|k|epsilon)"
     "(U|k|omega)"
     {
         solver          smoothSolver;
         smoother        symGaussSeidel;
-        tolerance       1e-06;
+        tolerance       1e-05;
         relTol          0.1;
     }
-    // Repeat settings explicitly — do NOT use $U (no plain 'U' key to dereference)
     "(U|k|omega)Final"
     {
         solver          smoothSolver;
         smoother        symGaussSeidel;
-        tolerance       1e-6;
+        tolerance       1e-06;
         relTol          0;
     }
 }
@@ -176,9 +149,6 @@ PIMPLE
     nNonOrthogonalCorrectors 1;
     momentumPredictor   yes;
 
-    // CRITICAL: each entry MUST be a sub-dictionary — NOT a plain scalar.
-    // Plain scalars (p 1e-4;) crash with:
-    //   "Residual data for p must be specified as a dictionary"
     residualControl
     {
         U   { tolerance 1e-4; relTol 0; }
@@ -192,4 +162,7 @@ relaxationFactors
 }
 ```
 
-Note: `pFinal { $p; relTol 0; }` alias is valid — `p` is a plain key. Do NOT use `$"(U|k|omega)"` syntax for regex keys (OpenFOAM cannot dereference regex-named entries via `$`).
+## 2D / 3D notes
+
+- No structural changes to fvSolution for 2D vs 3D — same algorithm, solvers, and relaxation
+- `pRefCell 0; pRefValue 0;` — include in PIMPLE block when no fixedValue pressure BC exists

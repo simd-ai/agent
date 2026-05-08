@@ -9,7 +9,7 @@ stopAt          endTime;
 endTime         <end_time_seconds>;  // physical seconds
 deltaT          <delta_t_seconds>;   // physical time step (e.g. 0.01 or 0.1)
 writeControl    adjustableRunTime;
-writeInterval   1;                   // write every N seconds of physical time
+writeInterval   <writeInterval>;     // endTime / 30 → ~30 snapshots (in seconds)
 adjustTimeStep  yes;
 maxCo           0.5;                 // Courant number limit — 0.5 for buoyant cases
 maxDeltaT       0.1;                 // upper bound on automatic time-step growth

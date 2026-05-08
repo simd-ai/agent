@@ -16,6 +16,7 @@ from simd_agent.repositories.chat_repo import ChatRepository
 from simd_agent.repositories.precheck_repo import PrecheckRepository
 from simd_agent.repositories.lint_repo import LintRepository
 from simd_agent.repositories.progress_repo import ProgressRepository
+from simd_agent.repositories.report_repo import ReportRepository
 
 from simd_agent.services.user_service import UserService
 from simd_agent.services.simulation_service import SimulationService
@@ -35,6 +36,7 @@ chat_repo = ChatRepository()
 precheck_repo = PrecheckRepository()
 lint_repo = LintRepository()
 progress_repo = ProgressRepository()
+report_repo = ReportRepository()
 
 # ── Service instances ────────────────────────────────────────────────────
 user_service = UserService(user_repo)

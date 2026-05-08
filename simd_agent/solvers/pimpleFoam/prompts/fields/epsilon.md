@@ -1,16 +1,50 @@
 # pimpleFoam — 0/epsilon
 
-**Dimensions**: `[0 2 -3 0 0 0 0]` (m²/s³)
+**Dimensions**: `[0 2 -3 0 0 0 0]` (m^2/s^3)
+
+## internalField
 
 Use `CaseSpec.turbulence_initial_values.epsilon` when available.
-Formula: `ε = Cμ^0.75 × k^1.5 / L`, Cμ = 0.09.
+Formula: `epsilon = Cmu^0.75 * k^1.5 / L` where Cmu = 0.09.
 
 ## BC types
 
-| Patch | BC type |
+| Patch role | BC type |
 |---|---|
 | inlet | `fixedValue` |
-| outlet | `zeroGradient` |
+| outlet | `inletOutlet` | `inletValue uniform <epsilon_value>` — prevents negative epsilon from backflow |
 | wall | `epsilonWallFunction` |
 | symmetry | `symmetry` |
-| empty (2D) | `empty` |
+| symmetryPlane | `symmetryPlane` |
+| empty (2D planar) | `empty` — no `value`, just `type empty;` |
+| wedge (2D axi) | `wedge` — no `value`, just `type wedge;` |
+
+```
+internalField   uniform <epsilon_value>;
+
+boundaryField
+{
+    inlet
+    {
+        type            fixedValue;
+        value           uniform <epsilon_value>;
+    }
+    outlet
+    {
+        type            inletOutlet;
+        inletValue      uniform <epsilon_value>;
+        value           uniform <epsilon_value>;
+    }
+    walls
+    {
+        type            epsilonWallFunction;
+        value           uniform <epsilon_value>;
+    }
+}
+```
+
+## Critical rules
+
+- `epsilon` MUST be >= 1e-6 — values below this cause division-by-zero in turbulence model
+- Formula: `epsilon = Cmu^0.75 * k^1.5 / L` with Cmu = 0.09
+- Outlet MUST use `inletOutlet` (not `zeroGradient`) to prevent negative epsilon from backflow -> SIGFPE

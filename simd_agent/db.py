@@ -404,6 +404,19 @@ async def init_db() -> None:
             )
         """))
 
+        # ── Simulation Reports ────────────────────────────────────────────
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS simulation_reports (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                simulation_id UUID NOT NULL REFERENCES simulations(id) ON DELETE CASCADE,
+                run_id UUID REFERENCES runs(id) ON DELETE SET NULL,
+                report_type TEXT NOT NULL DEFAULT 'standard',
+                file_name TEXT NOT NULL,
+                storage_key TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+
         # ── Migrations: add columns that may be missing on older tables ──
         # (CREATE TABLE IF NOT EXISTS won't alter an existing table)
         await _ensure_columns(conn)
@@ -435,6 +448,9 @@ async def init_db() -> None:
         ))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_lint_reports_simulation ON lint_reports(simulation_id)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_reports_simulation ON simulation_reports(simulation_id)"
         ))
 
 

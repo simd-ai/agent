@@ -689,6 +689,7 @@ class EventTypes:
     THINKING_COMPLETE = "thinking_complete"
 
     # Self-healing
+    DIAGNOSING = "diagnosing"
     ERROR_SUMMARY = "error_summary"
     RETRYING = "retrying"
     SIM_PROGRESS_RESET = "sim_progress_reset"  # emitted before retry; tells frontend to clear residuals

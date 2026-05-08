@@ -12,7 +12,7 @@ endTime         <max_iterations>;   // INTEGER — e.g. 1000, never 1000.0
 deltaT          1;
 
 writeControl    runTime;
-writeInterval   <writeInterval>;    // from CaseSpec (default 100)
+writeInterval   <writeInterval>;    // endTime / 20 → ~20 snapshots
 purgeWrite      0;
 
 writeFormat     ascii;

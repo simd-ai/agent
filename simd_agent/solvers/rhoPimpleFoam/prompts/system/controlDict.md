@@ -35,7 +35,7 @@ deltaT          <delta_t>;   // replace with 1e-5 for cryogenic cases (see rules
 endTime         <end_time>;
 
 writeControl    timeStep;
-writeInterval   <write_interval>;
+writeInterval   <write_interval>;   // endTime / 30 → ~30 snapshots
 
 runTimeModifiable true;
 

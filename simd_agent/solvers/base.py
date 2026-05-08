@@ -939,9 +939,31 @@ class SolverPlugin(ABC):
         )
 
         # ── Pressure solver ──────────────────────────────────────────────
-        use_gamg = tier == "good" or (tier == "moderate" and non_ortho < 50)
-        logger.info(f"[FV_SOLUTION] {self.name}: tier='{tier}', non_ortho={non_ortho}° → pressure solver = {'GAMG' if use_gamg else 'PBiCGStab'}")
+        # Incompressible solvers (simpleFoam, pimpleFoam): the pressure
+        # equation is a symmetric Laplacian → PCG + DIC.
+        # Compressible solvers (rhoSimpleFoam, rhoPimpleFoam): the pressure
+        # equation has asymmetric convective terms (div(phid,p)) →
+        # PBiCGStab + DILU.
+        # Using PBiCGStab (asymmetric) + DIC (symmetric) is WRONG and
+        # causes SIGFPE when the preconditioner encounters asymmetry.
+        # GAMG is the standard OpenFOAM default and works on the vast
+        # majority of meshes.  Only fall back to a direct solver when we
+        # KNOW the mesh quality is poor (non-ortho ≥ 65°, skew ≥ 2,
+        # aspect ≥ 100).  When mesh quality is unknown (no checkMesh
+        # data), GAMG is the safest choice — defaulting to non-GAMG
+        # would mean GAMG is almost never used in practice.
+        use_gamg = tier != "poor"
+        if self.is_compressible:
+            fallback_solver, fallback_precond = "PBiCGStab", "DILU"
+        else:
+            fallback_solver, fallback_precond = "PCG", "DIC"
+        logger.info(
+            f"[FV_SOLUTION] {self.name}: tier='{tier}', non_ortho={non_ortho}° "
+            f"→ pressure solver = {'GAMG' if use_gamg else fallback_solver}"
+        )
         if use_gamg:
+            # Coarsest-level corrector must also respect symmetry:
+            # PCG+DIC for incompressible, PBiCGStab+DILU for compressible.
             p_block = (
                 f"    {pf}\n"
                 "    {\n"
@@ -952,8 +974,8 @@ class SolverPlugin(ABC):
                 f"        relTol          {'0.1' if is_simple else '0.01'};\n"
                 "        coarsestLevelCorr\n"
                 "        {\n"
-                "            solver          PBiCGStab;\n"
-                "            preconditioner  DIC;\n"
+                f"            solver          {fallback_solver};\n"
+                f"            preconditioner  {fallback_precond};\n"
                 "            tolerance       1e-9;\n"
                 "            relTol          0;\n"
                 "        }\n"
@@ -963,8 +985,8 @@ class SolverPlugin(ABC):
             p_block = (
                 f"    {pf}\n"
                 "    {\n"
-                "        solver          PBiCGStab;\n"
-                "        preconditioner  DIC;\n"
+                f"        solver          {fallback_solver};\n"
+                f"        preconditioner  {fallback_precond};\n"
                 "        tolerance       1e-06;\n"
                 f"        relTol          {'0.1' if is_simple else '0.01'};\n"
                 "    }\n"

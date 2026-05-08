@@ -9,7 +9,7 @@ stopAt          endTime;
 endTime         <max_iterations>;   // integer — iteration counter for steady solver
 deltaT          1;                  // steady: 1 (not physical time)
 writeControl    timeStep;
-writeInterval   100;
+writeInterval   <writeInterval>;    // endTime / 20 → ~20 snapshots
 purgeWrite      0;
 writeFormat     ascii;
 writePrecision  6;

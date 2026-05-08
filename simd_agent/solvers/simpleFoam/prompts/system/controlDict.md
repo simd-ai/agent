@@ -30,7 +30,7 @@ runTimeModifiable true;
 - `endTime` MUST be an integer (no decimal point) — e.g. `1000` not `1000.0`
 - `deltaT 1` always for steady-state (each iteration is one "time step")
 - `application simpleFoam;` — must match the solver name exactly
-- `writeInterval`: use `CaseSpec.end_time / 10` or similar to get ~10 snapshots
+- `writeInterval`: use `CaseSpec.end_time / 20` to get ~20 snapshots
 
 ## 2D / 3D notes
 
