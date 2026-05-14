@@ -355,54 +355,10 @@ def validate_generated_files(
                     f"(a0={_a0_fix:.2f}, a1={_a1_fix:.2f}, rho_ref={_rho2} at T={_inlet_t2} K)"
                 )
 
-    # ── Check 3d-turbProps: Deterministically regenerate constant/turbulenceProperties ──
-    # This file is fully determined by sim_type and turbulence_model — never trust the LLM
-    # for it.  The LLM frequently emits wrong content when flow is laminar (e.g. it writes
-    # "simulationType RAS; RAS { RASModel kOmegaSST; }" even when CaseSpec says laminar).
-    if "constant/turbulenceProperties" in fixed_files:
-        _is_laminar_flow = turb_model in ("laminar", "none", "")
-        if _is_laminar_flow:
-            _tp_correct = (
-                "FoamFile\n{\n"
-                "    version     2.0;\n"
-                "    format      ascii;\n"
-                "    class       dictionary;\n"
-                "    object      turbulenceProperties;\n"
-                "}\n"
-                "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
-                "simulationType  laminar;\n\n"
-                "// ************************************************************************* //\n"
-            )
-        else:
-            _ras_or_les = "RAS"
-            _tp_correct = (
-                "FoamFile\n{\n"
-                "    version     2.0;\n"
-                "    format      ascii;\n"
-                "    class       dictionary;\n"
-                "    object      turbulenceProperties;\n"
-                "}\n"
-                "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
-                f"simulationType  {_ras_or_les};\n\n"
-                f"{_ras_or_les}\n{{\n"
-                f"    RASModel        {turb_model};\n"
-                "    turbulence      on;\n"
-                "    printCoeffs     on;\n"
-                "}\n\n"
-                "// ************************************************************************* //\n"
-            )
-        if fixed_files["constant/turbulenceProperties"] != _tp_correct:
-            issues.append(ValidationIssue(
-                "warning", "constant/turbulenceProperties",
-                f"Auto-corrected turbulenceProperties: simulationType={('laminar' if _is_laminar_flow else 'RAS')}, "
-                f"model={turb_model}. LLM output was overwritten deterministically.",
-                fix="turbulenceProperties regenerated deterministically"
-            ))
-            fixed_files["constant/turbulenceProperties"] = _tp_correct
-            logger.info(
-                f"[VALIDATE] Deterministically regenerated turbulenceProperties "
-                f"(laminar={_is_laminar_flow}, model={turb_model})"
-            )
+    # NOTE: Check 3d-turbProps (auto-regen of constant/turbulenceProperties)
+    # was deleted in Phase 4.  The file is now rendered up-front by
+    # ``SolverPlugin._build_turbulence_properties()`` via
+    # ``render_deterministic_files()``; the LLM never sees it.
 
     # ── Check 3e-laminarFields: Strip turbulence fields when flow is laminar ──
     # If CaseSpec correctly set turb_model=laminar but the LLM still generated 0/k,
@@ -519,6 +475,24 @@ def validate_generated_files(
         _is_transient = _cs_solver_props.get(solver, True)
         _canonical_dt = float(config.get("delta_t") or 0.001)
 
+        # Compute function object write interval for transient solvers.
+        # Uses runTime control at 2x the file writeInterval so the convergence
+        # chart gets ~50 data points — enough for trends, not enough to choke
+        # the frontend with 19K+ SVG points.
+        if _is_transient:
+            _solver_cfg = config.get("solver", {}) or {}
+            _cfg_end_time = float(
+                config.get("end_time")
+                or _solver_cfg.get("end_time")
+                or _solver_cfg.get("endTime")
+                or 10.0
+            )
+            _target_snaps = max(30, min(100, int(_cfg_end_time * 10)))
+            _file_write_int = _cfg_end_time / _target_snaps
+            _func_write_int = _file_write_int * 2
+        else:
+            _func_write_int = None  # steady: keep timeStep/1
+
         # Correct deltaT if LLM went below the canonical value
         _dt_match = re.search(r'\bdeltaT\s+([\d.eE+\-]+)\s*;', _ctrl)
         if _dt_match:
@@ -544,10 +518,12 @@ def validate_generated_files(
 
         # Inject adjustTimeStep + maxCo for transient solvers if missing
         if _is_transient and "adjustTimeStep" not in _ctrl:
+            # PIMPLE handles higher Courant numbers via outer corrector loops
+            _fallback_maxco = 2.0 if solver in ("pimpleFoam", "rhoPimpleFoam", "buoyantPimpleFoam") else 0.5
             # Insert after the deltaT line
             _ctrl = re.sub(
                 r'(deltaT\s+[\d.eE+\-]+\s*;)',
-                r'\1\n\nadjustTimeStep  yes;\nmaxCo           0.5;',
+                rf'\1\n\nadjustTimeStep  yes;\nmaxCo           {_fallback_maxco};',
                 _ctrl,
                 count=1,
             )
@@ -559,23 +535,24 @@ def validate_generated_files(
             )
             issues.append(ValidationIssue(
                 "warning", "system/controlDict",
-                "Auto-injected 'adjustTimeStep yes; maxCo 0.5;' — lets OpenFOAM auto-scale "
+                f"Auto-injected 'adjustTimeStep yes; maxCo {_fallback_maxco};' — lets OpenFOAM auto-scale "
                 "deltaT up to the Courant limit so the simulation runs as fast as physics allows.",
-                fix="Added adjustTimeStep + maxCo"
+                fix=f"Added adjustTimeStep + maxCo {_fallback_maxco}"
             ))
-            logger.info("[VALIDATE] Injected adjustTimeStep yes; maxCo 0.5 into controlDict")
+            logger.info(f"[VALIDATE] Injected adjustTimeStep yes; maxCo {_fallback_maxco} into controlDict")
+
+        # Determine solver classification flags (used by fieldMinMax, surfaceFieldValue, volFieldValue)
+        _is_buoyant = solver in ("buoyantSimpleFoam", "buoyantPimpleFoam")
+        _is_multiphase = solver in (
+            "interFoam", "interIsoFoam",
+            "compressibleInterFoam", "compressibleInterIsoFoam",
+            "compressibleMultiphaseInterFoam",
+        )
 
         # ── Inject fieldMinMax function object for convergence monitoring ──
         # Outputs min/max of solved fields each iteration → parsed from run_log
         # events in the orchestrator and forwarded to the frontend as field_ranges.
         if "fieldMinMax" not in _ctrl:
-            # Determine which fields to track based on solver type
-            _is_buoyant = solver in ("buoyantSimpleFoam", "buoyantPimpleFoam")
-            _is_multiphase = solver in (
-                "interFoam", "interIsoFoam",
-                "compressibleInterFoam", "compressibleInterIsoFoam",
-                "compressibleMultiphaseInterFoam",
-            )
             _minmax_fields = ["U"]
             # Pressure field depends on solver
             if _is_buoyant:
@@ -598,14 +575,20 @@ def validate_generated_files(
                 _minmax_fields.append("alpha.water")
             _fields_str = " ".join(_minmax_fields)
 
+            if _func_write_int is not None:
+                _fmm_wctrl = "runTime"
+                _fmm_wint = f"{_func_write_int:.6g}"
+            else:
+                _fmm_wctrl = "timeStep"
+                _fmm_wint = "1"
             _fmm_block = f"""
     fieldMinMax
     {{
         type            fieldMinMax;
         libs            (fieldFunctionObjects);
         fields          ({_fields_str});
-        writeControl    timeStep;
-        writeInterval   1;
+        writeControl    {_fmm_wctrl};
+        writeInterval   {_fmm_wint};
         log             true;
     }}"""
             if "functions" in _ctrl:
@@ -650,6 +633,12 @@ functions
                 # Build one function object per patch — OF2406 requires:
                 # type, libs, writeFields, regionType, name (=patch name),
                 # fields, operation, writeControl, writeInterval, log
+                if _func_write_int is not None:
+                    _sfv_wctrl = "runTime"
+                    _sfv_wint = f"{_func_write_int:.6g}"
+                else:
+                    _sfv_wctrl = "timeStep"
+                    _sfv_wint = "1"
                 _sfv_blocks = ""
                 for _sfv_pn in _sfv_patches:
                     _sfv_blocks += f"""
@@ -662,8 +651,8 @@ functions
         fields          ({_sfv_fields_str});
         operation       areaAverage;
         writeFields     false;
-        writeControl    timeStep;
-        writeInterval   1;
+        writeControl    {_sfv_wctrl};
+        writeInterval   {_sfv_wint};
         log             true;
     }}"""
 
@@ -713,6 +702,12 @@ functions
                 _vol_fields.append(("alpha.water", "volIntegrate"))
 
             # Build one function object per (field, operation) pair
+            if _func_write_int is not None:
+                _vfv_wctrl = "runTime"
+                _vfv_wint = f"{_func_write_int:.6g}"
+            else:
+                _vfv_wctrl = "timeStep"
+                _vfv_wint = "1"
             _vfv_blocks = ""
             for _vf_field, _vf_op in _vol_fields:
                 _safe_name = _vf_field.replace(".", "_")
@@ -725,8 +720,8 @@ functions
         operation       {_vf_op};
         regionType      all;
         writeFields     false;
-        writeControl    timeStep;
-        writeInterval   1;
+        writeControl    {_vfv_wctrl};
+        writeInterval   {_vfv_wint};
         log             true;
     }}"""
 
@@ -869,38 +864,63 @@ functions
                     f"wall_T={_fv_max_wall:.0f}K > inlet_T={_fv_inlet_t or '?'}K"
                 )
 
-    # ── Check 3c2: Enforce EOS ceiling on LLM-generated fvOptions ────────────
-    # If the LLM generated system/fvOptions but chose a max temperature above the
-    # icoPolynomial zero-density point, clamp it.
+    # ── Check 3c2 (Phase 2): clamp LLM's fvOptions.max to resolver's choice ──
+    # The resolver `resolve_fv_options_max` knows the right value (gas:
+    # min(3000, max(BC_T)·1.5); cryogenic: 0.9 × EOS ceiling).  This validator
+    # is now a thin guard that only fires when the LLM picked a value that
+    # would either crash the solver (cryogenic ≥ ceiling) or is clearly
+    # nonphysical (gas > 1.5× the resolver's value).  Replaces the 80-line
+    # branch that used to live here.
     if solver in _FVOPTIONS_ENERGY_SOLVERS and "system/fvOptions" in fixed_files:
-        if _eos_ceiling is not None:
-            _fvo = fixed_files["system/fvOptions"]
-            import re as _re_fvo
-            _max_match = _re_fvo.search(r'\bmax\s+([\d.eE+\-]+)\s*;', _fvo)
-            if _max_match:
-                try:
-                    _llm_max = float(_max_match.group(1))
-                    if _llm_max >= _eos_ceiling:
-                        # Use 0.9× ceiling — same factor as Check 3c3 wall BC clamp
-                        _safe_max = max(_t_floor * 3.0, _eos_ceiling * 0.9)
-                        fixed_files["system/fvOptions"] = _re_fvo.sub(
-                            rf'max             {_safe_max:.0f};',
-                            _fvo,
-                            count=1,
-                        )
-                        issues.append(ValidationIssue(
-                            "warning", "system/fvOptions",
-                            f"fvOptions max={_llm_max:.0f} K exceeds icoPolynomial EOS ceiling "
-                            f"({_eos_ceiling:.1f} K where ρ→0). Clamped to {_safe_max:.0f} K to "
-                            f"prevent negative density → SIGFPE in GAMGSolver::scale.",
-                            fix=f"Changed max from {_llm_max:.0f} to {_safe_max:.0f} K"
-                        ))
-                        logger.warning(
-                            f"[VALIDATE] fvOptions max {_llm_max:.0f} K clamped to {_safe_max:.0f} K "
-                            f"(icoPolynomial ceiling={_eos_ceiling:.1f} K)"
-                        )
-                except (ValueError, AttributeError):
-                    pass
+        from simd_agent.run.case_spec import resolve_fv_options_max
+        _fvo = fixed_files["system/fvOptions"]
+        import re as _re_fvo
+        _max_match = _re_fvo.search(r'\bmax\s+([\d.eE+\-]+)\s*;', _fvo)
+        if _max_match:
+            try:
+                _llm_max = float(_max_match.group(1))
+                _bcs_fvo = config.get("boundary_conditions") or {}
+                _bc_t_vals: list[float] = []
+                for _pbc in _bcs_fvo.values():
+                    if not isinstance(_pbc, dict):
+                        continue
+                    _t_e = _pbc.get("temperature") or _pbc.get("T")
+                    _t_v = (
+                        _t_e.get("value") or _t_e.get("uniform")
+                        if isinstance(_t_e, dict) else _t_e
+                    )
+                    try:
+                        _bc_t_vals.append(float(_t_v))
+                    except (TypeError, ValueError):
+                        pass
+
+                _profile = "cryogenic" if _eos_ceiling is not None else "gas"
+                _resolved_max = resolve_fv_options_max(
+                    profile=_profile,
+                    bc_temps=_bc_t_vals,
+                    eos_t_ceiling=_eos_ceiling,
+                    t_floor=_t_floor,
+                )
+
+                _needs_clamp = (
+                    (_eos_ceiling is not None and _llm_max >= _eos_ceiling)
+                    or _llm_max > _resolved_max * 1.5
+                )
+                if _needs_clamp:
+                    fixed_files["system/fvOptions"] = _re_fvo.sub(
+                        r'\bmax\s+[\d.eE+\-]+\s*;',
+                        f'max             {_resolved_max:.0f};',
+                        _fvo,
+                        count=1,
+                    )
+                    issues.append(ValidationIssue(
+                        "warning", "system/fvOptions",
+                        f"fvOptions max={_llm_max:.0f} K clamped to {_resolved_max:.0f} K "
+                        f"(profile={_profile}, resolved by resolve_fv_options_max).",
+                        fix=f"Changed max from {_llm_max:.0f} to {_resolved_max:.0f} K"
+                    ))
+            except (ValueError, AttributeError):
+                pass
 
     # ── Check 3c3: Clamp fixedValue temperatures in 0/T to EOS ceiling ──────────
     # limitTemperature (fvOptions) only applies to internal cell values.
@@ -976,31 +996,10 @@ functions
             fixed_files[_tf] = _tc_fixed
             logger.debug(f"[VALIDATE] Stripped deprecated nMoles from {_tf}")
 
-    # ── Check 3e: alphatWallFunction → compressible::alphatWallFunction ──────
-    # OpenFOAM 2406 ESI compressible solvers require the namespace-qualified BC type.
-    # Plain 'alphatWallFunction' is rejected: "Unknown patchField type alphatWallFunction
-    # for patch type wall".  Apply to 0/alphat in ALL compressible energy solvers.
-    if solver in ENERGY_SOLVERS and "0/alphat" in fixed_files:
-        _alphat_content = fixed_files["0/alphat"]
-        # Replace bare 'alphatWallFunction' (not already prefixed with 'compressible::')
-        _alphat_fixed = re.sub(
-            r'(?<!compressible::)\balphatWallFunction\b',
-            'compressible::alphatWallFunction',
-            _alphat_content,
-        )
-        if _alphat_fixed != _alphat_content:
-            fixed_files["0/alphat"] = _alphat_fixed
-            issues.append(ValidationIssue(
-                "warning", "0/alphat",
-                "Auto-fixed: replaced 'alphatWallFunction' with 'compressible::alphatWallFunction'. "
-                "OpenFOAM 2406 ESI compressible solvers require the namespace-qualified form; "
-                "plain 'alphatWallFunction' causes 'Unknown patchField type' fatal IO error.",
-                fix="alphatWallFunction → compressible::alphatWallFunction"
-            ))
-            logger.info(
-                f"[VALIDATE] Auto-fixed alphatWallFunction → compressible::alphatWallFunction "
-                f"in 0/alphat for {solver}"
-            )
+    # NOTE: Check 3e (alphatWallFunction → compressible::alphatWallFunction)
+    # was deleted in Phase 4.  ``0/alphat`` is now rendered from scratch by
+    # ``SolverPlugin._build_alphat()`` which emits the namespace-qualified
+    # name from the start — the LLM never produces this file.
 
     # ── Check 3b: Remove invented "front_and_back" patches ──
     # The LLM sometimes invents a "front_and_back" (with underscores) patch
@@ -1410,233 +1409,11 @@ functions
             )
             fixed_files["system/fvSchemes"] = fv_schemes
 
-    # ── Check 7d: div(phi,h) scheme — enforce upwind for large ΔT ──────────────
-    # linearUpwind for div(phi,h) overshoots enthalpy near large thermal gradients
-    # (e.g. T_inlet=77K, T_wall=400K). This drives h to values that trigger
-    # limitTemperature on 50%+ of cells, making the h equation ill-conditioned
-    # (PBiCGStab takes 300+ iterations and PIMPLE outer loop never converges → SIGFPE).
-    # Rule: ΔT > 100 K → force bounded Gauss upwind. No exceptions.
-    fv_schemes = fixed_files.get("system/fvSchemes", "")
-    if fv_schemes and solver in _COMPRESSIBLE_ENERGY_SOLVERS:
-        _bcs_for_t = config.get("boundary_conditions", {}) or {}
-        _all_bc_temps: list[float] = []
-        for _bc_v in _bcs_for_t.values():
-            if not isinstance(_bc_v, dict):
-                continue
-            _t_bc = _bc_v.get("temperature")
-            if isinstance(_t_bc, dict):
-                _tv = _t_bc.get("value")
-                if _tv is not None:
-                    try:
-                        _all_bc_temps.append(float(_tv))
-                    except (TypeError, ValueError):
-                        pass
-        _delta_t_bc = (max(_all_bc_temps) - min(_all_bc_temps)) if len(_all_bc_temps) >= 2 else 0.0
-        if _delta_t_bc > 100.0:
-            # Replace any linearUpwind variant for div(phi,h) or div(phi,e) with upwind
-            _fvs_fixed = re.sub(
-                r'(div\(phi,[he]\)\s+)bounded\s+Gauss\s+linearUpwind\s+grad\([he]\)',
-                r'\1bounded Gauss upwind',
-                fv_schemes,
-            )
-            if _fvs_fixed != fv_schemes:
-                fixed_files["system/fvSchemes"] = _fvs_fixed
-                fv_schemes = _fvs_fixed
-                issues.append(ValidationIssue(
-                    "warning", "system/fvSchemes",
-                    f"div(phi,h) scheme changed from linearUpwind → upwind. "
-                    f"ΔT={_delta_t_bc:.0f} K (> 100 K threshold): linearUpwind overshoots "
-                    "enthalpy near large thermal gradients, causes limitTemperature to clamp "
-                    "50%+ of cells → h equation ill-conditioned → PIMPLE loop never converges.",
-                    fix="Changed div(phi,h) to bounded Gauss upwind"
-                ))
-                logger.warning(
-                    f"[VALIDATE] div(phi,h) forced to upwind (ΔT={_delta_t_bc:.0f} K > 100 K). "
-                    "linearUpwind overshoots enthalpy → limitTemperature clamps 50%+ cells."
-                )
-
-    # ── Check 7c: GAMG coarsest-level solver — prevent DIC SIGFPE ──────────────
-    # GAMGSolver::solveCoarsestLevel uses PCG+DIC by default for symmetric matrices.
-    # DICPreconditioner::calcReciprocalD crashes with SIGFPE when the coarsest-level
-    # matrix has a zero or negative diagonal (common on tet meshes that over-agglomerate).
-    # Two-part fix:
-    #   1. nCoarsestCells 500 — prevents over-agglomeration (default 10 is too small)
-    #   2. coarsestLevelCorr with PBiCGStab + preconditioner none — pure Krylov iteration
-    #      with no diagonal inverse, immune to degenerate coarsest-level matrices.
-    fv_solution = fixed_files.get("system/fvSolution", "")
-    if fv_solution and solver in _COMPRESSIBLE_ENERGY_SOLVERS:
-        _7c_changed = False
-        if "GAMG" in fv_solution and "nCoarsestCells" not in fv_solution:
-            fv_solution = re.sub(
-                r'(solver\s+GAMG\s*;)',
-                r'\1\n        nCoarsestCells  500;',
-                fv_solution,
-                count=1,
-            )
-            _7c_changed = True
-        if "GAMG" in fv_solution and "coarsestLevelCorr" not in fv_solution:
-            _corr_block = (
-                "\n        coarsestLevelCorr\n"
-                "        {\n"
-                "            solver          PBiCGStab;\n"
-                "            preconditioner  none;\n"
-                "            tolerance       1e-9;\n"
-                "            relTol          0;\n"
-                "        }"
-            )
-            fv_solution = re.sub(
-                r'(solver\s+GAMG\s*;)',
-                r'\1' + _corr_block,
-                fv_solution,
-                count=1,
-            )
-            _7c_changed = True
-        if _7c_changed:
-            fixed_files["system/fvSolution"] = fv_solution
-            issues.append(ValidationIssue(
-                "warning", "system/fvSolution",
-                "GAMG hardening: added nCoarsestCells 500 + coarsestLevelCorr "
-                "(PBiCGStab, preconditioner none) to prevent SIGFPE on tet meshes.",
-                fix="nCoarsestCells 500; coarsestLevelCorr { solver PBiCGStab; preconditioner none; }"
-            ))
-
-    # ── Check 7e: rhoPimpleFoam — replace GAMG with PBiCGStab, fix PIMPLE startup ──
-    # GAMG crashes in GAMGSolver::scale during the first pressure solve at cold start
-    # regardless of whether heat transfer is active. The pressure matrix is underdetermined
-    # before velocity is established. PBiCGStab is robust against this; GAMG is not.
-    #
-    # nOuterCorrectors=50 is ONLY needed when h-ρ coupling is stiff (large ΔT across BCs).
-    # For near-isothermal cases (ΔT < 20 K), 2 outer correctors is sufficient.
-    # Detect near-isothermal from the BC temperature values in the config.
-    #
-    # Rules applied unconditionally for rhoPimpleFoam:
-    #   1. Replace GAMG → PBiCGStab + DILU for p/pFinal (crash prevention at cold start)
-    #   2. Set momentumPredictor yes if it is no
-    # Additional rule when near-isothermal (ΔT_BC < 20 K):
-    #   3. Cap nOuterCorrectors to 2 if > 10
-    if solver == "rhoPimpleFoam":
-        fv_solution = fixed_files.get("system/fvSolution", "")
-        if fv_solution:
-            _fv_changed = False
-
-            # 1. Replace GAMG pressure solver with PBiCGStab
-            # Strategy: targeted line-level replacements rather than full block re-match
-            # (block regex fails when coarsestLevelCorr nested braces are present).
-            if "GAMG" in fv_solution:
-                # Step A: strip coarsestLevelCorr sub-block (nested braces — use bracket counter)
-                def _strip_coarsest(s: str) -> str:
-                    out, i = [], 0
-                    while i < len(s):
-                        m = re.search(r'\s*coarsestLevelCorr\s*\{', s[i:])
-                        if not m:
-                            out.append(s[i:])
-                            break
-                        out.append(s[i: i + m.start()])
-                        i += m.end()
-                        depth = 1
-                        while i < len(s) and depth:
-                            if s[i] == '{':
-                                depth += 1
-                            elif s[i] == '}':
-                                depth -= 1
-                            i += 1
-                    return "".join(out)
-
-                fv_solution = _strip_coarsest(fv_solution)
-
-                # Step B: replace `solver GAMG` → `solver PBiCGStab`
-                fv_solution = re.sub(
-                    r'(solver\s+)GAMG(\s*;)',
-                    r'\1PBiCGStab\2',
-                    fv_solution,
-                )
-                # Step C: replace `smoother GaussSeidel` → `preconditioner DILU`
-                fv_solution = re.sub(
-                    r'smoother\s+GaussSeidel\s*;',
-                    'preconditioner  DILU;',
-                    fv_solution,
-                )
-                # Step D: remove leftover GAMG-only keys (nCellsInCoarsestLevel, nPreSweeps, etc.)
-                fv_solution = re.sub(
-                    r'\s*(nCellsInCoarsestLevel|nPreSweeps|nPostSweeps|nFinestSweeps'
-                    r'|agglomerator|cacheAgglomeration|mergeLevels)\s+[^;]+;\n?',
-                    '\n',
-                    fv_solution,
-                )
-                # Step E: pFinal { $p; relTol 0; } → explicit PBiCGStab block
-                fv_solution = re.sub(
-                    r'pFinal\s*\{\s*\$p\s*;[^}]*\}',
-                    (
-                        "pFinal\n    {\n"
-                        "        solver          PBiCGStab;\n"
-                        "        preconditioner  DILU;\n"
-                        "        tolerance       1e-7;\n"
-                        "        relTol          0;\n"
-                        "    }"
-                    ),
-                    fv_solution,
-                    flags=re.DOTALL,
-                )
-                _fv_changed = True
-
-            # 2. Cap nOuterCorrectors at 2 when ΔT across BCs is small (near-isothermal).
-            # nOuterCorrectors=50 is only justified for h-ρ coupling stiffness (large ΔT).
-            # Detect isothermal: gather all temperature BC values from config.
-            _bc_temps_7e: list[float] = []
-            for _pbc_7e in (config.get("boundary_conditions") or {}).values():
-                if not isinstance(_pbc_7e, dict):
-                    continue
-                for _tkey in ("temperature", "T"):
-                    _te = _pbc_7e.get(_tkey)
-                    if isinstance(_te, dict):
-                        _tv = _te.get("value") or _te.get("uniform")
-                        if _tv is not None:
-                            try:
-                                _bc_temps_7e.append(float(_tv))
-                            except (TypeError, ValueError):
-                                pass
-                    elif isinstance(_te, (int, float)):
-                        _bc_temps_7e.append(float(_te))
-
-            _delta_t_bc = (max(_bc_temps_7e) - min(_bc_temps_7e)) if len(_bc_temps_7e) >= 2 else 0.0
-            _near_isothermal = _delta_t_bc < 20.0  # K — no significant temperature gradient
-
-            if _near_isothermal:
-                def _cap_outer_corr(m: re.Match) -> str:
-                    v = int(m.group(1))
-                    return m.group(0).replace(m.group(1), "2") if v > 10 else m.group(0)
-
-                _fv_new = re.sub(
-                    r'nOuterCorrectors\s+(\d+)\s*;',
-                    _cap_outer_corr,
-                    fv_solution,
-                )
-                if _fv_new != fv_solution:
-                    fv_solution = _fv_new
-                    _fv_changed = True
-
-            # 3. Set momentumPredictor yes (no → yes)
-            _fv_new = re.sub(
-                r'(momentumPredictor\s+)no(\s*;)',
-                r'\1yes\2',
-                fv_solution,
-            )
-            if _fv_new != fv_solution:
-                fv_solution = _fv_new
-                _fv_changed = True
-
-            if _fv_changed:
-                fixed_files["system/fvSolution"] = fv_solution
-                _dt_info = f"ΔT_BC={_delta_t_bc:.0f}K" if _bc_temps_7e else "ΔT_BC=unknown"
-                issues.append(ValidationIssue(
-                    "warning", "system/fvSolution",
-                    f"rhoPimpleFoam startup fixes: replaced GAMG→PBiCGStab for p "
-                    f"(GAMG crashes in GAMGSolver::scale at cold start); "
-                    f"set momentumPredictor yes; "
-                    + (f"capped nOuterCorrectors to 2 ({_dt_info} < 20K, near-isothermal). " if _near_isothermal else ""),
-                    fix="p→PBiCGStab+DILU; momentumPredictor yes"
-                    + ("; nOuterCorrectors≤2" if _near_isothermal else ""),
-                ))
+    # NOTE: Check 7c (GAMG coarsest hardening), Check 7d (div(phi,h) upwind
+    # for large ΔT) and Check 7e (rhoPimpleFoam GAMG→PBiCGStab) were deleted
+    # in Phase 2.  Their physics decisions now live in case_spec.resolvers
+    # (resolve_pressure_solver_strategy, resolve_div_phi_h_scheme); the
+    # renderer produces correct fvSolution / fvSchemes from the start.
 
     # ── Check 8: flowRateInletVelocity MUST have massFlowRate/volumetricFlowRate ──
     # OpenFOAM 2406 fatal: "Please supply either 'volumetricFlowRate' or 'massFlowRate'"
@@ -2874,6 +2651,11 @@ class GenAICodeGenerator:
         for attempt in (1, 2):
             response = await self._call_genai_single_file(prompt)
             content = self._extract_single_file_content(response, file_path)
+            # controlDict: strip any LLM-generated functions block — the
+            # validator always injects the correct one.  This prevents
+            # truncation from an overly long output.
+            if content and file_path == "system/controlDict":
+                content = _strip_functions_block(content)
             if content and not _is_truncated(file_path, content):
                 return content
             if content and attempt == 1:
@@ -3014,12 +2796,16 @@ class GenAICodeGenerator:
                     history_text = history_text[:10000] + "\n... (truncated — see earlier iterations)\n"
                 error_section += history_text
 
-            # Show previous version of THIS specific file
+            # Show previous version of THIS specific file — full content
+            # so the LLM has complete context.  Strip the validator-injected
+            # functions block from controlDict: it's always re-injected after
+            # generation, and reproducing it wastes output tokens / causes
+            # truncation that loops the retry cycle.
             prev_files = error_context.get("previous_files", {})
             if file_path in prev_files:
                 prev = prev_files[file_path]
-                if len(prev) > 1500:
-                    prev = prev[:1500] + "\n... (truncated)"
+                if file_path == "system/controlDict":
+                    prev = _strip_functions_block(prev)
                 error_section += (
                     f"\n### Previous version of `{file_path}` (BROKEN — fix it)\n```\n{prev}\n```\n"
                 )
@@ -3046,8 +2832,12 @@ class GenAICodeGenerator:
             f"   }}\n"
             f"   <rest of content>\n"
             f"   ```\n"
-            f"   (first line inside block MUST be `FoamFile`, never `{file_path}`)\n\n"
-            f"Generate complete `{file_path}` now:"
+            f"   (first line inside block MUST be `FoamFile`, never `{file_path}`)\n"
+            + (f"9. Do NOT include a `functions` block — function objects "
+               f"(fieldMinMax, surfaceFieldValue, volFieldValue) are auto-injected "
+               f"by the validator after generation. End the file after the last "
+               f"solver setting.\n" if file_path == "system/controlDict" else "")
+            + f"\nGenerate complete `{file_path}` now:"
         )
 
     def _format_field_bc_table(self, file_path: str, cs: "CaseSpec") -> str:
@@ -3311,13 +3101,14 @@ class GenAICodeGenerator:
                 n_steps = int(cs.end_time / cs.delta_t)
                 adjust_note = (
                     f"\n- adjustTimeStep: yes   ← REQUIRED for transient solvers; lets OpenFOAM auto-scale "
-                    f"deltaT up to maxCo=0.5 so the simulation runs as fast as physics allows\n"
-                    f"- maxCo: 0.5\n"
+                    f"deltaT up to maxCo={cs.max_co} so the simulation runs as fast as physics allows\n"
+                    f"- maxCo: {cs.max_co}\n"
                     f"- DO NOT set deltaT smaller than {cs.delta_t}. "
                     f"With deltaT={cs.delta_t} and endTime={end_time_fmt} that is already {n_steps} steps — "
                     f"making it smaller (e.g. 0.0001) would multiply the runtime by 10x with no benefit.\n"
                     f"- writeControl: adjustableRunTime  (pair with adjustTimeStep)\n"
-                    f"- writeInterval: {cs.end_time / 30 if cs.end_time > 0 else 0.1}  (write ~30 snapshots)\n"
+                    f"- writeInterval: {cs.write_interval:.6g}  (write ~{int(cs.end_time / cs.write_interval)} snapshots)\n"
+                    f"- maxDeltaT: {cs.max_delta_t:.6g}\n"
                 )
             else:
                 wi = int(cs.end_time / 20) if cs.end_time > 0 else 100
@@ -4314,6 +4105,40 @@ Generate ALL corrected files now (all files from the checklist above):"""
         except Exception as e:
             logger.error(f"[GENAI] API call failed: {e}")
             raise
+
+
+# ────────────────────────────────────────────────────────────
+# controlDict functions-block stripping
+# ────────────────────────────────────────────────────────────
+
+def _strip_functions_block(content: str) -> str:
+    """Strip the ``functions { ... }`` block from controlDict content.
+
+    Function objects (fieldMinMax, surfaceFieldValue, volFieldValue) are always
+    re-injected by the validator after generation.  Including them in the
+    error-recovery context causes the LLM to reproduce the large block, which
+    frequently gets truncated mid-way — leaving unbalanced braces that the
+    simulation server rejects, triggering an infinite retry loop.
+
+    Uses brace-depth counting to handle arbitrarily nested sub-dicts.
+    """
+    match = re.search(r'\n\s*functions\s*\{', content)
+    if not match:
+        return content
+    start = match.start()
+    depth = 0
+    i = match.end() - 1  # position of the opening '{'
+    while i < len(content):
+        if content[i] == '{':
+            depth += 1
+        elif content[i] == '}':
+            depth -= 1
+            if depth == 0:
+                # Found the matching closing brace
+                return content[:start].rstrip() + "\n"
+        i += 1
+    # functions block is unclosed (already truncated) — strip it all
+    return content[:start].rstrip() + "\n"
 
 
 # ────────────────────────────────────────────────────────────

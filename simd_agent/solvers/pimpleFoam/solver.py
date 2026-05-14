@@ -56,12 +56,59 @@ class PimpleFoamSolver(SolverPlugin):
             "system/controlDict",
             # system/fvSchemes and system/fvSolution are generated
             # deterministically in validate(), not by the LLM.
-            "constant/transportProperties", "constant/turbulenceProperties",
-            "0/U", "0/p",
+            "constant/transportProperties", "0/U", "0/p",
         ]
         for f in self.turbulence_fields(turb_model):
+            if f == "nut":
+                continue  # 0/nut rendered deterministically (Phase 4)
             files.append(f"0/{f}")
         return files
+
+    # ── Deterministic builders ────────────────────────────────────────────
+
+    def _build_fv_solution(self, config: dict[str, Any]) -> str:
+        """pimpleFoam fvSolution — PIMPLE, incompressible, no energy.
+
+        Pressure has pFinal block; equations have Final regex.  No rho,
+        no compressible bounds.
+        """
+        ctx = self._fv_context(config)
+        eq_fields = self._equation_fields(ctx.turb_model)
+
+        p_block, p_final = self._build_pressure_solver_block(ctx, is_simple=False)
+        eq_block, eq_final = self._build_equation_solver_block(eq_fields, is_simple=False)
+        pimple_block = self._build_pimple_block(ctx, eq_fields, "")
+        relax_block = self._build_relaxation_pimple(ctx)
+
+        return (
+            self._foam_file_header("fvSolution")
+            + "solvers\n{\n"
+            + p_block
+            + p_final
+            + eq_block
+            + eq_final
+            + "}\n"
+            + pimple_block
+            + relax_block
+            + self._foam_file_footer()
+        )
+
+    def _build_fv_schemes(self, config: dict[str, Any]) -> str:
+        """pimpleFoam fvSchemes — transient incompressible (Euler ddt)."""
+        ctx = self._fv_context(config)
+        return (
+            self._foam_file_header("fvSchemes")
+            + self._build_ddt_block() + "\n"
+            + self._build_grad_block(ctx) + "\n"
+            + self._build_div_block(ctx) + "\n"
+            + self._build_laplacian_block(ctx) + "\n"
+            + self._build_interpolation_block() + "\n"
+            + self._build_sngrad_block(ctx) + "\n"
+            + self._build_flux_required_block()
+            + ("\n" + self._build_wall_dist_block(ctx.turb_model)
+               if ctx.turb_model != "laminar" else "")
+            + self._foam_file_footer()
+        )
 
     # ── Validation ────────────────────────────────────────────────────────
 
@@ -72,8 +119,9 @@ class PimpleFoamSolver(SolverPlugin):
         fixed = dict(files)
 
         # ── Deterministic fvSolution + fvSchemes ───────────────────────
-        fixed["system/fvSolution"] = self._build_fv_solution(config)
-        fixed["system/fvSchemes"] = self._build_fv_schemes(config)
+        # Deterministic files (LLM never generates these — Phase 4)
+
+        fixed.update(self.render_deterministic_files(config))
         issues.append(
             ValidationIssue(
                 "info",
@@ -116,6 +164,9 @@ class PimpleFoamSolver(SolverPlugin):
 
         # Floor turbulence ICs (prevent division-by-zero in wall functions)
         fixed = self._fix_turbulence_ic_floors(fixed, issues)
+
+        # Unify k/ω/ε across all inlets — flow-wide property, not per-inlet
+        fixed = self._unify_inlet_turbulence(fixed, issues, config)
 
         # Patch coverage check
         fixed = self._check_patch_coverage(fixed, issues, config)

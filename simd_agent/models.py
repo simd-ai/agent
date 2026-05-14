@@ -33,6 +33,7 @@ class RunStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    STOPPED = "stopped"
     NOT_CLEAR = "not_clear"
     CONFIG_INCOMPLETE = "config_incomplete"
 
@@ -552,7 +553,7 @@ class Constraints(BaseModel):
     max_retries: int = Field(default=7, ge=1, le=10)
     solver_preference: str | None = None
     mesh_preference: str | None = None
-    timeout_seconds: int = Field(default=21600, ge=30, le=21600)
+    timeout_seconds: int = Field(default=86400, ge=30, le=86400)
 
 
 class Metadata(BaseModel):
@@ -668,6 +669,7 @@ class EventTypes:
     SIM_RUN_PROGRESS = "sim_run_progress"
     SIM_RUN_LOG = "sim_run_log"
     SIM_RUN_SUCCEEDED = "sim_run_succeeded"
+    SIM_RUN_STOPPED = "sim_run_stopped"
     SIM_RUN_FAILED = "sim_run_failed"
     SIM_ARTIFACTS_READY = "sim_artifacts_ready"
     # MPI parallel decompose / reconstruct

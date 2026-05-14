@@ -44,6 +44,7 @@ class SimRunStatus(str, Enum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    STOPPED = "stopped"
 
 
 class SimRunMode(str, Enum):
@@ -105,26 +106,20 @@ class SimulationServerClient:
     The simulation server uses SSE for real-time event streaming.
     """
     
-    # Default simulation server URL (can be overridden in settings)
-    DEFAULT_URL = "https://vernie-unpreservable-supermentally.ngrok-free.dev"
-    
     def __init__(
         self,
         base_url: str | None = None,
         timeout: int = 300,
     ):
         """Initialize the simulation server client.
-        
+
         Args:
-            base_url: Override base URL (uses settings or default if not provided)
+            base_url: Override base URL (uses SIMULATION_SERVER_URL from .env if not provided)
             timeout: Request timeout in seconds
         """
         settings = get_settings()
-        # Use provided URL, or settings, or default
         self.base_url = (
-            base_url or 
-            getattr(settings, 'simulation_server_url', None) or 
-            self.DEFAULT_URL
+            base_url or settings.simulation_server_url
         ).rstrip("/")
         self.timeout = timeout
         
@@ -139,8 +134,6 @@ class SimulationServerClient:
                 timeout=httpx.Timeout(self.timeout),
                 headers={
                     "Accept": "application/json",
-                    # ngrok requires this header
-                    "ngrok-skip-browser-warning": "true",
                 },
             )
         return self._client
@@ -186,7 +179,10 @@ class SimulationServerClient:
             mode: Run mode - TEST (1 iteration) or FULL
             run_id: Optional run ID (generated if not provided)
             callback_url: Optional URL to POST final status to
-            n_cores: Number of MPI processes. 1 = serial (default). >1 = parallel.
+            n_cores: Number of MPI processes for FULL mode. 1 = serial,
+                     >1 = parallel via `mpirun -np N <solver> -parallel`.
+                     Ignored for TEST mode — the server force-overrides to 1
+                     (agent-simulation/app/runner.py:1112).
             refine_strategy: Mesh refinement: "none", "wall", "global".
 
         Returns:
@@ -224,8 +220,12 @@ class SimulationServerClient:
             logger.error(f"[SIM_SERVER] Submit failed: {e.response.status_code} - {error_text}")
             raise SimulationServerError(f"Failed to submit run: {e.response.status_code} - {error_text}")
         except Exception as e:
-            logger.error(f"[SIM_SERVER] Submit error: {e}")
-            raise SimulationServerError(f"Failed to submit run: {e}")
+            logger.error(
+                f"[SIM_SERVER] Submit error ({type(e).__name__}): {e!r}"
+            )
+            raise SimulationServerError(
+                f"Failed to submit run ({type(e).__name__}): {e}"
+            )
     
     async def submit_test_run(
         self,
@@ -630,6 +630,60 @@ class SimulationServerClient:
         except Exception as e:
             logger.warning(f"[SIM_SERVER] Cancel error: {e}")
             return False
+
+    async def stop_run(self, run_id: str) -> bool:
+        """Gracefully stop a running simulation on the sim server.
+
+        Sends POST /api/run/{run_id}/stop which kills the solver process
+        but triggers reconstruction and VTP generation on partial results.
+
+        Args:
+            run_id: The simulation run ID
+
+        Returns:
+            True if the solver process was stopped
+        """
+        client = await self._get_client()
+        try:
+            response = await client.post(f"/api/run/{run_id}/stop", timeout=10.0)
+            response.raise_for_status()
+            result = response.json()
+            stopped = result.get("stopped", False)
+            logger.info(f"[SIM_SERVER] Stop run {run_id}: stopped={stopped}")
+            return stopped
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"[SIM_SERVER] Stop failed: {e.response.status_code}")
+            return False
+        except Exception as e:
+            logger.warning(f"[SIM_SERVER] Stop error: {e}")
+            return False
+
+    async def continue_run(self, run_id: str) -> SimSubmitResponse:
+        """Continue a stopped simulation from the last checkpoint.
+
+        Sends POST /api/run/{run_id}/continue which patches controlDict
+        to ``startFrom latestTime`` and re-launches the solver.
+
+        Args:
+            run_id: The simulation run ID
+
+        Returns:
+            SimSubmitResponse with event stream URL
+        """
+        client = await self._get_client()
+        try:
+            response = await client.post(f"/api/run/{run_id}/continue", timeout=30.0)
+            response.raise_for_status()
+            result = response.json()
+            logger.info(f"[SIM_SERVER] Continue run {run_id}: status={result.get('status')}")
+            return SimSubmitResponse(**result)
+        except httpx.HTTPStatusError as e:
+            error_text = e.response.text[:500] if e.response.text else str(e)
+            logger.error(f"[SIM_SERVER] Continue failed: {e.response.status_code} - {error_text}")
+            raise SimulationServerError(f"Failed to continue run: {e.response.status_code} - {error_text}")
+        except Exception as e:
+            logger.error(f"[SIM_SERVER] Continue error: {e}")
+            raise SimulationServerError(f"Failed to continue run: {e}")
 
     async def delete_run(self, run_id: str) -> bool:
         """Delete a completed run and its files.

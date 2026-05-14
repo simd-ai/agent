@@ -122,6 +122,32 @@ def _extract_flags(validated_config: dict[str, Any]) -> dict[str, Any]:
         "transient", "unsteady"
     )
     laminar      = (_get("flow_regime", default="turbulent") or "turbulent") == "laminar"
+    # Gravity / buoyancy is a separate signal from heat transfer.  Forced
+    # convection (heat + no gravity) is a real case that must NOT collapse
+    # into a buoyant solver.
+    gravity      = bool(_get("gravity", "buoyancy", default=False))
+
+    # Heat-transfer detection beyond the explicit flag — temperature BCs
+    # with a meaningful spread imply heat transfer even if the flag is
+    # missing.  Without this, prompts like "hot air at 500K with a 600K
+    # wall, no gravity" silently end up at simpleFoam.
+    if not heat:
+        bc_temps: list[float] = []
+        for pbc in (validated_config.get("boundary_conditions") or {}).values():
+            if not isinstance(pbc, dict):
+                continue
+            t_entry = pbc.get("temperature") or pbc.get("T")
+            t_val = (
+                t_entry.get("value") or t_entry.get("uniform")
+                if isinstance(t_entry, dict)
+                else t_entry
+            )
+            try:
+                bc_temps.append(float(t_val))
+            except (TypeError, ValueError):
+                pass
+        if len(bc_temps) >= 2 and (max(bc_temps) - min(bc_temps)) > 5.0:
+            heat = True
 
     return {
         "heat":         heat,
@@ -131,6 +157,7 @@ def _extract_flags(validated_config: dict[str, Any]) -> dict[str, Any]:
         "compressible": compressible,
         "transient":    transient,
         "laminar":      laminar,
+        "gravity":      gravity,
     }
 
 
@@ -196,23 +223,47 @@ def _is_cryogenic_boiling(validated_config: dict[str, Any]) -> bool:
 
 
 def _heuristic_fallback(validated_config: dict[str, Any]) -> str:
-    """Pure-logic fallback when the LLM response is unparseable or invalid."""
+    """Pure-logic fallback when the LLM response is unparseable or invalid.
+
+    Decision logic, in order:
+
+      1. Cryogenic liquid (name keyword or T_inlet < 130 K) → rho*  (density-T coupling)
+      2. Heat transfer active:
+           - with gravity / buoyancy → buoyant*  (natural convection)
+           - without gravity         → rho*      (forced convection — simpleFoam
+             cannot solve the energy equation and assumes ρ=const, which is
+             physically wrong with any temperature gradient)
+      3. No heat but explicitly compressible (Mach > 0.3, etc.) → rho*
+      4. Otherwise → simple* / pimple* (incompressible isothermal)
+    """
     f = _extract_flags(validated_config)
 
-    # Cryogenic single-phase liquid (LH2, LN2, LOX, LHe, etc.) → always use rho* solver.
+    # 1. Cryogenic single-phase liquid (LH2, LN2, LOX, LHe, etc.) → rho*
     if _is_cryogenic_liquid(validated_config):
-        logger.warning("[SOLVER_SELECT] Heuristic: cryogenic liquid → rho* solver (density-temperature coupling)")
+        logger.warning(
+            "[SOLVER_SELECT] Heuristic: cryogenic liquid → rho* solver "
+            "(density-temperature coupling)"
+        )
         return "rhoPimpleFoam" if f["transient"] else "rhoSimpleFoam"
 
-    # Buoyancy-driven / natural convection: heat transfer + incompressible
-    if f["heat"] and not f["compressible"]:
-        logger.info("[SOLVER_SELECT] Heuristic: heat transfer + incompressible → buoyant solver")
-        return "buoyantPimpleFoam" if f["transient"] else "buoyantSimpleFoam"
-
-    # Compressible with heat (high-speed)
-    if f["heat"] or f["compressible"]:
+    # 2. Heat transfer active → buoyant (with gravity) or rho* (forced convection)
+    if f["heat"]:
+        if f["gravity"]:
+            logger.info(
+                "[SOLVER_SELECT] Heuristic: heat transfer + gravity → buoyant solver"
+            )
+            return "buoyantPimpleFoam" if f["transient"] else "buoyantSimpleFoam"
+        logger.info(
+            "[SOLVER_SELECT] Heuristic: heat transfer + no gravity → rho* solver "
+            "(forced convection — simpleFoam has no energy equation)"
+        )
         return "rhoPimpleFoam" if f["transient"] else "rhoSimpleFoam"
 
+    # 3. Compressible without heat (high-speed aero, shocks)
+    if f["compressible"]:
+        return "rhoPimpleFoam" if f["transient"] else "rhoSimpleFoam"
+
+    # 4. Incompressible isothermal
     if not f["transient"]:
         return "simpleFoam"
     return "pimpleFoam"
@@ -256,36 +307,73 @@ Any of the following → set solver to null with a clear warning:
   - Moving fluid-front / filling / air-displacement scenarios
   - Cryogenic liquid heated above its boiling point (phase change)
 
-## 2. Single-phase path — Buoyancy / Natural Convection (CHECK FIRST for heat cases)
+══════════════════════════════════════════════════════════════
+HEAT TRANSFER IS THE PRIMARY DISCRIMINATOR
+──────────────────────────────────────────────────────────────
+"Heat transfer active" means ANY of:
+  • The user mentions temperature, hot, cold, heated, cooled, warm, chill,
+    thermal, heat flux, isothermal wall at T≠ambient
+  • Two patches in the BCs carry different temperatures (e.g. inlet at
+    300 K and wall at 500 K) — even if no thermal language is used
+  • A cryogenic fluid is named (LN2, LH2, LOX, LHe, …)
+
+When heat transfer is active, simpleFoam / pimpleFoam are ELIMINATED.
+They solve only momentum + continuity (ρ=const, no energy equation).
+Using them with a temperature gradient gives a result that ignores the
+thermal physics entirely.  Pick a compressible-energy solver instead.
+══════════════════════════════════════════════════════════════
+
+## 2. Heat transfer + gravity / buoyancy → buoyant solvers
 Apply when ALL of:
-  - Heat transfer is active
+  - Heat transfer is active (see above)
   - Single-phase only
-  - Low-speed (Mach < 0.3)
-  - Gravity matters: natural convection, heated room, HVAC, chimney, solar collector,
-    electronic cooling, smoke spread, density stratification, buoyancy-driven flow
+  - Gravity matters: user mentions gravity, buoyancy, natural convection,
+    heated room, HVAC, chimney, solar collector, electronic cooling,
+    smoke spread, density stratification — i.e. the flow is driven (in
+    part or whole) by Δρ × g
 
   Steady-state  → buoyantSimpleFoam
   Transient     → buoyantPimpleFoam
 
-## 3. Single-phase — High-speed Compressible (gravity not dominant)
-Compressible signals (any one):
-  - Mach > 0.3, supersonic, transonic, shock
-  - Density varies significantly with pressure or temperature
-  - Gas at large pressure differential (> ~10% of absolute)
-  - ⚠ Cryogenic liquid (LH2, LN2, LOX, LHe — boiling point < 130 K):
-      ALWAYS compressible; icoPolynomial EOS required.
+## 3. Heat transfer + NO gravity (forced convection) → rho* solvers
+Apply when ALL of:
+  - Heat transfer is active
+  - Single-phase only
+  - Gravity is OFF (user explicitly says "no gravity" / "without gravity"
+    / "horizontal pipe / duct" / "ignore buoyancy") OR the flow is clearly
+    pressure / pump driven (mass flow rate, velocity BC, no buoyancy
+    language)
+  - This includes ALL forced-convection heat exchangers, heated pipes,
+    cooling channels, hot-wall ducts, etc.
 
   Steady-state  → rhoSimpleFoam
   Transient     → rhoPimpleFoam
 
-## 4. Single-phase incompressible, no heat transfer
-  - Liquid at moderate conditions (water, oil, glycol — NOT cryogenic)
-  - Density constant, Mach < 0.1, no temperature gradients
+  RATIONALE: simpleFoam has no energy equation and assumes ρ = const.  Air
+  at 280 K vs 600 K is ρ ≈ 1.26 vs 0.59 kg/m³ — a 53 % density variation
+  that simpleFoam cannot represent.  rhoSimpleFoam is the correct choice
+  whenever there is any temperature gradient and no buoyancy.
+
+## 4. No heat transfer, high-speed compressible → rho* solvers
+Apply when:
+  - Heat transfer is NOT active (isothermal)
+  - Mach > 0.3, supersonic, transonic, shock, or pressure differential
+    > ~10 % of absolute pressure
+  - OR cryogenic liquid (always compressible regardless of speed)
+
+  Steady-state  → rhoSimpleFoam
+  Transient     → rhoPimpleFoam
+
+## 5. No heat, low Mach, no buoyancy → incompressible
+Apply when ALL of:
+  - Heat transfer is NOT active
+  - Mach < 0.1, no shocks
+  - Liquid or gas at moderate, near-uniform conditions
 
   Steady-state  → simpleFoam
   Transient     → pimpleFoam
 
-## 5. Steady vs transient
+## 6. Steady vs transient
 Steady: "steady", "RANS", "converge", "time-averaged", "mean flow"
 Transient: "transient", "unsteady", "time-varying", "oscillating", "pulsating",
   "start-up", "smoke spread", "moving parts", "ventilation transient"

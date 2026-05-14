@@ -666,6 +666,23 @@ class EventBus:
             },
         )
     
+    async def emit_sim_stopped(
+        self,
+        sim_run_id: str,
+        duration_seconds: float,
+        artifacts: list[dict[str, Any]] | None = None,
+    ) -> AgentEvent:
+        """Emit simulation stopped event (user stopped gracefully, partial results)."""
+        return await self.emit_info(
+            EventTypes.SIM_RUN_STOPPED,
+            f"Simulation stopped after {duration_seconds:.1f}s — partial results available",
+            {
+                "sim_run_id": sim_run_id,
+                "duration_seconds": duration_seconds,
+                "artifacts": artifacts or [],
+            },
+        )
+
     async def emit_sim_progress_reset(self, attempt: int) -> AgentEvent:
         """Emit sim_progress_reset event.
 

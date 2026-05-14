@@ -30,34 +30,48 @@ If `CaseSpec.rho` is set and no significant temperature variation: use `heRhoThe
 | Inside `thermoType {}` | `thermo  hConst;` | ~~`thermodynamics hConst;`~~ |
 | Inside `mixture {}` | `thermodynamics { Cp …; }` | ~~`thermo { Cp …; }`~~ |
 
-## Energy field name
+## Energy field name — DEFAULT IS `sensibleInternalEnergy` (`e`)
 
 `thermoType.energy` controls the transported variable name:
-- `sensibleEnthalpy` → field name `h` (default)
-- `sensibleInternalEnergy` → field name `e`
+- `sensibleInternalEnergy` → field name `e` ← **DEFAULT for rhoSimpleFoam**
+- `sensibleEnthalpy` → field name `h` (used by transient solvers / cryogenic LN2)
+
+The OpenFOAM reference rhoSimpleFoam tutorials (e.g.
+`compressible/rhoSimpleFoam/angledDuctExplicitFixedCoeff`) transport
+**internal energy**, not enthalpy.  Internal energy avoids the
+pressure-work source term ∂p/∂t in the energy equation — that source
+is a major startup transient on steady compressible cases, exactly the
+failure mode that crashes mass-flow-driven inlets with a high pressure
+ratio (compressor inlet against atmospheric outlet).
+
+The deterministic fvSchemes / fvSolution renderer emits `div(phi,e)`
+and `e` in the residualControl + relaxation blocks for rhoSimpleFoam;
+the thermo dict here **must** declare `sensibleInternalEnergy` so the
+variable names agree.  A mismatch is auto-corrected by the validator
+(`_fix_energy_form`), but emitting it correctly avoids a recovery pass.
 
 This MUST match:
-- `div(phi,h)` or `div(phi,e)` in `fvSchemes`
-- `"(U|h|…)"` regex in `fvSolution`
-- `residualControl { h …; }` in `fvSolution`
+- `div(phi,e)` in `fvSchemes`
+- `"(U|e|…)"` regex in `fvSolution`
+- `residualControl { e …; }` in `fvSolution`
 
 ## Templates
 
-### Gas (perfectGas)
+### Gas (perfectGas) — DEFAULT
 ```
 thermoType
 {
     type            hePsiThermo;
     mixture         pureMixture;
     transport       const;
-    thermo          hConst;           // ← MUST be 'thermo' here
+    thermo          hConst;                  // ← MUST be 'thermo' here
     equationOfState perfectGas;
     specie          specie;
-    energy          sensibleEnthalpy;
+    energy          sensibleInternalEnergy;  // ← matches OF rhoSimpleFoam tutorial
 }
 mixture
 {
-    specie      { nMoles 1; molWeight 28.97; }
+    specie      { molWeight 28.97; }
     thermodynamics { Cp 1005; Hf 0; }  // ← MUST be 'thermodynamics' here
     transport   { mu 1.8e-5; Pr 0.713; }
 }
@@ -82,7 +96,7 @@ thermoType
 }
 mixture
 {
-    specie      { nMoles 1; molWeight 28.014; }
+    specie      { molWeight 28.014; }
     thermodynamics                   // hPolynomial: CpCoeffs<8> + Hf + Sf (NOT plain Cp)
     {
         Hf              0;
@@ -117,7 +131,7 @@ thermoType
 }
 mixture
 {
-    specie      { nMoles 1; molWeight 28.97; }
+    specie      { molWeight 28.97; }
     thermodynamics { Cp 4182; Hf 0; }
     transport   { mu 1e-3; Pr 7.0; }
     equationOfState { rho 1000; }

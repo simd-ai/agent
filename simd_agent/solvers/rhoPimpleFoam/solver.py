@@ -65,24 +65,75 @@ class RhoPimpleFoamSolver(SolverPlugin):
             "system/controlDict",
             # system/fvSchemes and system/fvSolution are generated
             # deterministically in validate(), not by the LLM.
-            "constant/thermophysicalProperties", "constant/turbulenceProperties",
-            "0/U", "0/p", "0/T",
+            "constant/thermophysicalProperties", "0/U", "0/p", "0/T",
         ]
         if heat_transfer:
             files.append("system/fvOptions")
         for f in self.turbulence_fields(turb_model):
+            if f == "nut":
+                continue  # 0/nut rendered deterministically (Phase 4)
             files.append(f"0/{f}")
-        if turb_model not in ("laminar", "none", ""):
-            files.append("0/alphat")
+        # 0/alphat is rendered deterministically (Phase 4).
         return files
+
+    # ── Deterministic builders ────────────────────────────────────────────
+
+    def _build_fv_solution(self, config: dict[str, Any]) -> str:
+        """rhoPimpleFoam fvSolution — PIMPLE, compressible, energy.
+
+        Profile-aware (gas vs cryogenic).  PIMPLE block adds nOuterCorrectors
+        and nCorrectors; pressure has a pFinal block; equations have Final
+        regex variants.
+        """
+        ctx = self._fv_context(config)
+        eq_fields = self._equation_fields(ctx.turb_model)
+
+        p_block, p_final = self._build_pressure_solver_block(ctx, is_simple=False)
+        rho_block = self._build_rho_solver_block()
+        eq_block, eq_final = self._build_equation_solver_block(eq_fields, is_simple=False)
+        bounds_block = self._build_compressible_bounds(config, ctx)
+        pimple_block = self._build_pimple_block(ctx, eq_fields, bounds_block)
+        relax_block = self._build_relaxation_pimple(ctx)
+
+        return (
+            self._foam_file_header("fvSolution")
+            + "solvers\n{\n"
+            + p_block
+            + p_final
+            + rho_block
+            + eq_block
+            + eq_final
+            + "}\n"
+            + pimple_block
+            + relax_block
+            + self._foam_file_footer()
+        )
+
+    def _build_fv_schemes(self, config: dict[str, Any]) -> str:
+        """rhoPimpleFoam fvSchemes — transient compressible (Euler ddt)."""
+        ctx = self._fv_context(config)
+        return (
+            self._foam_file_header("fvSchemes")
+            + self._build_ddt_block() + "\n"
+            + self._build_grad_block(ctx) + "\n"
+            + self._build_div_block(ctx) + "\n"
+            + self._build_laplacian_block(ctx) + "\n"
+            + self._build_interpolation_block() + "\n"
+            + self._build_sngrad_block(ctx) + "\n"
+            + self._build_flux_required_block()
+            + ("\n" + self._build_wall_dist_block(ctx.turb_model)
+               if ctx.turb_model != "laminar" else "")
+            + self._foam_file_footer()
+        )
 
     def validate(self, files: dict[str, str], config: dict[str, Any]) -> ValidationResult:
         issues: list[ValidationIssue] = []
         fixed = dict(files)
 
         # Deterministic fvSolution + fvSchemes
-        fixed["system/fvSolution"] = self._build_fv_solution(config)
-        fixed["system/fvSchemes"] = self._build_fv_schemes(config)
+        # Deterministic files (LLM never generates these — Phase 4)
+
+        fixed.update(self.render_deterministic_files(config))
 
         fixed = self._fix_controldict_solver(fixed, issues)
         fixed = self._fix_pressure_field(fixed, issues)
@@ -97,12 +148,11 @@ class RhoPimpleFoamSolver(SolverPlugin):
                 issues.append(ValidationIssue("warning", ef, f"Removed {ef}: thermo reads 0/T."))
 
         # Enforce PIMPLE settings for isothermal case
-        heat_transfer = bool(
-            config.get("heat_transfer")
-            or (config.get("physics", {}) or {}).get("heat_transfer")
-        )
-        if not heat_transfer:
-            fixed = self._fix_isothermal_pimple(fixed, issues)
+        # Phase 2: the isothermal-rhoPimpleFoam GAMG→PBiCGStab switch is now
+        # made up-front by resolve_pressure_solver_strategy() and rendered by
+        # _build_pressure_solver_block().  The post-gen regex hack
+        # (_fix_isothermal_pimple) is no longer needed.
+        fixed = self._unify_inlet_turbulence(fixed, issues, config)
 
         return ValidationResult(files=fixed, issues=issues)
 
@@ -114,22 +164,8 @@ class RhoPimpleFoamSolver(SolverPlugin):
             issues.append(ValidationIssue("warning", "0/alphat", "Fixed: alphatWallFunction -> compressible::alphatWallFunction."))
         return files
 
-    def _fix_isothermal_pimple(self, files: dict[str, str], issues: list[ValidationIssue]) -> dict[str, str]:
-        """For isothermal rhoPimpleFoam: PBiCGStab+DILU for p, nOuterCorrectors=2."""
-        fvs = files.get("system/fvSolution", "")
-        if not fvs:
-            return files
-        modified = False
-        if "GAMG" in fvs and not bool(
-            (files.get("system/fvSolution", "").count("GAMG") or 0)
-            and "heat" in str(files.get("system/controlDict", "")).lower()
-        ):
-            fvs = re.sub(r"\bGAMG\b", "PBiCGStab", fvs)
-            if "DILU" not in fvs:
-                fvs = re.sub(r"preconditioner\s+\w+", "preconditioner  DILU", fvs)
-            modified = True
-            issues.append(ValidationIssue("warning", "system/fvSolution", "Isothermal: GAMG -> PBiCGStab+DILU for p."))
-        if modified:
-            files["system/fvSolution"] = fvs
-        return files
+    # _fix_isothermal_pimple was removed in Phase 2 — the GAMG→PBiCGStab
+    # decision for isothermal rhoPimpleFoam now lives in
+    # resolve_pressure_solver_strategy() and the renderer emits the correct
+    # solver from the start.
 

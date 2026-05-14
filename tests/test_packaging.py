@@ -173,30 +173,31 @@ class TestPackageCase:
     """Tests for case packaging to zip."""
     
     def test_package_creates_zip(self):
-        """Test that packaging creates a valid zip."""
+        """Default ZIP (sim-server path) excludes run.sh / fix_mesh_setup.sh."""
         files = {
             "system/controlDict": "test content",
             "0/U": "velocity field",
         }
-        
+
         zip_bytes, file_list = package_case(files)
-        
+
         assert len(zip_bytes) > 0
-        
-        # Verify it's a valid zip
+
         zip_buffer = io.BytesIO(zip_bytes)
         with zipfile.ZipFile(zip_buffer, "r") as zf:
             names = zf.namelist()
             assert any("controlDict" in n for n in names)
-            assert any("run.sh" in n for n in names)
-    
-    def test_package_includes_run_script(self):
-        """Test that run.sh is included by default."""
+            assert not any("run.sh" in n for n in names)
+            assert not any("fix_mesh_setup.sh" in n for n in names)
+
+    def test_package_with_local_helpers(self):
+        """Export path opts in to run.sh + fix_mesh_setup.sh."""
         files = {"system/controlDict": "content"}
-        
-        zip_bytes, file_list = package_case(files, include_run_script=True)
-        
-        assert any("run.sh" in f for f in file_list)
+
+        zip_bytes, file_list = package_case(files, include_local_helpers=True)
+
+        assert any(f.endswith("run.sh") for f in file_list)
+        assert any(f.endswith("fix_mesh_setup.sh") for f in file_list)
     
     def test_package_custom_case_name(self):
         """Test custom case name in zip."""

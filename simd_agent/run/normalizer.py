@@ -273,12 +273,23 @@ def _normalize_physics(config: dict[str, Any]) -> PhysicsV1:
         False
     )
     
-    # Extract turbulence model
+    # Extract turbulence model.
+    # The precheck stores it as ``config["turbulence"]["model"]`` (a sub-object,
+    # not a flat field).  Earlier code only checked the flat ``turbulence_model``
+    # variants and missed this, which silently demoted every kOmegaSST case to
+    # ``simulationType laminar`` downstream — causing rhoSimpleFoam to diverge
+    # with massive pressure spikes on any moderate-Re forced-convection case.
+    _turb_obj = config.get("turbulence") or {}
+    if not isinstance(_turb_obj, dict):
+        _turb_obj = {}
     turbulence_model = (
         physics_data.get("turbulence_model") or
         physics_data.get("turbulenceModel") or
         config.get("turbulence_model") or
-        config.get("turbulenceModel")
+        config.get("turbulenceModel") or
+        _turb_obj.get("model") or
+        _turb_obj.get("RASModel") or
+        _turb_obj.get("turbulenceModel")
     )
     
     return PhysicsV1(

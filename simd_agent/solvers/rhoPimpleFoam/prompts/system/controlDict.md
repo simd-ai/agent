@@ -10,11 +10,11 @@
 
 **Never use the user-supplied `delta_t` directly for cryogenic cases without checking it against the flow velocity.**
 
-With `adjustTimeStep yes` and `maxCo 0.9`, OpenFOAM will halve deltaT every step if Co > 0.9 — but it CANNOT rescue a case where the **first** time step produces Co >> 1 and k goes negative (turbulence blow-up; see fvSolution notes). The damage from the first step is irreversible: once k < 0 → nut < 0 → velocity diverges, subsequent halving is too late.
+With `adjustTimeStep yes` and `maxCo <max_co>`, OpenFOAM will halve deltaT every step if Co > maxCo — but it CANNOT rescue a case where the **first** time step produces Co >> 1 and k goes negative (turbulence blow-up; see fvSolution notes). The damage from the first step is irreversible: once k < 0 → nut < 0 → velocity diverges, subsequent halving is too late.
 
 | Condition | Recommended initial deltaT |
 |---|---|
-| High-Re established flow, U > 1 m/s | `delta_t` from CaseSpec (typical 0.001–0.01 s), `maxCo 0.9` |
+| High-Re established flow, U > 1 m/s | `delta_t` from CaseSpec (typical 0.001–0.01 s), `maxCo` from CaseSpec |
 | Low-velocity or cryogenic startup (U < 0.5 m/s) | `1e-5` s, `maxCo 0.2` |
 | Cryogenic with T span > 100 K (LN2/LH2/LOX) | `1e-5` s, `maxCo 0.2` |
 
@@ -34,11 +34,12 @@ stopAt          endTime;
 deltaT          <delta_t>;   // replace with 1e-5 for cryogenic cases (see rules above)
 endTime         <end_time>;
 
-writeControl    timeStep;
-writeInterval   <write_interval>;   // endTime / 30 → ~30 snapshots
+writeControl    adjustableRunTime;
+writeInterval   <write_interval>;   // from CaseSpec (~100 snapshots)
 
 runTimeModifiable true;
 
 adjustTimeStep  yes;
-maxCo           0.2;   // MUST be ≤ 0.2 for cryogenic startup; 0.9 ok only for well-established high-Re flows
+maxCo           <max_co>;           // from CaseSpec (2.0 for PIMPLE; override to 0.2 for cryogenic startup)
+maxDeltaT       <max_delta_t>;      // from CaseSpec (= writeInterval)
 ```

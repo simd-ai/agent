@@ -1967,23 +1967,49 @@ async def generate_report(args: dict[str, Any], snap: SimulationSnapshot) -> dic
             if _conv_lines:
                 _conv_text = "\n".join(_conv_lines[-15:])
                 _provider = get_provider()
+                _bg_system = (
+                    "You are a technical writer producing content for an engineering report. "
+                    "Output ONLY the final polished text — no thinking, no drafts, no meta-commentary, "
+                    "no remarks about the task, no labels like 'Draft:' or 'Background:'. "
+                    "Never reference the conversation, the user, or your own reasoning process."
+                )
+                _bg_user = (
+                    "Write 2–3 sentences for the 'Background' section of a CFD simulation report. "
+                    "Third person, professional tone. "
+                    "Focus on: what was simulated, the key physical setup "
+                    "(geometry, fluid, conditions), and the objective.\n\n"
+                    "Context:\n"
+                    f"{_conv_text}"
+                )
                 _summary_resp = await _provider.client.aio.models.generate_content(
                     model=_provider.models["default"],
-                    contents=(
-                        f"Summarize the following conversation between a user and a CFD assistant "
-                        f"into 2–3 sentences suitable for the 'Background' section of an engineering "
-                        f"simulation report. Write in third person, professional tone. "
-                        f"Focus on: what the user wanted to simulate, the key physical setup "
-                        f"(geometry, fluid, conditions), and the objective. "
-                        f"Do NOT mention the chat or conversation itself.\n\n"
-                        f"{_conv_text}"
-                    ),
+                    contents=[
+                        _provider.types.Content(
+                            role="user",
+                            parts=[_provider.types.Part.from_text(text=_bg_system + "\n\n" + _bg_user)],
+                        ),
+                    ],
                     config=_provider.types.GenerateContentConfig(
                         temperature=0.2,
                         max_output_tokens=256,
+                        system_instruction=_bg_system,
                     ),
                 )
-                _bg_paragraph = (_summary_resp.text or "").strip()
+                _raw_bg = (_summary_resp.text or "").strip()
+                # Strip any residual chain-of-thought / meta labels
+                import re as _re
+                _raw_bg = _re.sub(
+                    r"^(Draft\s*\d*\s*:|Background\s*:|Summary\s*:|Here\s*(?:is|are)\s*.*?:)\s*",
+                    "", _raw_bg, flags=_re.IGNORECASE,
+                ).strip()
+                # Reject if it still looks like meta-commentary
+                _lower_bg = _raw_bg.lower()
+                if any(phrase in _lower_bg for phrase in [
+                    "my task", "the user", "the conversation", "i need to",
+                    "i should", "let me", "surprisingly", "chain of thought",
+                ]):
+                    _raw_bg = ""
+                _bg_paragraph = _raw_bg
         except Exception as exc:
             logger.debug("[generate_report] background summary failed: %s", exc)
 

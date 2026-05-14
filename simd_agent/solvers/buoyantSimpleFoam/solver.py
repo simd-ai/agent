@@ -59,25 +59,73 @@ class BuoyantSimpleFoamSolver(SolverPlugin):
             # system/fvSchemes and system/fvSolution are generated
             # deterministically in validate(), not by the LLM.
             "system/fvOptions",
-            "constant/thermophysicalProperties", "constant/turbulenceProperties",
-            "constant/g",
+            "constant/thermophysicalProperties", "constant/g",
             # 0/p is synthesised by _fix_pressure_field from 0/p_rgh, so the
             # LLM only needs to generate the solved field (0/p_rgh).
             "0/U", "0/p_rgh", "0/T",
         ]
         for f in self.turbulence_fields(turb_model):
+            if f == "nut":
+                continue  # 0/nut rendered deterministically (Phase 4)
             files.append(f"0/{f}")
-        if turb_model not in ("laminar", "none", ""):
-            files.append("0/alphat")
+        # 0/alphat is rendered deterministically (Phase 4).
         return files
+
+    # ── Deterministic builders ────────────────────────────────────────────
+
+    def _build_fv_solution(self, config: dict[str, Any]) -> str:
+        """buoyantSimpleFoam fvSolution — SIMPLE, compressible, p_rgh + gravity.
+
+        Pressure field is ``p_rgh``; ``constant/g`` is required.  Otherwise
+        the same SIMPLE+energy shape as rhoSimpleFoam.
+        """
+        ctx = self._fv_context(config)
+        eq_fields = self._equation_fields(ctx.turb_model)
+
+        p_block, _ = self._build_pressure_solver_block(ctx, is_simple=True)
+        rho_block = self._build_rho_solver_block()
+        eq_block, _ = self._build_equation_solver_block(eq_fields, is_simple=True)
+        bounds_block = self._build_compressible_bounds(config, ctx)
+        simple_block = self._build_simple_block(ctx, eq_fields, bounds_block)
+        relax_block = self._build_relaxation_simple(ctx, eq_fields)
+
+        return (
+            self._foam_file_header("fvSolution")
+            + "solvers\n{\n"
+            + p_block
+            + rho_block
+            + eq_block
+            + "}\n"
+            + simple_block
+            + relax_block
+            + self._foam_file_footer()
+        )
+
+    def _build_fv_schemes(self, config: dict[str, Any]) -> str:
+        """buoyantSimpleFoam fvSchemes — steady, compressible, no div(phid,p)."""
+        ctx = self._fv_context(config)
+        return (
+            self._foam_file_header("fvSchemes")
+            + self._build_ddt_block() + "\n"
+            + self._build_grad_block(ctx) + "\n"
+            + self._build_div_block(ctx) + "\n"
+            + self._build_laplacian_block(ctx) + "\n"
+            + self._build_interpolation_block() + "\n"
+            + self._build_sngrad_block(ctx) + "\n"
+            + self._build_flux_required_block()
+            + ("\n" + self._build_wall_dist_block(ctx.turb_model)
+               if ctx.turb_model != "laminar" else "")
+            + self._foam_file_footer()
+        )
 
     def validate(self, files: dict[str, str], config: dict[str, Any]) -> ValidationResult:
         issues: list[ValidationIssue] = []
         fixed = dict(files)
 
         # Deterministic fvSolution + fvSchemes
-        fixed["system/fvSolution"] = self._build_fv_solution(config)
-        fixed["system/fvSchemes"] = self._build_fv_schemes(config)
+        # Deterministic files (LLM never generates these — Phase 4)
+
+        fixed.update(self.render_deterministic_files(config))
 
         fixed = self._fix_controldict_solver(fixed, issues)
         fixed = self._fix_pressure_field(fixed, issues)
@@ -87,5 +135,6 @@ class BuoyantSimpleFoamSolver(SolverPlugin):
             if ef in fixed:
                 del fixed[ef]
                 issues.append(ValidationIssue("warning", ef, f"Removed {ef}: thermo reads 0/T."))
+        fixed = self._unify_inlet_turbulence(fixed, issues, config)
         return ValidationResult(files=fixed, issues=issues)
 

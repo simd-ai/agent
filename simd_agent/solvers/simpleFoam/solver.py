@@ -75,16 +75,61 @@ class SimpleFoamSolver(SolverPlugin):
             # system/fvSchemes and system/fvSolution are NOT here — they are
             # generated deterministically in validate(), not by the LLM.
             "constant/transportProperties",
-            "constant/turbulenceProperties",
             "0/U",
             "0/p",
         ]
 
         # Turbulence fields
         for f in self.turbulence_fields(turb_model):
+            if f == "nut":
+                continue  # 0/nut rendered deterministically (Phase 4)
             files.append(f"0/{f}")
 
         return files
+
+    # ── Deterministic builders ────────────────────────────────────────────
+
+    def _build_fv_solution(self, config: dict[str, Any]) -> str:
+        """simpleFoam fvSolution — SIMPLE, incompressible, no energy.
+
+        No rho block, no compressible bounds.  Pressure uses PCG/DIC fallback.
+        """
+        ctx = self._fv_context(config)
+        eq_fields = self._equation_fields(ctx.turb_model)
+
+        p_block, _ = self._build_pressure_solver_block(ctx, is_simple=True)
+        eq_block, _ = self._build_equation_solver_block(eq_fields, is_simple=True)
+        # No bounds, no rho block (incompressible)
+        simple_block = self._build_simple_block(ctx, eq_fields, "")
+        relax_block = self._build_relaxation_simple(ctx, eq_fields)
+
+        return (
+            self._foam_file_header("fvSolution")
+            + "solvers\n{\n"
+            + p_block
+            + eq_block
+            + "}\n"
+            + simple_block
+            + relax_block
+            + self._foam_file_footer()
+        )
+
+    def _build_fv_schemes(self, config: dict[str, Any]) -> str:
+        """simpleFoam fvSchemes — steady incompressible, linearUpwind grad(U)."""
+        ctx = self._fv_context(config)
+        return (
+            self._foam_file_header("fvSchemes")
+            + self._build_ddt_block() + "\n"
+            + self._build_grad_block(ctx) + "\n"
+            + self._build_div_block(ctx) + "\n"
+            + self._build_laplacian_block(ctx) + "\n"
+            + self._build_interpolation_block() + "\n"
+            + self._build_sngrad_block(ctx) + "\n"
+            + self._build_flux_required_block()
+            + ("\n" + self._build_wall_dist_block(ctx.turb_model)
+               if ctx.turb_model != "laminar" else "")
+            + self._foam_file_footer()
+        )
 
     # ── Validation ────────────────────────────────────────────────────────
 
@@ -99,8 +144,9 @@ class SimpleFoamSolver(SolverPlugin):
         # Any LLM-generated versions are discarded.
         # Both methods live in SolverPlugin base class — single source of
         # truth for all solvers (mesh-quality-aware, velocity-aware).
-        fixed["system/fvSolution"] = self._build_fv_solution(config)
-        fixed["system/fvSchemes"] = self._build_fv_schemes(config)
+        # Deterministic files (LLM never generates these — Phase 4)
+
+        fixed.update(self.render_deterministic_files(config))
         issues.append(
             ValidationIssue(
                 "info",
@@ -146,6 +192,9 @@ class SimpleFoamSolver(SolverPlugin):
 
         # Floor turbulence ICs (prevent division-by-zero in wall functions)
         fixed = self._fix_turbulence_ic_floors(fixed, issues)
+
+        # Unify k/ω/ε across all inlets — flow-wide property, not per-inlet
+        fixed = self._unify_inlet_turbulence(fixed, issues, config)
 
         # Patch coverage check
         fixed = self._check_patch_coverage(fixed, issues, config)

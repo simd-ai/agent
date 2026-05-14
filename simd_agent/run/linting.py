@@ -365,21 +365,42 @@ class CFDLinter:
         reynolds: float | None,
         config: SimulationConfigV1,
     ) -> FlowRegime | None:
-        """Determine flow regime from Reynolds number or config."""
-        # Check if explicitly set in physics
+        """Determine flow regime — explicit signals beat Reynolds.
+
+        Priority (highest first):
+
+          1. ``config.physics.flow_regime`` explicitly set → respect it.
+             This is the user / precheck-planner's stated physical intent.
+
+          2. ``config.physics.turbulence_model`` set to a non-laminar model
+             (kOmegaSST, kEpsilon, kOmega, …) → infer ``TURBULENT``.  A
+             caller that specified an RAS model is telling us the case is
+             turbulent; demoting to laminar from a Reynolds number derived
+             from an inaccurate bbox-D_h would contradict that intent and
+             crash the solver (rhoSimpleFoam SIGFPE cascade observed on
+             U-bend / multi-inlet geometries where bbox-D_h overshoots true
+             D_h by ~3×).
+
+          3. Otherwise fall back to Reynolds-based detection using
+             classical thresholds (laminar / transitional / turbulent).
+        """
+        # 1. Explicit physics.flow_regime wins
         if config.physics.flow_regime:
             return config.physics.flow_regime
-        
-        # Use Reynolds number
+
+        # 2. Explicit turbulence model implies turbulent — never demote.
+        tm = config.physics.turbulence_model
+        if isinstance(tm, str) and tm and tm.lower() not in ("laminar", "none"):
+            return FlowRegime.TURBULENT
+
+        # 3. Reynolds-based fallback (classical thresholds).
         if reynolds is None:
             return None
-        
         if reynolds < 2300:
             return FlowRegime.LAMINAR
-        elif reynolds < 4000:
+        if reynolds <= 4000:
             return FlowRegime.TRANSITIONAL
-        else:
-            return FlowRegime.TURBULENT
+        return FlowRegime.TURBULENT
     
     def _select_solver_and_turbulence(
         self,
@@ -407,13 +428,17 @@ class CFDLinter:
         else:
             recommended_solver = "simpleFoam"
         
-        # Determine recommended turbulence model
+        # Determine recommended turbulence model.
+        # Default to kOmegaSST for any turbulent / unknown case — it matches
+        # the ``default_turbulence_model`` declared on every SolverPlugin
+        # and the ``resolve_turbulence_spec`` fallback.  Keeps the linter
+        # consistent with the rest of the pipeline (Phases 1–4).
         if regime == FlowRegime.LAMINAR:
             recommended_turb = "laminar"
-        elif regime == FlowRegime.TRANSITIONAL:
-            recommended_turb = "kOmegaSST"  # Better for transitional
         else:
-            recommended_turb = "kEpsilon"  # Robust default
+            # turbulent / transitional / unknown — kOmegaSST is the safest
+            # broadly-applicable RAS model and what the plugins expect.
+            recommended_turb = "kOmegaSST"
         
         # Check if current solver is compatible
         solver = current_solver

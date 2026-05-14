@@ -63,7 +63,7 @@ solvers
         smoother        GaussSeidel;
         tolerance       1e-8;
         relTol          0.01;
-        nCoarsestCells  500;
+        nCoarsestCells  20;
         coarsestLevelCorr
         {
             solver          PBiCGStab;
@@ -100,6 +100,8 @@ PIMPLE
     {
         p_rgh   { tolerance 1e-4; relTol 0; }
         U       { tolerance 1e-4; relTol 0; }
+        k       { tolerance 1e-3; relTol 0; }
+        omega   { tolerance 1e-3; relTol 0; }
         h       { tolerance 1e-4; relTol 0; }
     }
 }

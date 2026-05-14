@@ -102,14 +102,38 @@ class TestSolverSelection:
         # For steady turbulent flow, pimpleFoam is also valid
         assert result.validated_config.get("solver") in ["simpleFoam", "pimpleFoam"]
     
-    async def test_turbulence_override_for_laminar(self, linter, laminar_config):
-        """Test that turbulence model is overridden to laminar for low Re."""
-        # User specifies turbulent model for laminar flow
+    async def test_explicit_turbulence_model_is_respected(self, linter, laminar_config):
+        """User-provided turbulence model wins over a low Reynolds number.
+
+        Geometry-inferred Re is unreliable on complex / multi-inlet meshes
+        (the bbox-derived D_h tends to overshoot for U-bends, tee-junctions
+        and ducts with branches).  When the user — or the precheck planner —
+        explicitly sets a turbulent model, the linter must respect it; the
+        previous "Re wins" behaviour silently demoted real RAS cases to
+        ``simulationType laminar`` and crashed rhoSimpleFoam with SIGFPE.
+        """
+        # User specifies a turbulent model on a fixture whose geometry happens
+        # to give low Re.  The model carries through.
         laminar_config["turbulence_model"] = "kEpsilon"
-        
+
         result = await linter.lint(laminar_config)
-        
-        # Should be changed to laminar
+
+        # Honoured — no auto-demotion to laminar.
+        assert result.validated_config.get("turbulence_model") == "kEpsilon"
+
+    async def test_explicit_laminar_flow_regime_overrides_model(
+        self, linter, laminar_config
+    ):
+        """The user can still force laminar by stating it explicitly.
+
+        ``flow_regime=laminar`` is an unambiguous user signal that beats any
+        turbulence model that may have been left in the config.
+        """
+        laminar_config["flow_regime"] = "laminar"
+        laminar_config["turbulence_model"] = "kEpsilon"
+
+        result = await linter.lint(laminar_config)
+
         assert result.validated_config.get("turbulence_model") == "laminar"
         
         # Should have a recommendation about this

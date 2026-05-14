@@ -20,8 +20,6 @@ router = APIRouter(prefix="/api/simulations", tags=["simulations"])
 
 
 # ── Simulation CRUD ─────────────────────────────────────────────────────
-
-
 @router.post("", status_code=201)
 async def create_simulation(body: SimulationCreate) -> SimulationOut:
     # Enforce project limit for free-tier users

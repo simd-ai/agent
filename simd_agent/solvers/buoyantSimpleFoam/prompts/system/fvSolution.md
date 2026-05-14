@@ -46,7 +46,7 @@ Only use names from these tables. Any other name causes a fatal IO error at runt
 ## Solver settings
 
 - **p_rgh**: use `GAMG` with smoother `GaussSeidel`. Never `DIC` — causes SIGFPE.
-  Include `nCoarsestCells 500;` and `coarsestLevelCorr` with `PBiCGStab; preconditioner none;`.
+  Include `nCoarsestCells  20;` and `coarsestLevelCorr` with `PBiCGStab; preconditioner none;`.
 - **U, h, turbulence, alphat**: use `smoothSolver` with `symGaussSeidel`.
 - Use regex group `"(U|h|k|omega|epsilon|alphat)"` for all equation fields.
 
@@ -69,7 +69,7 @@ solvers
         smoother        GaussSeidel;
         tolerance       1e-7;
         relTol          0.01;
-        nCoarsestCells  500;
+        nCoarsestCells  20;
         coarsestLevelCorr
         {
             solver          PBiCGStab;

@@ -196,21 +196,36 @@ def normalize_physics(raw: dict[str, Any], top_level: dict[str, Any]) -> Physics
     """
     # Merge top-level fields into physics
     data = {}
-    
+
     # Top-level overrides
-    for key in ["flow_regime", "flowRegime", "time_scheme", "timeScheme", 
+    for key in ["flow_regime", "flowRegime", "time_scheme", "timeScheme",
                 "compressibility", "heat_transfer", "heatTransfer",
                 "enable_heat_transfer", "enableHeatTransfer",
                 "turbulence_model", "turbulenceModel"]:
         snake_key = camel_to_snake(key)
         if key in top_level:
             data[snake_key] = top_level[key]
-    
+
+    # Precheck shape — turbulence is a NESTED sub-object, not a flat field.
+    # The precheck emits ``{"turbulence": {"model": "kOmegaSST", ...}}``.
+    # Without this lookup, the linter sees ``turbulence_model = None``,
+    # defaults to laminar, and the case ships with ``simulationType laminar``
+    # (the regression that crashed rhoSimpleFoam with SIGFPE in iteration 64).
+    _turb_obj = top_level.get("turbulence")
+    if isinstance(_turb_obj, dict):
+        _nested_model = (
+            _turb_obj.get("model")
+            or _turb_obj.get("RASModel")
+            or _turb_obj.get("turbulenceModel")
+        )
+        if _nested_model and not data.get("turbulence_model"):
+            data["turbulence_model"] = _nested_model
+
     # Physics object (if provided)
     if raw:
         physics_data = deep_convert_keys(raw, camel_to_snake)
         data.update(physics_data)
-    
+
     # Parse flow_regime - None by default, auto-detected from Reynolds
     flow_regime: FlowRegime | None = None
     raw_regime = data.get("flow_regime")
@@ -219,6 +234,20 @@ def normalize_physics(raw: dict[str, Any], top_level: dict[str, Any]) -> Physics
             flow_regime = FlowRegime(raw_regime.lower() if isinstance(raw_regime, str) else raw_regime)
         except (ValueError, AttributeError):
             pass  # Invalid regime -> will be auto-detected
+
+    # Soft inference: a non-laminar turbulence model implies turbulent flow.
+    # When the user provides an explicit model (e.g. kOmegaSST) but the flow
+    # regime is missing, we trust the model.  Prevents the linter from
+    # auto-detecting laminar from a tiny / missing Reynolds number when the
+    # case clearly intends RAS / LES.
+    _t_model = data.get("turbulence_model")
+    if (
+        flow_regime is None
+        and isinstance(_t_model, str)
+        and _t_model
+        and _t_model.lower() not in ("laminar", "none")
+    ):
+        flow_regime = FlowRegime.TURBULENT
     
     # Parse time_scheme
     time_scheme = TimeScheme.STEADY

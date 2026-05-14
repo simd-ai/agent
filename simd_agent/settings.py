@@ -30,8 +30,8 @@ class Settings(BaseSettings):
 
     # Simulation Server (OpenFOAM runner — configurable endpoint)
     simulation_server_url: str = Field(
-        default="https://vernie-unpreservable-supermentally.ngrok-free.dev",
-        description="Base URL for the SIMD Simulation Runner server (OpenFOAM)",
+        description="Base URL for the SIMD Simulation Runner server (OpenFOAM). "
+                    "Must be set via SIMULATION_SERVER_URL in .env.",
     )
 
     # LLM Provider — the registry reads these to configure the active provider.

@@ -45,7 +45,7 @@ thermoType
 }
 mixture
 {
-    specie      { nMoles 1; molWeight <molWeight>; }
+    specie      { molWeight <molWeight>; }
     thermodynamics { Cp <Cp>; Hf 0; }
     transport   { mu <mu>; Pr <Pr>; }
 }
@@ -68,7 +68,7 @@ thermoType
 }
 mixture
 {
-    specie      { nMoles 1; molWeight <molWeight>; }
+    specie      { molWeight <molWeight>; }
     thermodynamics                   // hPolynomial: CpCoeffs<8> + Hf + Sf (NOT plain Cp)
     {
         Hf              0;

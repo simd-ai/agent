@@ -95,8 +95,9 @@ class Orchestrator:
         self.store = store
         self.request = request
         self._cancelled = cancelled or asyncio.Event()
+        self._stop_requested = asyncio.Event()
         self.settings = get_settings()
-        
+
         # Components (lazily initialized)
         self._linter: CFDLinter | None = None
         self._planner: Planner | None = None
@@ -908,16 +909,29 @@ class Orchestrator:
                     len(zip_bytes),
                 )
 
-                # ── Submit to simulation server (TEST mode — 1 iteration) ──
-                # TEST mode is used here for fast validation during the self-healing
-                # loop; the server patches controlDict to endTime=1 so errors are
-                # caught cheaply.  On success we immediately run the full simulation.
+                # ── Submit to simulation server (TEST mode — watchdog validation) ──
+                # The sim server runs the solver normally (no controlDict patching)
+                # and kills it after _TEST_TIMEOUT_SECONDS (20s, in runner.py:805).
+                # Pass = ≥1 iteration parsed before the kill, signalled by the
+                # `run_test_passed` SSE event. On pass we immediately submit FULL.
+                # Retry submission up to 3 times for transient connectivity issues
+                # (ngrok tunnel flaps, brief server restarts) before reporting failure.
                 self._check_cancelled()
-                sim_result = await self._run_on_sim_server(
-                    zip_bytes,
-                    mode=SimRunMode.TEST,
-                    n_cores=1,   # always serial for test/dry-run
-                )
+                sim_result: dict = {"success": False, "error": "Not submitted"}
+                for _submit_attempt in range(1, 4):
+                    sim_result = await self._run_on_sim_server(
+                        zip_bytes,
+                        mode=SimRunMode.TEST,
+                        n_cores=1,   # server force-overrides TEST to 1 anyway (runner.py:1112)
+                    )
+                    if sim_result["success"] or "Failed to submit" not in sim_result.get("error", ""):
+                        break  # success or a real sim error — stop retrying
+                    if _submit_attempt < 3:
+                        logger.warning(
+                            "[SIM_SERVER] Submit attempt %d/3 failed: %s — retrying in 5s",
+                            _submit_attempt, sim_result.get("error"),
+                        )
+                        await asyncio.sleep(5)
 
                 import json as _json
                 logger.debug(
@@ -926,10 +940,11 @@ class Orchestrator:
                 )
 
                 if sim_result["success"]:
-                    # ── TEST passed → automatically run the FULL simulation ──
-                    # The generated controlDict already has the correct endTime
-                    # (from validated_config.solver.max_iterations).  FULL mode
-                    # lets the solver run to that endTime without any patching.
+                    # ── TEST passed → run the FULL simulation ──
+                    # Both TEST and FULL submit the same ZIP with the same
+                    # controlDict (endTime from validated_config.solver.max_iterations).
+                    # The only difference is that TEST is killed early by the
+                    # server's watchdog; FULL runs to endTime with mpirun -np 12.
                     logger.info(
                         f"[CODEGEN] Test validation passed (iter {self._iteration}). "
                         "Starting full simulation run..."
@@ -955,10 +970,26 @@ class Orchestrator:
                     artifacts = full_result.get("artifacts", [])
 
                     if full_result["success"]:
-                        await self.event_bus.emit_run_succeeded(
-                            f"Simulation completed after {self._iteration} codegen iteration(s)",
-                            artifacts,
+                        was_stopped = full_result.get("stopped", False)
+                        final_status = RunStatus.STOPPED if was_stopped else RunStatus.SUCCEEDED
+                        final_label = "stopped" if was_stopped else "succeeded"
+                        final_summary = (
+                            "Simulation stopped by user — partial results available"
+                            if was_stopped
+                            else "Simulation completed successfully"
                         )
+
+                        if was_stopped:
+                            await self.event_bus.emit(
+                                "run_stopped",
+                                message=f"Simulation stopped after {self._iteration} codegen iteration(s)",
+                                payload={"artifacts": artifacts},
+                            )
+                        else:
+                            await self.event_bus.emit_run_succeeded(
+                                f"Simulation completed after {self._iteration} codegen iteration(s)",
+                                artifacts,
+                            )
 
                         # Compute final convergence assessment
                         if self._all_progress and not self._last_convergence:
@@ -976,13 +1007,12 @@ class Orchestrator:
 
                         await self.store.finalize_run(
                             run_id=self.run_id,
-                            status=RunStatus.SUCCEEDED,
+                            status=final_status,
                             validated_config=self._lint_result.validated_config,
                             result={
                                 "artifacts": artifacts,
                                 "iterations": self._iteration,
                                 "solver": solver,
-                                # Store sim_run_id so the VTK endpoint can retrieve it
                                 "sim_run_id": full_result.get("sim_run_id"),
                                 "convergence": self._last_convergence,
                             },
@@ -1001,26 +1031,26 @@ class Orchestrator:
                             )
 
                         await self.event_bus.emit_final(
-                            status="succeeded",
+                            status=final_label,
                             validated_config=self._lint_result.validated_config,
                             artifacts=artifacts,
                             iterations=self._iteration,
                             retries=self._retries,
-                            summary="Simulation completed successfully",
+                            summary=final_summary,
                             case_type=case_type,
                             solver=solver,
                         )
 
                         get_telemetry().capture(RunCompleted(
                             solver=solver,
-                            success=True,
+                            success=not was_stopped,
                             duration_s=(datetime.utcnow() - self.event_bus._started_at).total_seconds(),
                             retry_count=self._retries,
                             mesh_cells=_mesh.get("check_mesh", {}).get("cells") if isinstance(_mesh.get("check_mesh"), dict) else None,
                         ), user_id=_uid)
 
                         return FinalResult(
-                            status=RunStatus.SUCCEEDED,
+                            status=final_status,
                             validated_config=self._lint_result.validated_config,
                             artifacts=artifacts,
                             iterations=self._iteration,
@@ -1044,7 +1074,14 @@ class Orchestrator:
                 sim_logs = sim_result.get("logs", "")
                 sim_exit_code = sim_result.get("exit_code")
                 sim_stderr = sim_result.get("stderr", "")
-                
+
+                # ── Detect server connectivity failures ──
+                # Submit failures (server unreachable, ngrok down, etc.) are NOT
+                # file-generation issues.  Retrying with regenerated files wastes
+                # time and the LLM error summarizer misdiagnoses them as "truncated
+                # controlDict" because there's no real OpenFOAM error to analyse.
+                _is_submit_failure = "Failed to submit" in sim_error
+
                 # ── Log simulation error for visibility ──
                 logger.warning(
                     "[SIM_ERROR] Simulation failed (iter %d, exit_code=%s): %s",
@@ -1055,14 +1092,30 @@ class Orchestrator:
                     _tail = "\n".join(_err_detail.split("\n")[-30:])
                     logger.debug("[SIM_ERROR] Last output:\n%s", _tail)
                 logger.debug("[SIM_ERROR] Files sent: %s", list(self._current_files.keys()))
-                
+
                 if self._retries >= max_retries:
                     break
-                
+
                 self._retries += 1
-                
+
+                if _is_submit_failure:
+                    # Server connectivity failure — NOT a file-generation issue.
+                    # Don't diagnose files or regenerate code.  Break out of the
+                    # retry loop with a clear error.
+                    logger.warning(
+                        "[CODEGEN] Server submit failed (attempt %d/%d): %s "
+                        "— this is a connectivity issue, not a code issue",
+                        self._retries, max_retries, sim_error,
+                    )
+                    await self.event_bus.emit_error_summary(
+                        f"Simulation server unreachable: {sim_error}",
+                        [{"description": "Check that the simulation server is running and reachable"}],
+                        [],
+                    )
+                    break  # no point retrying codegen for a server issue
+
                 logger.warning(f"[CODEGEN] Simulation failed (attempt {self._retries}/{max_retries}): {sim_error}")
-                
+
                 # Store error for context in next LLM call.
                 # The new simulation server emits solver output via the
                 # run_failed payload's "stderr" key rather than run_log events,
@@ -1959,6 +2012,7 @@ class Orchestrator:
             all_events: list[SimRunEvent] = []
             test_passed_payload: dict | None = None   # set when run_test_passed arrives
             was_cancelled = False
+            was_stopped = False
 
             async for event in self.sim_server.stream_events(sim_run_id, on_event=on_sim_event):
                 all_events.append(event)
@@ -1973,10 +2027,22 @@ class Orchestrator:
                     was_cancelled = True
                     break
 
+                # ── Check for stop request ────────────────────────────────────
+                if self._stop_requested.is_set():
+                    logger.info("[SIM_SERVER] Run stop requested — stopping sim server gracefully")
+                    try:
+                        await self.sim_server.stop_run(sim_run_id)
+                    except Exception as _se:
+                        logger.warning("[SIM_SERVER] Failed to stop sim server run: %s", _se)
+                    # Don't break — keep streaming to receive reconstruction events
+                    # and the final run_stopped / artifacts_ready events.
+                    self._stop_requested.clear()
+                    was_stopped = True
+
                 # ── Raw simulation data logging ────────────────────────────────
                 if event.type in ("run_log", "run_progress", "run_progress_batch",
                                   "run_started", "run_succeeded", "run_failed",
-                                  "run_test_passed"):
+                                  "run_test_passed", "run_stopped"):
                     logger.debug(
                         "[SIM_RAW] type=%s level=%s seq=%s message=%s",
                         event.type, event.level, event.seq, event.message,
@@ -1989,7 +2055,7 @@ class Orchestrator:
                     break   # no artifacts_ready will follow — exit stream now
 
                 if event.type == "artifacts_ready":
-                    break   # full run completed normally
+                    break   # full run or stopped run completed
 
             if was_cancelled:
                 raise OrchestrationError("Run cancelled")
@@ -2015,20 +2081,31 @@ class Orchestrator:
             # ── FULL mode: check final status and collect artifacts ───────────
             final_status = await self.sim_server.get_status(sim_run_id)
 
-            if final_status.status == SimRunStatus.SUCCEEDED:
+            if final_status.status in (SimRunStatus.SUCCEEDED, SimRunStatus.STOPPED):
                 artifacts = await self.sim_server.get_artifacts(sim_run_id)
                 artifacts_list = [
                     a.model_dump() for a in artifacts
                     if not (a.path or a.name or "").startswith("processor")
                 ]
-                logger.debug("[SIM] Succeeded: %d artifacts", len(artifacts_list))
-                await self.event_bus.emit_sim_succeeded(
-                    sim_run_id=sim_run_id,
-                    duration_seconds=final_status.duration_seconds or 0.0,
-                    artifacts=artifacts_list,
-                )
+                is_stopped = final_status.status == SimRunStatus.STOPPED
+                logger.debug("[SIM] %s: %d artifacts",
+                             "Stopped" if is_stopped else "Succeeded",
+                             len(artifacts_list))
+                if is_stopped:
+                    await self.event_bus.emit_sim_stopped(
+                        sim_run_id=sim_run_id,
+                        duration_seconds=final_status.duration_seconds or 0.0,
+                        artifacts=artifacts_list,
+                    )
+                else:
+                    await self.event_bus.emit_sim_succeeded(
+                        sim_run_id=sim_run_id,
+                        duration_seconds=final_status.duration_seconds or 0.0,
+                        artifacts=artifacts_list,
+                    )
                 return {
                     "success": True,
+                    "stopped": is_stopped,
                     "sim_run_id": sim_run_id,
                     "artifacts": artifacts_list,
                     "logs": logs,

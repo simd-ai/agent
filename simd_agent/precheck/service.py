@@ -915,28 +915,48 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
         flow_regime = "turbulent"
         turb_model = "kOmegaSST"
 
-        # Guard: only allow heat transfer if the user prompt contains thermal keywords.
-        # The LLM planner sometimes autonomously adds temperature BCs even when the user
-        # didn't request heat transfer — this guard prevents that from selecting rhoSimpleFoam.
+        # Heat transfer detection.
+        #
+        # Trust the planner's explicit signal first: when the planner sets
+        # ``strategyT.status == "selected"`` AND attaches a concrete
+        # ``staticTemperature`` / ``totalTemperature`` value, the user
+        # provided a temperature for that patch — that IS heat transfer.
+        #
+        # The keyword check below is a softer second signal that catches
+        # cases where the planner failed to extract a concrete value but
+        # the prompt clearly talks about temperature.  It is NOT a veto on
+        # the planner's explicit per-patch decisions any more — previously
+        # this guard was stripping legitimate T BCs whenever the user's
+        # most-recent message didn't repeat the thermal keywords.
         _HEAT_KEYWORDS = (
             "temperature", "thermal", "heat transfer", "heat flux",
             "heated", "cooled", "hot wall", "cold wall", "hot ", "cold ",
             "heating", "cooling", "convection heat", "conduction",
             "kelvin", " k ", "celsius", "degrees",
         )
-        _user_wants_heat = (
+        _prompt_has_heat_keyword = (
             any(kw in prompt_lower for kw in _HEAT_KEYWORDS) or
             any(kw in prompt_lower for kw in CRYOGENIC_KEYWORDS)
         )
 
         for p in boundary_plan.get("patches", []):
-            # Only count as heat transfer if:
-            # 1. A concrete temperature VALUE was provided by the planner, AND
-            # 2. The user actually asked for heat transfer (keyword check)
-            if not _user_wants_heat:
+            _has_T = (
+                (p.get("hasStaticTemperature") and p.get("staticTemperature") is not None)
+                or (p.get("hasTotalTemperature") and p.get("totalTemperature") is not None)
+            )
+            # 1. Planner explicitly chose a T strategy for this patch (status="selected")
+            #    AND attached a concrete value → trust it unconditionally.
+            _t_strategy_selected = (
+                isinstance(p.get("strategyT"), dict)
+                and p["strategyT"].get("status") == "selected"
+            )
+            if _has_T and _t_strategy_selected:
+                has_heat = True
                 continue
-            if (p.get("hasStaticTemperature") and p.get("staticTemperature") is not None) or \
-               (p.get("hasTotalTemperature") and p.get("totalTemperature") is not None):
+            # 2. Planner attached a value but didn't explicitly mark T as
+            #    "selected" — fall back to the keyword check to avoid
+            #    autonomous T BCs the user never asked for.
+            if _has_T and _prompt_has_heat_keyword:
                 has_heat = True
         # Fluid preset (detected early so compressibility can be fluid-aware)
         fluid = self._detect_fluid(prompt_lower)
@@ -1053,9 +1073,26 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
         )
         _filling = any(kw in prompt_lower for kw in _FILLING_KEYWORDS)
 
+        # Gravity / buoyancy detection — keyword scan with explicit negation guard.
+        # Naive substring matching used to trip on "no gravity" because the
+        # substring "gravity" was present.  We now check for negation phrases
+        # FIRST; if any are present, gravity is off regardless of what keywords
+        # appear later in the prompt.
+        _NO_GRAVITY_PATTERNS = (
+            "no gravity", "without gravity", "no buoyancy", "without buoyancy",
+            "ignore gravity", "ignore buoyancy",
+            "neglect gravity", "neglect buoyancy",
+            "no g ", "no g.", "no g,",
+            "g=0", "g = 0",
+            "gravity off", "buoyancy off",
+            "forced convection",   # user wrote "forced convection" → no buoyancy
+        )
         _GRAVITY_KEYWORDS = ("gravity", "gravitational", "buoyancy", "buoyant",
                               "natural convection", "free convection")
-        _has_gravity = any(w in prompt_lower for w in _GRAVITY_KEYWORDS)
+        if any(p in prompt_lower for p in _NO_GRAVITY_PATTERNS):
+            _has_gravity = False
+        else:
+            _has_gravity = any(w in prompt_lower for w in _GRAVITY_KEYWORDS)
         if has_heat and _has_gravity:
             openfoam_solver = "buoyantPimpleFoam" if is_transient else "buoyantSimpleFoam"
         elif is_compressible:
@@ -1065,6 +1102,41 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
             openfoam_solver = "simpleFoam"
         else:
             openfoam_solver = "pimpleFoam"
+
+        # ── Solver-identity invariant (safety net) ───────────────────────────
+        # rhoSimpleFoam / rhoPimpleFoam / buoyantSimpleFoam / buoyantPimpleFoam
+        # all solve the energy equation and require ``0/T``.  If any of them was
+        # selected (typically by the compressibility path above, which has its
+        # own keyword detection) BUT ``has_heat`` is still ``False`` AND the
+        # planner extracted at least one temperature, the state is inconsistent.
+        # The solver's identity is the stronger signal — force has_heat=True and
+        # rebuild the per-patch BCs so the T values survive.
+        _ENERGY_SOLVERS = {
+            "rhoSimpleFoam", "rhoPimpleFoam",
+            "buoyantSimpleFoam", "buoyantPimpleFoam",
+        }
+        if openfoam_solver in _ENERGY_SOLVERS and not has_heat:
+            _planner_has_any_T = any(
+                (p.get("hasStaticTemperature") and p.get("staticTemperature") is not None)
+                or (p.get("hasTotalTemperature") and p.get("totalTemperature") is not None)
+                for p in boundary_plan.get("patches", [])
+            )
+            if _planner_has_any_T:
+                logger.warning(
+                    f"[PRECHECK] Solver-identity invariant: {openfoam_solver} is an "
+                    "energy solver but has_heat was False despite the planner "
+                    "extracting temperature BCs.  Forcing has_heat=True and "
+                    "rebuilding boundary conditions so the T values survive."
+                )
+                has_heat = True
+                # Re-run the BC builder for every patch with the corrected has_heat.
+                # patch_specs, _plan_by_name and flow_regime are all in scope.
+                boundary_conditions = {
+                    patch_name: self._patch_spec_args_to_patch_bc(
+                        spec, has_heat, flow_regime, _plan_by_name.get(patch_name, {})
+                    )
+                    for patch_name, spec in patch_specs.items()
+                }
 
         # Use LLM-provided end_time when transient; default to 5s if not specified
         # Cap transient simulations to 10s and steady-state to 1000 iterations.
@@ -1085,7 +1157,8 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
                 )
                 _end_time = _MAX_TRANSIENT_END_TIME
             _delta_t = max(1e-4, _end_time / 1000.0)
-            _write_interval = max(_delta_t, _end_time / 100.0)
+            _target_snapshots = max(30, min(100, int(_end_time * 10)))
+            _write_interval = max(_delta_t, _end_time / _target_snapshots)
         else:
             _end_time = None
             _delta_t = None
@@ -1112,11 +1185,11 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
             gravity=_has_gravity,
             openfoam_solver=openfoam_solver,
             phase_change_detected=phase_change_detected,
-            # solver: only carry temporal user-intent values from the prompt.
-            # algorithm / max_iterations / convergence_criteria are NOT set here —
-            # they are determined by the run-time normalizer/linter and sent back
-            # to the frontend via the `simulation_config_ready` event on ws/run.
+            # solver: algorithm derived from openfoam_solver so the UI shows
+            # the correct value immediately.  Temporal fields (end_time, delta_t,
+            # write_interval) extracted from the prompt.
             solver=SolverSettings(
+                algorithm=self._algorithm_for_solver(openfoam_solver),
                 end_time=_end_time,
                 delta_t=_delta_t,
                 write_interval=_write_interval,
@@ -1294,32 +1367,30 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
                     f"{U_max_laminar:.4g} m/s for a stable laminar simulation."
                 )
 
-        # ── Case 2: Default turbulent but Re is laminar ──────────────────────
+        # ── Case 2: Default turbulent but Re is "laminar" by D_h ────────────
+        # Previously: auto-demoted to laminar whenever Re < 2300.  This is
+        # unsafe on real meshes — bbox-D_h overshoots true D_h by ~3× on
+        # U-bends, tees and multi-inlet ducts, so the computed Re can read
+        # ~500 where the physical value is ~12 500.  The bug surfaced in
+        # production as ``cfd_physics.flow_regime = laminar`` +
+        # ``cfd_turbulence.model = kOmegaSST`` (DB inconsistency) and as
+        # ``simulationType laminar`` in turbulenceProperties of a
+        # rhoSimpleFoam case that promptly SIGFPE'd.
+        #
+        # New policy: surface the low Reynolds as an *informational
+        # warning* but DO NOT silently flip the regime.  The user only
+        # gets a laminar simulation when they explicitly asked for one
+        # (planner ``flow_regime: laminar`` OR the keyword "laminar" in
+        # the prompt — already handled in ``_build_suggested_config``).
         elif user_said_turbulent and Re < RE_LAMINAR_MAX:
-            # User didn't explicitly say "turbulent" — the default was applied.
-            # Switch to laminar since turbulence models at Re < 2300 are non-physical.
             warnings.append(
-                f"At {U_avg:.4g} m/s the Reynolds number is {Re:.0f} (laminar regime). "
-                f"Switched from turbulent (kOmegaSST) to laminar — turbulence models "
-                f"are not applicable below Re = {RE_LAMINAR_MAX}."
+                f"At {U_avg:.4g} m/s the bbox-derived Reynolds number is {Re:.0f} "
+                f"(below the classical laminar threshold of {RE_LAMINAR_MAX}). "
+                f"On complex / multi-inlet geometries D_h estimated from the "
+                f"bounding box can overshoot the true value by 3× or more, so "
+                f"the regime is kept turbulent.  If you intended a laminar "
+                f"simulation, set the flow regime explicitly."
             )
-            sc.flow_regime = "laminar"
-            sc.turbulence = TurbulenceSettings(
-                model="laminar",
-                turbulence_intensity=None,
-                turbulence_length_scale=None,
-                hydraulic_diameter=D_h,
-                wall_functions=False,
-                k=None, omega=None, epsilon=None, nut=None,
-            )
-            # Strip turbulence fields from boundary conditions
-            for bc in sc.boundary_conditions.values():
-                bc.k = None
-                bc.omega = None
-                bc.epsilon = None
-                bc.nut = None
-            # Solver stays the same (simpleFoam/pimpleFoam handle laminar fine)
-            corrected = True
 
         elif user_said_turbulent and RE_LAMINAR_MAX <= Re < RE_TURBULENT_MIN:
             # Transitional — warn but keep turbulent (safer choice)
@@ -1491,6 +1562,23 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
             if _T_field.type == "fixedValue" and _T_field.value is None:
                 _T_field = FieldBC(type="zeroGradient", value=None)
 
+        # Per-patch turbulence intensity from the planner output.
+        # Planner schema returns I as a fraction (0.05 = 5%); store as-is.
+        # None when the user didn't specify a TI for this patch — validator
+        # will fall back to a sensible global default.
+        _patch_TI: float | None = None
+        if turb and role == "inlet" and plan.get("hasTurbulenceIntensity"):
+            _ti_raw = plan.get("turbulenceIntensity")
+            if _ti_raw is not None:
+                try:
+                    _patch_TI = float(_ti_raw)
+                    # Planner sometimes emits a percentage rather than a
+                    # fraction — clamp to the fraction range.
+                    if _patch_TI > 1.0:
+                        _patch_TI = _patch_TI / 100.0
+                except (TypeError, ValueError):
+                    pass
+
         return PatchBoundaryCondition(
             patch_class=patch_class,
             confidence=_norm_conf(spec.get("confidence", 0.8)),
@@ -1501,6 +1589,7 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
             epsilon=_field("fieldEpsilon") if turb else None,
             omega=_field("fieldOmega") if turb else None,
             nut=_field("fieldNut") if turb else None,
+            turbulence_intensity=_patch_TI,
         )
 
     def _patch_spec_args_to_fragment(self, spec: dict[str, Any]) -> dict[str, Any]:
@@ -1831,6 +1920,30 @@ One paragraph recap, then a markdown table with ONLY the columns below (no extra
             if any(k in prompt_lower for k in kw):
                 return FLUID_PRESETS[key]
         return FLUID_PRESETS["air"]
+
+    @staticmethod
+    def _algorithm_for_solver(solver_name: str) -> str:
+        """Derive the pressure-velocity coupling algorithm from the solver name.
+
+        Uses the solver plugin registry when available (single source of truth).
+        Falls back to a name-based heuristic for legacy/multiphase solvers
+        that haven't been ported to plugins yet.
+        """
+        from simd_agent.solvers.registry import get_registry
+
+        plugin = get_registry().get(solver_name)
+        if plugin is not None:
+            return plugin.algorithm
+
+        # Fallback for solvers not yet in the plugin registry (legacy multiphase,
+        # chtMultiRegionFoam, etc.).  Transient solvers default to PIMPLE.
+        _name = solver_name.lower()
+        if "simple" in _name:
+            return "SIMPLE"
+        if "piso" in _name or _name == "icofoam":
+            return "PISO"
+        # interFoam, compressibleInterFoam, chtMultiRegionFoam, etc. all use PIMPLE
+        return "PIMPLE"
 
     def _detect_case_type(self, prompt_lower: str) -> str:
         if any(w in prompt_lower for w in ("pipe", "duct", "channel", "tube")):

@@ -6,13 +6,13 @@ application     buoyantPimpleFoam;
 startFrom       startTime;
 startTime       0;
 stopAt          endTime;
-endTime         <end_time_seconds>;  // physical seconds
-deltaT          <delta_t_seconds>;   // physical time step (e.g. 0.01 or 0.1)
+endTime         <end_time>;          // physical seconds, from CaseSpec
+deltaT          <delta_t>;           // physical time step, from CaseSpec
 writeControl    adjustableRunTime;
-writeInterval   <writeInterval>;     // endTime / 30 → ~30 snapshots (in seconds)
+writeInterval   <write_interval>;    // from CaseSpec (~100 snapshots)
 adjustTimeStep  yes;
-maxCo           0.5;                 // Courant number limit — 0.5 for buoyant cases
-maxDeltaT       0.1;                 // upper bound on automatic time-step growth
+maxCo           <max_co>;            // from CaseSpec (2.0 for PIMPLE)
+maxDeltaT       <max_delta_t>;       // from CaseSpec (= writeInterval)
 purgeWrite      0;
 writeFormat     ascii;
 writePrecision  6;
@@ -25,7 +25,8 @@ runTimeModifiable true;
 ## Notes
 
 - `endTime` and `deltaT` are in PHYSICAL SECONDS (not iteration counter).
-- `adjustTimeStep yes; maxCo 0.5` recommended for stability.
-  At Co=1.0 the limiter reacts too late to prevent divergence cascade in buoyant flows.
+- `maxCo` from CaseSpec (2.0 for PIMPLE). For buoyant cases with strong natural convection, consider reducing to 1.0 if residuals oscillate.
 - For fire/smoke simulations, initial `deltaT` should be small (0.001–0.01 s).
 - `application` MUST be `buoyantPimpleFoam` exactly.
+- `writeInterval` from CaseSpec gives ~100 snapshots for the full endTime.
+- `maxDeltaT` from CaseSpec (= writeInterval) prevents deltaT from jumping past a file write time.

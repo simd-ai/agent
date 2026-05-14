@@ -511,6 +511,11 @@ async def websocket_chat(websocket: WebSocket):
         logger.info("[WS/chat] Connection closed")
 
 
+# Active orchestrators by run_id — allows the REST stop endpoint to signal
+# a running orchestrator to stop gracefully.
+_active_orchestrators: dict[UUID, Orchestrator] = {}
+
+
 @app.websocket("/ws/run")
 async def websocket_run(websocket: WebSocket):
     """WebSocket endpoint for CFD workflow execution.
@@ -618,6 +623,7 @@ async def websocket_run(websocket: WebSocket):
             request=request,
             cancelled=cancelled,
         )
+        _active_orchestrators[run_id] = orchestrator
 
         # Start heartbeat
         heartbeat_task = asyncio.create_task(
@@ -676,6 +682,7 @@ async def websocket_run(websocket: WebSocket):
             pass
 
     finally:
+        _active_orchestrators.pop(run_id, None)
         try:
             await websocket.close()
         except Exception:
@@ -775,6 +782,12 @@ async def cancel_run(run_id: str) -> dict[str, Any]:
     if run.status in _TERMINAL_STATUSES:
         return {"run_id": run_id, "status": run.status.value, "already_terminal": True}
 
+    # Signal the orchestrator so it stops the sim server process too
+    orchestrator = _active_orchestrators.get(run_uuid)
+    if orchestrator is not None:
+        orchestrator._cancelled.set()
+        logger.info(f"[CANCEL] Run {run_id} orchestrator signalled to cancel")
+
     await store.finalize_run(
         run_id=run_uuid,
         status=RunStatus.CANCELLED,
@@ -788,12 +801,324 @@ async def cancel_run(run_id: str) -> dict[str, Any]:
     return {"run_id": run_id, "status": "cancelled"}
 
 
+@app.post("/api/runs/{run_id}/stop")
+async def stop_run(run_id: str) -> dict[str, Any]:
+    """Gracefully stop a running simulation.
+
+    Signals the active orchestrator to tell the sim server to stop the
+    solver, reconstruct partial results, and return them as if the
+    simulation completed.  The run is marked as STOPPED (not CANCELLED).
+    """
+    try:
+        run_uuid = UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid run ID format")
+
+    store = EventStore()
+    run = await store.get_run(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status in _TERMINAL_STATUSES:
+        return {"run_id": run_id, "stopped": False, "reason": f"Run already {run.status.value}"}
+
+    # Signal the orchestrator to stop the sim server run gracefully
+    orchestrator = _active_orchestrators.get(run_uuid)
+    if orchestrator is not None:
+        orchestrator._stop_requested.set()
+        logger.info(f"[STOP] Run {run_id} stop requested via REST endpoint")
+        return {"run_id": run_id, "stopped": True}
+
+    # No active orchestrator — fall back to marking stopped in DB
+    await store.finalize_run(
+        run_id=run_uuid,
+        status=RunStatus.STOPPED,
+        result={"info": "Stopped by user"},
+    )
+    logger.info(f"[STOP] Run {run_id} marked stopped (no active orchestrator)")
+    return {"run_id": run_id, "stopped": True}
+
+
+@app.post("/api/runs/{run_id}/continue")
+async def continue_run(run_id: str) -> dict[str, Any]:
+    """Continue a stopped simulation from the last checkpoint.
+
+    Calls the sim server's continue endpoint (patches controlDict to
+    ``startFrom latestTime`` and re-launches the solver), then streams
+    events via the WatchBus so ``/ws/watch/{run_id}`` subscribers receive
+    live updates.
+    """
+    try:
+        run_uuid = UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid run ID format")
+
+    store = EventStore()
+    run = await store.get_run(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status != RunStatus.STOPPED:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run is {run.status.value}, only stopped runs can be continued",
+        )
+
+    sim_run_id = (run.result or {}).get("sim_run_id")
+    if not sim_run_id:
+        raise HTTPException(
+            status_code=409,
+            detail="No sim_run_id found — cannot continue this run",
+        )
+
+    # Reset run status to RUNNING
+    await store.update_run_status(run_uuid, RunStatus.RUNNING)
+
+    # Tell the sim server to continue
+    sim_client = SimulationServerClient()
+    try:
+        await sim_client.continue_run(sim_run_id)
+    except SimulationServerError as e:
+        # Revert status on failure
+        await store.finalize_run(run_id=run_uuid, status=RunStatus.STOPPED)
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # Launch a background task to stream events from the continued sim run
+    # into the DB + WatchBus, so /ws/watch subscribers receive live updates.
+    asyncio.create_task(
+        _stream_continued_run(run_uuid, sim_run_id, store)
+    )
+
+    logger.info(f"[CONTINUE] Run {run_id} resumed (sim_run_id={sim_run_id})")
+    return {"run_id": run_id, "continued": True, "sim_run_id": sim_run_id}
+
+
+async def _stream_continued_run(
+    run_id: UUID,
+    sim_run_id: str,
+    store: EventStore,
+) -> None:
+    """Background task: stream SSE events from a continued sim run,
+    persist them, and publish to the WatchBus."""
+    from simd_agent.models import AgentEvent, EventLevel, EventTypes
+    from simd_agent.run.simulation_server_client import SimRunEvent
+
+    watch_bus = get_watch_bus()
+    sim_client = SimulationServerClient()
+    seq = 0
+
+    # Get the current max seq from the DB so we continue numbering
+    try:
+        events = await store.get_events(run_id)
+        if events:
+            seq = max(e.seq for e in events) + 1
+    except Exception:
+        pass
+
+    # Emit a sim_progress_reset so the frontend clears old residuals
+    from datetime import datetime
+    reset_event = AgentEvent(
+        run_id=run_id, seq=seq, ts=datetime.utcnow(),
+        level=EventLevel.INFO, type="sim_progress_reset",
+        message="Continued simulation — clearing old residual data",
+        payload={},
+    )
+    seq += 1
+    try:
+        await store.append_event(reset_event)
+        watch_bus.publish_nowait(str(run_id), reset_event.to_ws_message())
+    except Exception as e:
+        logger.warning("[CONTINUE] Failed to emit reset event: %s", e)
+
+    # Map sim server event types to agent event types (subset of orchestration.py)
+    _EVENT_MAP = {
+        "run_started": "sim_run_started",
+        "run_log": "sim_run_log",
+        "run_succeeded": "sim_run_succeeded",
+        "run_failed": "sim_run_failed",
+        "run_stopped": "sim_run_stopped",
+        "artifacts_ready": "sim_artifacts_ready",
+        "reconstruct_started": "sim_reconstruct_started",
+        "reconstruct_complete": "sim_reconstruct_complete",
+    }
+    _SKIP = {"decompose_started", "decompose_complete", "decompose_failed",
+             "decompose_log", "reconstruct_log", "run_log"}
+
+    try:
+        async for event in sim_client.stream_events(sim_run_id):
+            if event.type in _SKIP:
+                continue
+
+            mapped = _EVENT_MAP.get(event.type, event.type)
+
+            # Build sim_progress_batch for run_progress / run_progress_batch
+            if event.type in ("run_progress", "run_progress_batch"):
+                raw_items = (
+                    event.payload.get("items", [])
+                    if event.type == "run_progress_batch"
+                    else [event.payload]
+                )
+                built = []
+                for p in raw_items:
+                    residuals_raw = p.get("residuals", {})
+                    residuals = {}
+                    for field, val in residuals_raw.items():
+                        if isinstance(val, dict):
+                            residuals[field] = {
+                                "initial": float(val.get("initial", 0)),
+                                "final": float(val.get("final", val.get("initial", 0))),
+                                "iters": int(val.get("iters", 1)),
+                            }
+                        else:
+                            residuals[field] = {"initial": float(val), "final": float(val), "iters": 1}
+
+                    courant_raw = p.get("courant")
+                    courant = (
+                        {"mean": float(courant_raw["mean"]), "max": float(courant_raw["max"])}
+                        if isinstance(courant_raw, dict) else None
+                    )
+                    cont_raw = p.get("continuity")
+                    continuity = (
+                        {"local": float(cont_raw["local"]), "global": float(cont_raw["global"]),
+                         "cumulative": float(cont_raw["cumulative"])}
+                        if isinstance(cont_raw, dict) else None
+                    )
+                    exec_raw = p.get("execution")
+                    execution = (
+                        {"stepSeconds": float(exec_raw.get("stepSeconds", exec_raw.get("step_seconds", 0))),
+                         "clockSeconds": float(exec_raw.get("clockSeconds", exec_raw.get("clock_seconds", 0))),
+                         "label": exec_raw.get("label", "")}
+                        if isinstance(exec_raw, dict) else None
+                    )
+                    built.append({
+                        "iteration": int(p.get("iteration", 0)),
+                        "simTime": float(p.get("time", p.get("simTime", 0))),
+                        "fields": list(p.get("fields", list(residuals.keys()))),
+                        "residuals": residuals,
+                        "courant": courant,
+                        "continuity": continuity,
+                        "execution": execution,
+                    })
+
+                if built:
+                    ae = AgentEvent(
+                        run_id=run_id, seq=seq, ts=datetime.utcnow(),
+                        level=EventLevel.INFO, type="sim_progress_batch",
+                        message=f"{len(built)} step(s)",
+                        payload={"items": built},
+                    )
+                    seq += 1
+                    watch_bus.publish_nowait(str(run_id), ae.to_ws_message())
+                    # Don't persist progress events (too many)
+                continue
+
+            # Terminal: artifacts_ready means simulation finished
+            if event.type == "artifacts_ready":
+                break
+
+            # Emit mapped event
+            ae = AgentEvent(
+                run_id=run_id, seq=seq, ts=datetime.utcnow(),
+                level=EventLevel.INFO, type=mapped,
+                message=event.message, payload=event.payload,
+            )
+            seq += 1
+            try:
+                await store.append_event(ae)
+            except Exception:
+                pass
+            watch_bus.publish_nowait(str(run_id), ae.to_ws_message())
+
+        # Check final status
+        final_status = await sim_client.get_status(sim_run_id)
+
+        if final_status.status.value in ("succeeded", "stopped"):
+            final_label = final_status.status.value
+            db_status = RunStatus.STOPPED if final_label == "stopped" else RunStatus.SUCCEEDED
+            summary = (
+                "Simulation stopped by user — partial results available"
+                if final_label == "stopped"
+                else "Continued simulation completed successfully"
+            )
+        else:
+            db_status = RunStatus.FAILED
+            summary = final_status.error or "Continued simulation failed"
+
+        # Emit run_succeeded / run_stopped / run_failed
+        run_event_type = {
+            RunStatus.SUCCEEDED: "run_succeeded",
+            RunStatus.STOPPED: "run_stopped",
+            RunStatus.FAILED: "run_failed",
+        }[db_status]
+
+        ae = AgentEvent(
+            run_id=run_id, seq=seq, ts=datetime.utcnow(),
+            level=EventLevel.INFO, type=run_event_type,
+            message=summary, payload={},
+        )
+        seq += 1
+        try:
+            await store.append_event(ae)
+        except Exception:
+            pass
+        watch_bus.publish_nowait(str(run_id), ae.to_ws_message())
+
+        # Emit final event
+        final_ae = AgentEvent(
+            run_id=run_id, seq=seq, ts=datetime.utcnow(),
+            level=EventLevel.INFO, type="final",
+            message=summary,
+            payload={
+                "run_id": str(run_id),
+                "status": final_label if db_status != RunStatus.FAILED else "failed",
+                "validated_config": None,
+                "artifacts": [],
+                "iterations": 0,
+                "retries": 0,
+                "summary": summary,
+                "case_type": None,
+                "solver": None,
+                "error": None if db_status != RunStatus.FAILED else summary,
+            },
+        )
+        seq += 1
+        try:
+            await store.append_event(final_ae)
+        except Exception:
+            pass
+        watch_bus.publish_nowait(str(run_id), final_ae.to_ws_message())
+
+        # Finalize in DB
+        await store.finalize_run(
+            run_id=run_id,
+            status=db_status,
+            result={
+                "sim_run_id": sim_run_id,
+                "summary": summary,
+            },
+        )
+        logger.info("[CONTINUE] Run %s finalized as %s", run_id, db_status.value)
+
+    except Exception as e:
+        logger.error("[CONTINUE] Stream error for run %s: %s", run_id, e)
+        # Mark as failed
+        try:
+            await store.finalize_run(
+                run_id=run_id,
+                status=RunStatus.FAILED,
+                result={"error": str(e), "sim_run_id": sim_run_id},
+            )
+        except Exception:
+            pass
+
+
 # ── Reconnectable watch WebSocket ─────────────────────────────────────────────
 
 _TERMINAL_STATUSES = {
     RunStatus.SUCCEEDED,
     RunStatus.FAILED,
     RunStatus.CANCELLED,
+    RunStatus.STOPPED,
     RunStatus.NOT_CLEAR,
     RunStatus.CONFIG_INCOMPLETE,
 }

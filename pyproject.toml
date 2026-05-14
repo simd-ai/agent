@@ -47,5 +47,44 @@ python_functions = ["test_*"]
 [tool.hatch.metadata]
 allow-direct-references = true
 
+# ── Type checking ──────────────────────────────────────────────────────────
+# Strict mode is enabled on the **renderer modules** — the parts of the
+# codebase that consume the typed FvBuildContext / strategy schemas and emit
+# OpenFOAM dict text.  Phase 3 of the LLM/validator-boundary redesign.
+#
+# Strict on these modules guarantees:
+#   • No untyped `dict[str, Any]` returned from helpers
+#   • Every ctx field access is checked against FvBuildContext
+#   • Strategy fields keep their Literal narrowing through renderers
+#
+# Run locally:
+#   mypy --strict simd_agent/solvers/contexts.py \
+#                 simd_agent/run/case_spec/strategies.py \
+#                 simd_agent/run/case_spec/resolvers.py \
+#                 simd_agent/solvers/*/solver.py
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# Phase 3 strict modules — the resolved-strategy contract.
+module = [
+    "simd_agent.solvers.contexts",
+    "simd_agent.run.case_spec.strategies",
+    "simd_agent.run.case_spec.resolvers",
+    "simd_agent.solvers.simpleFoam.solver",
+    "simd_agent.solvers.pimpleFoam.solver",
+    "simd_agent.solvers.rhoSimpleFoam.solver",
+    "simd_agent.solvers.rhoPimpleFoam.solver",
+    "simd_agent.solvers.buoyantSimpleFoam.solver",
+    "simd_agent.solvers.buoyantPimpleFoam.solver",
+]
+strict = true
+disallow_any_generics = true
+disallow_untyped_defs = true
+warn_return_any = true
+no_implicit_optional = true
+strict_equality = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["simd_agent"]

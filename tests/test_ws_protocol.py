@@ -241,7 +241,7 @@ class TestConstraints:
         
         assert constraints.max_retries == 7
         assert constraints.solver_preference is None
-        assert constraints.timeout_seconds == 21600
+        assert constraints.timeout_seconds == 86400
     
     def test_custom_constraints(self):
         """Test custom constraint values."""

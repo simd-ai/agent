@@ -76,12 +76,15 @@ agglomeration creates degenerate matrices. PBiCGStab+DIC is slower but always st
 
 ## residualControl — CRITICAL format
 
-PIMPLE's `pimpleControl` REQUIRES each residualControl entry to be a **sub-dictionary**:
+PIMPLE's `pimpleControl` REQUIRES each residualControl entry to be a **sub-dictionary**.
+Include ALL solved fields — p, U, and turbulence (k, omega or k, epsilon):
 ```
 residualControl
 {
-    U   { tolerance 1e-4; relTol 0; }
     p   { tolerance 1e-4; relTol 0; }
+    U   { tolerance 1e-4; relTol 0; }
+    k   { tolerance 1e-3; relTol 0; }
+    omega { tolerance 1e-3; relTol 0; }
 }
 ```
 
@@ -111,7 +114,7 @@ solvers
         smoother        GaussSeidel;
         tolerance       1e-06;
         relTol          0.01;
-        nCoarsestCells  500;
+        nCoarsestCells  20;
         coarsestLevelCorr
         {
             solver          PBiCGStab;
@@ -151,8 +154,10 @@ PIMPLE
 
     residualControl
     {
-        U   { tolerance 1e-4; relTol 0; }
         p   { tolerance 1e-4; relTol 0; }
+        U   { tolerance 1e-4; relTol 0; }
+        k   { tolerance 1e-3; relTol 0; }
+        omega { tolerance 1e-3; relTol 0; }
     }
 }
 

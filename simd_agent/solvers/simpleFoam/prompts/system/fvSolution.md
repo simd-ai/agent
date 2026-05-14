@@ -38,7 +38,7 @@ Only use names from these tables. Any other name causes a fatal IO error at runt
 
 ## Solvers
 
-- **p**: `GAMG` with `GaussSeidel` smoother. MUST include `nCoarsestCells 500;` and
+- **p**: `GAMG` with `GaussSeidel` smoother. MUST include `nCoarsestCells  20;` and
   `coarsestLevelCorr` with `PBiCGStab; preconditioner none;` — prevents SIGFPE on
   unstructured tet meshes where GAMG over-agglomerates to degenerate coarsest-level
   matrices with zero diagonals.
@@ -156,7 +156,7 @@ solvers
         tolerance       1e-06;
         relTol          0.1;
         smoother        GaussSeidel;
-        nCoarsestCells  500;
+        nCoarsestCells  20;
         coarsestLevelCorr
         {
             solver          PBiCGStab;

@@ -201,14 +201,15 @@ async def export_case(run_id: UUID) -> StreamingResponse:
         except Exception as e:
             logger.warning(f"[EXPORT] Could not retrieve mesh for run {run_id}: {e}")
 
-    # 4. Package into ZIP
+    # 4. Package into ZIP — include run.sh + fix_mesh_setup.sh so the
+    # downloaded case is runnable locally with `bash run.sh`.
     solver = run.solver or "simpleFoam"
     from simd_agent.run.packaging import package_case
     zip_bytes, file_list = package_case(
         files=run.generated_files,
         solver=solver,
         case_name="case",
-        include_run_script=True,
+        include_local_helpers=True,
         mesh_bytes=mesh_bytes,
         mesh_filename=mesh_filename,
         mesh_format=mesh_format,

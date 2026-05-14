@@ -20,9 +20,7 @@ thermoType
 mixture
 {
     specie
-    {
-        nMoles      1;
-        molWeight   28.96;   // air [g/mol]; adjust for other gases
+    { molWeight   28.96;   // air [g/mol]; adjust for other gases
     }
     thermodynamics
     {
@@ -56,9 +54,7 @@ thermoType
 mixture
 {
     specie
-    {
-        nMoles      1;
-        molWeight   18.015;   // water [g/mol]
+    { molWeight   18.015;   // water [g/mol]
     }
     equationOfState
     {

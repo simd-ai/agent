@@ -452,22 +452,27 @@ def package_case(
     files: dict[str, str],
     solver: str = "simpleFoam",
     case_name: str = "case",
-    include_run_script: bool = True,
+    include_local_helpers: bool = False,
     mesh_bytes: bytes | None = None,
     mesh_filename: str | None = None,
     mesh_format: str | None = None,
 ) -> tuple[bytes, list[str]]:
     """Package OpenFOAM case files into a zip archive.
-    
+
     Args:
         files: Dictionary mapping relative paths to file content
         solver: Solver name for run script
         case_name: Root folder name in the zip
-        include_run_script: Whether to include run.sh
+        include_local_helpers: Include run.sh + fix_mesh_setup.sh for
+            local execution by an end user. The simulation runner server
+            never executes these (it orchestrates mesh conversion, MPI
+            decomposition, the solver, and reconstruction itself in
+            agent-simulation/app/runner.py), so the default is False.
+            Set True only for the /api/runs/{id}/export download path.
         mesh_bytes: Optional mesh file bytes to include
         mesh_filename: Original mesh filename
         mesh_format: Mesh format (msh, stl, etc.)
-        
+
     Returns:
         Tuple of (zip_bytes, file_list)
     """
@@ -503,8 +508,7 @@ def package_case(
             zf.writestr(full_path, content)
             file_list.append(full_path)
         
-        # Add run script if requested
-        if include_run_script:
+        if include_local_helpers:
             run_script = generate_run_script(
                 solver=solver,
                 mesh_filename=mesh_filename,
@@ -513,8 +517,7 @@ def package_case(
             run_path = f"{case_name}/run.sh"
             zf.writestr(run_path, run_script)
             file_list.append(run_path)
-            
-            # Add post-mesh-conversion fix script (always included)
+
             fix_script_path = f"{case_name}/fix_mesh_setup.sh"
             zf.writestr(fix_script_path, FIX_MESH_SETUP_SCRIPT)
             file_list.append(fix_script_path)
@@ -556,17 +559,17 @@ def package_from_llm_output(
         # Remove mesh warning if external mesh provided
         warnings = [w for w in warnings if "mesh" not in w.lower()]
     
-    # Package
+    # Package — slim ZIP for the simulation runner server (it ignores
+    # run.sh / fix_mesh_setup.sh and orchestrates execution itself).
     zip_bytes, file_list = package_case(
         files=files,
         solver=solver,
         case_name=case_name,
-        include_run_script=True,
         mesh_bytes=mesh_bytes,
         mesh_filename=mesh_filename,
         mesh_format=mesh_format,
     )
-    
+
     return zip_bytes, file_list, warnings
 
 
@@ -577,50 +580,48 @@ def package_simulation_case(
     case_name: str = "case",
 ) -> tuple[bytes, list[str], list[str]]:
     """Package a complete simulation case with mesh from storage.
-    
-    This is the main entry point for packaging a simulation case with:
+
+    Main entry point for the simulation-runner-server submission path:
     1. Generated OpenFOAM files (0/, system/, constant/)
     2. Mesh file retrieved from storage
-    3. Run script with mesh conversion commands
-    
+
+    The sim server orchestrates mesh conversion, MPI decomposition, the
+    solver, and reconstruction itself, so no run.sh / fix_mesh_setup.sh
+    is included.
+
     Args:
         generated_files: Dictionary of generated OpenFOAM files
         mesh_id: Mesh ID from /api/mesh/convert
         solver: OpenFOAM solver to use
         case_name: Root folder name in zip
-        
+
     Returns:
         Tuple of (zip_bytes, file_list, warnings)
     """
     from simd_agent.run.mesh_retriever import get_mesh_file, MeshNotFoundError
-    
-    # Get mesh from storage
+
     try:
         mesh_bytes, mesh_filename, mesh_format = get_mesh_file(mesh_id)
         logger.info(f"Retrieved mesh: {mesh_filename} ({mesh_format} format, {len(mesh_bytes)} bytes)")
     except MeshNotFoundError as e:
         logger.error(f"Failed to retrieve mesh: {e}")
-        # Package without mesh - let run script handle blockMeshDict
         mesh_bytes = None
         mesh_filename = None
         mesh_format = None
-    
-    # Validate structure
+
     warnings = validate_openfoam_structure(generated_files)
     if mesh_bytes:
         warnings = [w for w in warnings if "mesh" not in w.lower()]
-    
-    # Package everything
+
     zip_bytes, file_list = package_case(
         files=generated_files,
         solver=solver,
         case_name=case_name,
-        include_run_script=True,
         mesh_bytes=mesh_bytes,
         mesh_filename=mesh_filename,
         mesh_format=mesh_format,
     )
-    
+
     return zip_bytes, file_list, warnings
 
 

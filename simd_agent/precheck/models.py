@@ -94,11 +94,9 @@ class PrecheckRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 class SolverSettings(BaseModel):
-    # algorithm, max_iterations and convergence_criteria are NOT predicted by
-    # precheck — they are determined at run time by the normalizer/linter and
-    # returned to the frontend via the `simulation_config_ready` event.
-    # Precheck only carries temporal user-intent fields (end_time, delta_t,
-    # write_interval) extracted from the prompt ("run for 2s", etc.).
+    # algorithm is derived from the selected openfoam_solver name.
+    # Temporal fields (end_time, delta_t, write_interval) are extracted
+    # from the prompt ("run for 2s", etc.).
     algorithm: Literal["SIMPLE", "PIMPLE", "PISO"] | None = None
     max_iterations: int | None = Field(default=None, alias="maxIterations")
     convergence_criteria: float | None = Field(default=None, alias="convergenceCriteria")
@@ -155,6 +153,14 @@ class PatchBoundaryCondition(BaseModel):
     epsilon: FieldBC | None = None
     omega: FieldBC | None = None
     nut: FieldBC | None = None
+    # Per-patch turbulence intensity (fraction, e.g. 0.05 for 5%).
+    # Used by the inlet-turbulence validator to compute k = 1.5 · (U·I)² for
+    # this patch specifically.  None → fall back to the global default.
+    # Different inlets can carry different TIs (e.g. turbulent jet at 10%
+    # mixing with a settled coflow at 1%) — they are NOT forced to match.
+    turbulence_intensity: float | None = Field(
+        default=None, alias="turbulenceIntensity"
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
