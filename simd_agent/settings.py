@@ -11,7 +11,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Resolve .env relative to the repo root (one level up from this file's package dir)
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
-
 class Settings(BaseSettings):
     """Application configuration from environment variables."""
 
