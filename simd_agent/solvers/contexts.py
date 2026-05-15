@@ -96,6 +96,21 @@ class FvBuildContext:
     # Defaults to empty for legacy test callers that don't set it.
     bc_pressures: tuple[float, ...] = ()
 
+    # True iff any inlet patch uses ``flowRateInletVelocity`` (impulsive
+    # mass-flow BC).  These cases require special startup handling:
+    #   * a non-zero ``0/U.internalField`` seeded from U_bulk so iteration
+    #     1 doesn't have to accelerate the fluid from 0 → U_inlet instantly,
+    #   * tighter ``maxCo`` (≤ 0.5) in controlDict,
+    #   * more PIMPLE outer correctors,
+    #   * ``consistent no`` (regular PIMPLE rather than SIMPLEC).
+    has_impulsive_inlets: bool = False
+
+    # Estimated bulk velocity (m/s) — the dominant inlet's
+    # ``mdot / (ρ_estimate · A_estimate)`` for mass-flow inlets, or the
+    # explicit velocity magnitude for ``fixedValue`` inlets.  Used to
+    # seed ``0/U.internalField`` and to size the initial ``deltaT``.
+    bulk_velocity: float = 0.0
+
     # Resolved per-regime scheme bundle — laminar / RAS / LES knobs for
     # fvSchemes (ddt, div(phi,*)) and constant/turbulenceProperties.
     # See ``simd_agent.run.case_spec.resolvers.resolve_regime_profile``.

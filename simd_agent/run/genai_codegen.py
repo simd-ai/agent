@@ -3330,6 +3330,7 @@ class GenAICodeGenerator:
         previous_files: dict[str, str],
         solver: str,
         validated_config: dict[str, Any],
+        ai_editable_files: list[str] | None = None,
     ) -> list[str]:
         """Determine which files need to be regenerated based on sim errors.
 
@@ -3499,9 +3500,15 @@ class GenAICodeGenerator:
             _plug = None
         if _plug is not None:
             _plugin_files = set(_plug.required_files(validated_config))
+            # User-unlocked deterministic files are sent to the LLM like any
+            # other affected file — the orchestrator restores LLM output after
+            # validate_full() to preserve the regeneration.
+            _ai_editable_set = set(ai_editable_files or ())
             _deterministic = {
                 f for f in affected
-                if not f.startswith("__surgical:") and f not in _plugin_files
+                if not f.startswith("__surgical:")
+                and f not in _plugin_files
+                and f not in _ai_editable_set
             }
             if _deterministic:
                 logger.info(
@@ -3602,6 +3609,7 @@ class GenAICodeGenerator:
         previous_files: dict[str, str] | None = None,
         missing_files: list[str] | None = None,
         iteration: int = 1,
+        ai_editable_files: list[str] | None = None,
     ) -> str:
         """Generate OpenFOAM case files.
 
@@ -3642,6 +3650,7 @@ class GenAICodeGenerator:
                 previous_files=previous_files or {},
                 solver=solver,
                 validated_config=validated_config,
+                ai_editable_files=ai_editable_files or [],
             )
             # Cap error history sent to the LLM to the most recent iterations.
             # Older errors add context noise and inflate the prompt; regex-based

@@ -582,6 +582,20 @@ class StartRequest(BaseModel):
     )
     constraints: Constraints = Field(default_factory=Constraints)
     metadata: Metadata = Field(default_factory=Metadata)
+    # ── Per-file AI-edit unlocks ────────────────────────────────────────
+    # Deterministic files (system/fvSolution, system/fvSchemes,
+    # constant/turbulenceProperties, 0/nut, 0/alphat …) are rebuilt from
+    # Python every iteration and the LLM never sees them.  When the user
+    # marks one as "AI-editable" in the UI, the path is added here.  The
+    # error-recovery loop keeps it in the affected-files set and lets the
+    # LLM rewrite it; the plugin's deterministic renderer is then skipped
+    # for that file in subsequent merges.
+    ai_editable_files: list[str] = Field(
+        default_factory=list, alias="aiEditableFiles",
+        description="Deterministic files the user unlocked for LLM regeneration",
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 # --- Server -> Client ---

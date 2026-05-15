@@ -65,7 +65,15 @@ async def get_solver(solver_name: str) -> SolverInfo:
 
 @router.get("/{solver_name}/required-files")
 async def get_required_files(solver_name: str, config: str = "{}") -> dict[str, Any]:
-    """Get the list of OpenFOAM files this solver would generate for a config."""
+    """Get the list of OpenFOAM files this solver would generate for a config.
+
+    Returns:
+        - ``files`` — paths the LLM is asked to write (``required_files()``).
+        - ``deterministic`` — paths built from Python (``render_deterministic_files()``).
+          These are the files eligible for the per-file AI-edit unlock toggle
+          in the UI: by default the LLM never sees them, but a user can mark
+          one as AI-editable so the error-recovery loop hands it to the LLM.
+    """
     import json
 
     registry = get_registry()
@@ -78,9 +86,17 @@ async def get_required_files(solver_name: str, config: str = "{}") -> dict[str, 
     except json.JSONDecodeError:
         parsed_config = {}
 
+    try:
+        deterministic = sorted(plugin.render_deterministic_files(parsed_config).keys())
+    except Exception as e:
+        # Plugin may need a more complete config to render — degrade gracefully.
+        logger.warning("render_deterministic_files() failed for %s: %s", solver_name, e)
+        deterministic = []
+
     return {
         "solver": solver_name,
         "files": plugin.required_files(parsed_config),
+        "deterministic": deterministic,
     }
 
 

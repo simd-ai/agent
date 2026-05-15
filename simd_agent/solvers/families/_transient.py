@@ -54,12 +54,29 @@ class TransientBase(SolverPlugin):
         eq_fields: list[str],
         bounds_block: str,
     ) -> str:
-        """Build the ``PIMPLE { … }`` algorithm block.
+        """Build the ``PIMPLE { … }`` algorithm block — condition-aware.
 
-        Matches the OpenFOAM rhoPimpleFoam ras tutorial keys:
-          * ``consistent yes``         — SIMPLEC mode inside PIMPLE
-          * ``transonic no``           — avoid implicit "yes" on some forks
-          * ``turbOnFinalIterOnly no`` — solve turbulence every outer pass
+        Three knobs are now driven by the resolved context instead of
+        hard-coded defaults:
+
+          * ``nOuterCorrectors`` scales with ΔT_BC + impulsive inlets:
+              - ΔT < 50 K, no impulsive BCs     →  2  (standard transient)
+              - ΔT 50–150 K, or impulsive BCs   → 10  (stiff coupling)
+              - ΔT > 150 K (e.g. 320 K U-bend)  → 30  (very stiff)
+              - Pressure ratio ≥ 3                → bump to ≥ 20
+            Matches the OF rhoPimpleFoam ras tutorial which uses 50 for
+            the angledDuct case with a heated cellZone.
+
+          * ``consistent yes`` (SIMPLEC) is the default for smooth cases
+            but DISABLED for impulsive startups — SIMPLEC's second
+            corrector restarts at residual ~1 and can re-create the
+            divergence we're trying to damp.
+
+          * ``nNonOrthogonalCorrectors`` keeps its existing mesh-tier
+            heuristic (bumped at high speed).
+
+        The other tutorial keys (``transonic no``, ``turbOnFinalIterOnly
+        no``) are unconditional — they prevent fork-to-fork drift.
         """
         n_non_ortho = ctx.n_non_ortho
         speed_tier = ctx.speed_tier
@@ -67,6 +84,20 @@ class TransientBase(SolverPlugin):
 
         if speed_tier == "high" and n_non_ortho < 2:
             n_non_ortho = 2
+
+        # ── nOuterCorrectors: scale with stiffness signals ─────────────
+        delta_t = ctx.delta_t_bc
+        impulsive = ctx.has_impulsive_inlets
+        high_dp = ctx.pressure_ratio >= 3.0
+        if delta_t > 150 or impulsive and delta_t > 100:
+            n_outer = 30
+        elif delta_t > 50 or impulsive or high_dp:
+            n_outer = 10
+        else:
+            n_outer = 2
+
+        # ── consistent: disable SIMPLEC for impulsive / high-Δp startups ─
+        consistent_yes = not (impulsive or high_dp or delta_t > 150)
 
         res_lines = (
             f"        {pf}   {{ tolerance 1e-4; relTol 0; }}\n"
@@ -86,11 +117,11 @@ class TransientBase(SolverPlugin):
         return (
             f"\n{self.algorithm}\n"
             "{\n"
-            "    nOuterCorrectors    2;\n"
-            "    nCorrectors         2;\n"
+            f"    nOuterCorrectors    {n_outer};\n"
+            "    nCorrectors         1;\n"
             f"    nNonOrthogonalCorrectors {n_non_ortho};\n"
             "    momentumPredictor   yes;\n"
-            "    consistent          yes;\n"
+            f"    consistent          {'yes' if consistent_yes else 'no'};\n"
             "    transonic           no;\n"
             "    turbOnFinalIterOnly no;\n"
             f"{bounds_block}"

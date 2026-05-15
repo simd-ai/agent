@@ -833,3 +833,111 @@ def fix_residual_control_format(
     if new_fv != fv:
         files["system/fvSolution"] = new_fv
     return files
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# controlDict time-stepping — condition-aware maxCo / maxDeltaT / deltaT
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def fix_controldict_time_stepping(
+    files: dict[str, str],
+    issues: list[ValidationIssue],
+    *,
+    is_transient: bool,
+    has_impulsive_inlets: bool,
+    bulk_velocity: float,
+) -> dict[str, str]:
+    """Clamp ``maxCo`` / ``maxDeltaT`` / startup ``deltaT`` for hard cases.
+
+    Steady solvers skip this entirely.  For transient solvers:
+
+      * **Impulsive mass-flow inlets** (``flowRateInletVelocity``):
+        clamp ``maxCo`` to 0.3 — the iteration-1 acceleration from a
+        seeded but non-converged velocity field is the most common
+        source of Δt-underflow blow-ups.  Also clamp ``maxDeltaT`` to
+        1e-3 s and the initial ``deltaT`` to ``0.1·h / U_bulk`` so the
+        first step is well within the explicit stability limit.
+
+      * **Smooth velocity / pressure inlets**: leave the LLM-emitted
+        values alone (the case has no startup shock to worry about).
+
+    The fixer only TIGHTENS values — it never loosens a user-tuned
+    controlDict that already has a small maxCo.
+    """
+    if not is_transient:
+        return files
+
+    cd_path = "system/controlDict"
+    cd = files.get(cd_path, "")
+    if not cd:
+        return files
+
+    # Only act on impulsive cases — smooth velocity-BC cases can keep
+    # the LLM's maxCo / deltaT choices.
+    if not has_impulsive_inlets:
+        return files
+
+    changed = False
+    notes: list[str] = []
+
+    # ── maxCo: clamp to 0.3 if above ──
+    target_maxCo = 0.3
+    m = re.search(r"\bmaxCo\b\s+([\d.eE+-]+)\s*;", cd)
+    if m:
+        try:
+            cur = float(m.group(1))
+        except ValueError:
+            cur = target_maxCo
+        if cur > target_maxCo:
+            cd = cd[: m.start()] + f"maxCo           {target_maxCo};" + cd[m.end():]
+            changed = True
+            notes.append(f"maxCo {cur:g} -> {target_maxCo}")
+
+    # ── maxDeltaT: clamp to 1e-3 if above ──
+    target_maxDeltaT = 1e-3
+    m = re.search(r"\bmaxDeltaT\b\s+([\d.eE+-]+)\s*;", cd)
+    if m:
+        try:
+            cur = float(m.group(1))
+        except ValueError:
+            cur = target_maxDeltaT
+        if cur > target_maxDeltaT:
+            cd = (
+                cd[: m.start()]
+                + f"maxDeltaT       {target_maxDeltaT:g};"
+                + cd[m.end():]
+            )
+            changed = True
+            notes.append(f"maxDeltaT {cur:g} -> {target_maxDeltaT:g}")
+
+    # ── initial deltaT: clamp to 0.1·h/U_bulk (mesh size guess: 5e-3 m) ──
+    if bulk_velocity > 0:
+        h_mesh = 5e-3  # 5 mm — a typical RANS cell at the wall.
+        target_deltaT = max(1e-7, 0.1 * h_mesh / bulk_velocity)
+        m = re.search(r"\bdeltaT\b\s+([\d.eE+-]+)\s*;", cd)
+        if m:
+            try:
+                cur = float(m.group(1))
+            except ValueError:
+                cur = target_deltaT
+            if cur > target_deltaT * 10:
+                cd = (
+                    cd[: m.start()]
+                    + f"deltaT          {target_deltaT:g};"
+                    + cd[m.end():]
+                )
+                changed = True
+                notes.append(f"deltaT {cur:g} -> {target_deltaT:g}")
+
+    if changed:
+        files[cd_path] = cd
+        issues.append(
+            ValidationIssue(
+                "warning",
+                cd_path,
+                "Tightened controlDict time-stepping for impulsive mass-flow "
+                f"inlets (U_bulk ~ {bulk_velocity:.1f} m/s): {'; '.join(notes)}.",
+            )
+        )
+    return files

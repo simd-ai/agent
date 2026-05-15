@@ -1,4 +1,4 @@
-"""Boundary-condition fixers for the ``0/*`` directory of an OpenFOAM case.
+"""Boundary-condition + initial-condition fixers for the ``0/*`` directory.
 
 Hoisted out of ``SolverPlugin`` for the same reasons as ``legacy_fixers``:
 
@@ -305,4 +305,77 @@ def fix_inlet_turbulence_bc_types(
                 )
         if new_content != content:
             files[fpath] = new_content
+    return files
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Initial-condition seeding — kills the iteration-1 impulsive shock
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def fix_initial_velocity_field(
+    files: dict[str, str],
+    issues: list[ValidationIssue],
+    *,
+    has_impulsive_inlets: bool,
+    bulk_velocity: float,
+) -> dict[str, str]:
+    """Seed ``0/U.internalField`` with the estimated bulk velocity.
+
+    When a case has ``flowRateInletVelocity`` inlets but the LLM emits
+    ``0/U.internalField uniform (0 0 0)``, the first time step has to
+    accelerate the fluid from 0 → U_inlet within one Δt — producing a
+    giant pressure spike that the adaptive time-stepper can't escape.
+    Δt collapses to floating-point underflow.
+
+    Seeding the internal field with a non-zero estimate of the bulk
+    flow speed removes that shock.  The exact direction doesn't matter
+    much (pressure correction redistributes within ~5 iterations) —
+    we pick ``(0.5·U_bulk, 0, 0)`` as a stable conservative default.
+
+    Only fires when:
+      * ``has_impulsive_inlets`` is True (the fix is irrelevant for
+        velocity-fixed-value inlets), AND
+      * the current internalField is ``(0 0 0)`` (|U| < 1e-3 m/s) —
+        never overwrite a hand-tuned initial field.
+    """
+    if not has_impulsive_inlets or bulk_velocity <= 0:
+        return files
+
+    u_path = "0/U"
+    content = files.get(u_path, "")
+    if not content:
+        return files
+
+    m = re.search(
+        r"(internalField\s+uniform\s+)\(\s*([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s+"
+        r"([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s+"
+        r"([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*\)",
+        content,
+    )
+    if not m:
+        return files
+
+    try:
+        ux, uy, uz = float(m.group(2)), float(m.group(3)), float(m.group(4))
+    except ValueError:
+        return files
+
+    if (ux * ux + uy * uy + uz * uz) ** 0.5 >= 1e-3:
+        return files
+
+    u_seed = 0.5 * bulk_velocity
+    new_internal = f"{m.group(1)}({u_seed:.4g} 0 0)"
+    new_content = content[: m.start()] + new_internal + content[m.end():]
+    files[u_path] = new_content
+
+    issues.append(
+        ValidationIssue(
+            "warning",
+            "0/U",
+            f"Seeded internalField (0 0 0) -> ({u_seed:.4g} 0 0) to "
+            f"prevent the iteration-1 impulsive shock from a "
+            f"flowRateInletVelocity inlet (U_bulk approx {bulk_velocity:.1f} m/s).",
+        )
+    )
     return files

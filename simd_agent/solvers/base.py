@@ -570,6 +570,13 @@ class SolverPlugin(ABC):
             energy_var=self.energy_var,
         )
 
+        # Detect impulsive (mass-flow) inlets — these need special startup
+        # handling (seeded U field, tighter maxCo, more PIMPLE iters).
+        # Compute the bulk velocity estimate while we're walking the BCs.
+        has_impulsive_inlets, bulk_velocity = self._extract_impulsive_state(
+            config, bc_pressures, bc_temps
+        )
+
         return FvBuildContext(
             tier=mq["mesh_quality_tier"],
             non_ortho=mq.get("mesh_max_non_orthogonality") or 0.0,
@@ -579,12 +586,87 @@ class SolverPlugin(ABC):
             speed_tier=speed_tier,
             bc_temps=tuple(sorted(set(bc_temps))),
             bc_pressures=tuple(sorted(set(bc_pressures))),
+            has_impulsive_inlets=has_impulsive_inlets,
+            bulk_velocity=bulk_velocity,
             profile=profile,
             heat_transfer_active=heat_transfer_active,
             turb_model=turb_model,
             mesh_quality=mq,
             regime_profile=regime_profile,
         )
+
+    @staticmethod
+    def _extract_impulsive_state(
+        config: dict[str, Any],
+        bc_pressures: list[float],
+        bc_temps: list[float],
+    ) -> tuple[bool, float]:
+        """Return ``(has_impulsive_inlets, bulk_velocity)``.
+
+        An "impulsive inlet" is one using ``flowRateInletVelocity`` —
+        these force U from mdot at the patch even when the internal
+        field is (0,0,0), which produces a giant pressure spike at
+        iteration 1 unless the internal field is pre-seeded.
+
+        ``bulk_velocity`` is the maximum among:
+          * U = mdot / (ρ · A) for each mass-flow inlet (assumed
+            cross-section A ≈ 1e-4 m² because we don't have mesh patch
+            areas at codegen time — the resulting magnitude is right
+            within a factor of 2-5, which is enough to remove the
+            iteration-1 shock),
+          * explicit U magnitudes from ``fixedValue`` velocity inlets.
+        """
+        bcs = config.get("boundary_conditions") or {}
+        if not isinstance(bcs, dict):
+            return False, 0.0
+
+        # Reference density: gas at coldest BC temp + highest BC pressure.
+        # This over-estimates ρ on warm air → U_bulk is slightly conservative.
+        p_high = max((p for p in bc_pressures if p > 0), default=101325.0)
+        t_cold = min((t for t in bc_temps if t > 0), default=288.15)
+        rho_ref = max(0.1, p_high / (287.0 * max(t_cold, 1.0)))
+
+        # Heuristic patch cross-section.  Without mesh data the best we
+        # can do is a single representative area; the resulting U_bulk is
+        # an over-estimate for small inlets and an under-estimate for
+        # large ones — but the goal here is to KILL the impulsive shock,
+        # not to match the final converged velocity.
+        A_inlet_default = 1e-4  # m²
+
+        has_impulsive = False
+        u_bulk = 0.0
+
+        for _name, pbc in bcs.items():
+            if not isinstance(pbc, dict):
+                continue
+            u_entry = pbc.get("U") or pbc.get("velocity") or {}
+            if not isinstance(u_entry, dict):
+                continue
+            u_type = (u_entry.get("type") or "").strip()
+            if u_type == "flowRateInletVelocity":
+                has_impulsive = True
+                mdot = u_entry.get("massFlowRate") or u_entry.get("volumetricFlowRate")
+                try:
+                    mdot_val = float(mdot) if mdot is not None else 0.0
+                except (TypeError, ValueError):
+                    mdot_val = 0.0
+                if u_type == "flowRateInletVelocity" and u_entry.get("volumetricFlowRate") is not None:
+                    # Volumetric: U = Q / A.
+                    u_est = abs(mdot_val) / A_inlet_default
+                else:
+                    # Mass flow: U = mdot / (ρ · A).
+                    u_est = abs(mdot_val) / (rho_ref * A_inlet_default)
+                u_bulk = max(u_bulk, u_est)
+            elif u_type == "fixedValue":
+                v = u_entry.get("value")
+                if isinstance(v, (list, tuple)) and len(v) >= 3:
+                    try:
+                        mag = sum(float(c) ** 2 for c in v[:3]) ** 0.5
+                        u_bulk = max(u_bulk, mag)
+                    except (TypeError, ValueError):
+                        pass
+
+        return has_impulsive, u_bulk
 
     # ── Equation field lookup ─────────────────────────────────────────────
 

@@ -493,6 +493,19 @@ class Orchestrator:
             f"required_case_files={self._solver_prompt_pack.required_case_files}"
         )
 
+        # Deterministic files — built from Python every iteration; the LLM
+        # never sees them unless the user marks one as AI-editable in the UI.
+        _deterministic_files: list[str] = []
+        if self._solver_plugin is not None:
+            try:
+                _deterministic_files = sorted(
+                    self._solver_plugin.render_deterministic_files(
+                        self._lint_result.validated_config
+                    ).keys()
+                )
+            except Exception as _e:
+                logger.warning("Could not enumerate deterministic files: %s", _e)
+
         await self.event_bus.emit(
             "solver_selected",
             message=f"Solver selected: {solver}",
@@ -504,6 +517,7 @@ class Orchestrator:
                 "compressibility": self._lint_result.validated_config.get("compressibility", "incompressible"),
                 "prompt_files": self._solver_prompt_pack.prompt_files,
                 "required_case_files": self._solver_prompt_pack.required_case_files,
+                "deterministic_files": _deterministic_files,
             },
         )
 
@@ -674,11 +688,25 @@ class Orchestrator:
                 # plugin-specific validation (base class helpers + solver hooks)
                 # with the shared monolithic validator.
                 if self._solver_plugin is not None:
+                    # Per-file AI-edit unlocks: snapshot LLM content for files
+                    # the user marked as AI-editable BEFORE validate_full runs,
+                    # so we can restore them after render_deterministic_files
+                    # overwrites them with the Python-built version.
+                    _ai_editable = set(self.request.ai_editable_files or ())
+                    _llm_owned: dict[str, str] = {
+                        fp: files[fp] for fp in _ai_editable if fp in files
+                    }
                     vresult = self._solver_plugin.validate_full(
                         files, self._lint_result.validated_config
                     )
                     files = vresult.files
                     validation_issues = vresult.issues
+                    if _llm_owned:
+                        files.update(_llm_owned)
+                        logger.info(
+                            "[CODEGEN] Restored AI-editable files from LLM output: %s",
+                            sorted(_llm_owned.keys()),
+                        )
                 else:
                     # Fallback: no plugin registered for this solver (shouldn't happen
                     # post-refactor, but keeps the orchestrator resilient).
@@ -1394,6 +1422,7 @@ class Orchestrator:
             previous_files=previous_files,
             missing_files=missing_files,
             iteration=self._iteration,
+            ai_editable_files=list(self.request.ai_editable_files or ()),
         )
 
         return result

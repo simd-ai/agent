@@ -162,6 +162,23 @@ class RhoPimpleFoamSolver(TransientBase, CompressibleMixin):
         fixed = self._fix_outlet_backflow_bcs(fixed, issues, config)
         fixed = self._fix_inlet_turbulence_bc_types(fixed, issues, config)
 
+        # Condition-aware startup fixers — driven by FvBuildContext.
+        # These remove the iteration-1 impulsive shock that crashes
+        # mass-flow-inlet cases with Δt → 1e-65 floating-point underflow.
+        from simd_agent.solvers import bc_fixers, legacy_fixers
+        ctx = self._fv_context(config)
+        fixed = bc_fixers.fix_initial_velocity_field(
+            fixed, issues,
+            has_impulsive_inlets=ctx.has_impulsive_inlets,
+            bulk_velocity=ctx.bulk_velocity,
+        )
+        fixed = legacy_fixers.fix_controldict_time_stepping(
+            fixed, issues,
+            is_transient=self.is_transient,
+            has_impulsive_inlets=ctx.has_impulsive_inlets,
+            bulk_velocity=ctx.bulk_velocity,
+        )
+
         return ValidationResult(files=fixed, issues=issues)
 
 
