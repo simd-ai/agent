@@ -75,6 +75,58 @@ class MultiRegionBase(SolverPlugin):
 
     # ── Region extraction from config ─────────────────────────────────────
 
+    # ── Helper: marshal extra region fields from config dict ──────────────
+
+    @staticmethod
+    def _region_kwargs_from_dict(raw: dict[str, Any], kind: str) -> dict[str, Any]:
+        """Translate a region dict (user-supplied JSON / YAML) to RegionSpec kwargs.
+
+        Accepts both snake_case (precheck shape) and camelCase (frontend
+        shape) keys.  Validates ``interfaces`` shape (must be list of str).
+        """
+        kw: dict[str, Any] = {
+            "name": raw["name"],
+            "kind": kind,
+        }
+        if kind == "fluid":
+            kw["thermo_profile"] = raw.get("thermo_profile") or raw.get(
+                "thermoProfile", "gas"
+            )
+            kw["turbulence_model"] = (
+                raw.get("turbulence_model")
+                or raw.get("turbulenceModel", "kEpsilon")
+            )
+            for src, dst in (
+                ("Cp", "Cp"), ("mol_weight", "mol_weight"),
+                ("molWeight", "mol_weight"), ("mu", "mu"), ("Pr", "Pr"),
+                ("T_init", "T_init"), ("p_init", "p_init"),
+                ("k_init", "k_init"), ("epsilon_init", "epsilon_init"),
+            ):
+                if src in raw:
+                    kw[dst] = raw[src]
+            if "U_init" in raw:
+                _u = raw["U_init"]
+                if isinstance(_u, (list, tuple)) and len(_u) == 3:
+                    kw["U_init"] = tuple(float(c) for c in _u)
+        else:  # solid
+            kw["thermo_profile"] = "solid"
+            kw["turbulence_model"] = None
+            for src, dst in (
+                ("rho_solid", "rho_solid"), ("rhoSolid", "rho_solid"),
+                ("kappa_solid", "kappa_solid"), ("kappaSolid", "kappa_solid"),
+                ("Cp_solid", "Cp_solid"), ("CpSolid", "Cp_solid"),
+                ("T_init", "T_init"),
+            ):
+                if src in raw:
+                    kw[dst] = raw[src]
+
+        # Interfaces — names of regions this one touches.
+        _ifaces = raw.get("interfaces") or raw.get("coupled_regions") or ()
+        if isinstance(_ifaces, (list, tuple)):
+            kw["interfaces"] = tuple(str(x) for x in _ifaces)
+
+        return kw
+
     def extract_regions(self, config: dict[str, Any]) -> "CaseRegions":
         """Build the ``CaseRegions`` strategy from a normalised config.
 
@@ -109,35 +161,14 @@ class MultiRegionBase(SolverPlugin):
         # Default: single fluid + single solid (mirrors the OF
         # multiRegionHeater minimal layout).
         if not fluid_raw:
-            fluid_raw = [{
-                "name": "fluid",
-                "thermo_profile": "gas",
-                "turbulence_model": "kEpsilon",
-            }]
+            fluid_raw = [{"name": "fluid"}]
 
         fluids = [
-            RegionSpec(
-                name=r["name"],
-                kind="fluid",
-                thermo_profile=r.get("thermo_profile", "gas"),
-                turbulence_model=r.get("turbulence_model", "kEpsilon"),
-                Cp=r.get("Cp", 1006.0),
-                mol_weight=r.get("mol_weight", 28.97),
-                mu=r.get("mu", 1.8e-5),
-                Pr=r.get("Pr", 0.7),
-            )
+            RegionSpec(**self._region_kwargs_from_dict(r, kind="fluid"))
             for r in fluid_raw
         ]
         solids = [
-            RegionSpec(
-                name=r["name"],
-                kind="solid",
-                thermo_profile="solid",
-                turbulence_model=None,
-                rho_solid=r.get("rho_solid", 8000.0),
-                kappa_solid=r.get("kappa_solid", 80.0),
-                Cp_solid=r.get("Cp_solid", 450.0),
-            )
+            RegionSpec(**self._region_kwargs_from_dict(r, kind="solid"))
             for r in solid_raw
         ]
 
@@ -293,19 +324,470 @@ class MultiRegionBase(SolverPlugin):
             "// ************************************************************************* //\n"
         )
 
+    # ── Per-region turbulenceProperties + g (fluid regions) ───────────────
+
+    @staticmethod
+    def build_fluid_turbulence_properties(region: "RegionSpec") -> str:
+        """Per-region ``constant/<fluid>/turbulenceProperties``.
+
+        Always RAS in CHT context — LES on a multi-region case is unusual.
+        Model defaults to ``kEpsilon`` (the OF multiRegionHeater choice);
+        the user / precheck can override via ``region.turbulence_model``.
+        """
+        model = region.turbulence_model or "kEpsilon"
+        if model.lower() == "laminar":
+            body = "simulationType  laminar;\n"
+        else:
+            body = (
+                "simulationType  RAS;\n\n"
+                "RAS\n{\n"
+                f"    RASModel        {model};\n"
+                "    turbulence      on;\n"
+                "    printCoeffs     on;\n"
+                "}\n"
+            )
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       dictionary;\n"
+            f"    location    \"constant/{region.name}\";\n"
+            "    object      turbulenceProperties;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            + body
+            + "\n// ************************************************************************* //\n"
+        )
+
+    @staticmethod
+    def build_region_gravity(region: "RegionSpec") -> str:
+        """Per-region ``constant/<fluid>/g`` — Earth gravity in -y."""
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       uniformDimensionedVectorField;\n"
+            f"    location    \"constant/{region.name}\";\n"
+            "    object      g;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "dimensions      [0 1 -2 0 0 0 0];\n"
+            "value           (0 -9.81 0);\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    # ── Per-region fvSchemes ──────────────────────────────────────────────
+
+    @staticmethod
+    def build_fluid_fv_schemes(region: "RegionSpec") -> str:
+        """Per-region ``system/<fluid>/fvSchemes`` — full N-S + energy + turb.
+
+        Mirrors the OF ``multiRegionHeater/bottomWater/fvSchemes`` pattern:
+        upwind everywhere for robustness, ``div(phi,K) Gauss linear``
+        (kinetic energy in the energy equation), incompressible-form
+        viscous stress.
+        """
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       dictionary;\n"
+            f"    location    \"system/{region.name}\";\n"
+            "    object      fvSchemes;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "ddtSchemes\n{\n    default         Euler;\n}\n\n"
+            "gradSchemes\n{\n    default         Gauss linear;\n}\n\n"
+            "divSchemes\n{\n"
+            "    default         none;\n"
+            "    div(phi,U)      bounded Gauss upwind;\n"
+            "    div(phi,K)      Gauss linear;\n"
+            "    div(phi,h)      bounded Gauss upwind;\n"
+            "    div(phi,k)      bounded Gauss upwind;\n"
+            "    div(phi,epsilon) bounded Gauss upwind;\n"
+            "    div(phi,omega)  bounded Gauss upwind;\n"
+            "    div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;\n"
+            "}\n\n"
+            "laplacianSchemes\n{\n    default         Gauss linear corrected;\n}\n\n"
+            "interpolationSchemes\n{\n    default         linear;\n}\n\n"
+            "snGradSchemes\n{\n    default         corrected;\n}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    @staticmethod
+    def build_solid_fv_schemes(region: "RegionSpec") -> str:
+        """Per-region ``system/<solid>/fvSchemes`` — only ``laplacian(alpha,h)``.
+
+        Solid regions solve only the heat equation; no momentum, no
+        turbulence, no convection.  The single relevant scheme is the
+        laplacian for enthalpy diffusion.
+        """
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       dictionary;\n"
+            f"    location    \"system/{region.name}\";\n"
+            "    object      fvSchemes;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "ddtSchemes\n{\n    default         Euler;\n}\n\n"
+            "gradSchemes\n{\n    default         Gauss linear;\n}\n\n"
+            "divSchemes\n{\n    default         none;\n}\n\n"
+            "laplacianSchemes\n{\n"
+            "    default             none;\n"
+            "    laplacian(alpha,h)  Gauss linear corrected;\n"
+            "}\n\n"
+            "interpolationSchemes\n{\n    default         linear;\n}\n\n"
+            "snGradSchemes\n{\n    default         corrected;\n}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    # ── Per-region fvSolution ─────────────────────────────────────────────
+
+    def build_fluid_fv_solution(self, region: "RegionSpec") -> str:
+        """Per-region ``system/<fluid>/fvSolution``.
+
+        Solvers for rho, p_rgh, (U|h|k|epsilon|omega) + Final variants.
+        SIMPLE / PIMPLE outer-loop control read from the plugin's
+        ``algorithm``.
+        """
+        outer_block_name = self.algorithm  # SIMPLE or PIMPLE
+        # Build the equation regex from the fluid region's turbulence model.
+        eq_fields = ["U", "h"]
+        m = (region.turbulence_model or "").lower()
+        if "komegasst" in m or "komega" in m:
+            eq_fields += ["k", "omega"]
+        elif "kepsilon" in m:
+            eq_fields += ["k", "epsilon"]
+        eq_regex = '"(' + "|".join(eq_fields) + ')"'
+        eq_final_regex = '"(' + "|".join(eq_fields) + ')Final"'
+
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       dictionary;\n"
+            f"    location    \"system/{region.name}\";\n"
+            "    object      fvSolution;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "solvers\n{\n"
+            "    rho\n"
+            "    {\n"
+            "        solver          PCG;\n"
+            "        preconditioner  DIC;\n"
+            "        tolerance       1e-7;\n"
+            "        relTol          0.1;\n"
+            "    }\n\n"
+            "    rhoFinal\n"
+            "    {\n"
+            "        $rho;\n"
+            "        tolerance       1e-7;\n"
+            "        relTol          0;\n"
+            "    }\n\n"
+            "    p_rgh\n"
+            "    {\n"
+            "        solver          GAMG;\n"
+            "        smoother        GaussSeidel;\n"
+            "        nCellsInCoarsestLevel 20;\n"
+            "        tolerance       1e-7;\n"
+            "        relTol          0.01;\n"
+            "    }\n\n"
+            "    p_rghFinal\n"
+            "    {\n"
+            "        $p_rgh;\n"
+            "        tolerance       1e-7;\n"
+            "        relTol          0;\n"
+            "    }\n\n"
+            f"    {eq_regex}\n"
+            "    {\n"
+            "        solver          PBiCG;\n"
+            "        preconditioner  DILU;\n"
+            "        tolerance       1e-7;\n"
+            "        relTol          0.1;\n"
+            "    }\n\n"
+            f"    {eq_final_regex}\n"
+            f"    {{\n"
+            f"        ${eq_fields[0]};\n"
+            "        tolerance       1e-7;\n"
+            "        relTol          0;\n"
+            "    }\n"
+            "}\n\n"
+            f"{outer_block_name}\n"
+            "{\n"
+            "    momentumPredictor   yes;\n"
+            "    nCorrectors         2;\n"
+            "    nNonOrthogonalCorrectors 0;\n"
+            "}\n\n"
+            "relaxationFactors\n{\n"
+            "    equations\n"
+            "    {\n"
+            '        "h.*"           1;\n'
+            '        "U.*"           1;\n'
+            "    }\n"
+            "}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    def build_solid_fv_solution(self, region: "RegionSpec") -> str:
+        """Per-region ``system/<solid>/fvSolution`` — only enthalpy h."""
+        outer_block_name = self.algorithm
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       dictionary;\n"
+            f"    location    \"system/{region.name}\";\n"
+            "    object      fvSolution;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "solvers\n{\n"
+            "    h\n"
+            "    {\n"
+            "        solver          PCG;\n"
+            "        preconditioner  DIC;\n"
+            "        tolerance       1e-06;\n"
+            "        relTol          0.1;\n"
+            "    }\n\n"
+            "    hFinal\n"
+            "    {\n"
+            "        $h;\n"
+            "        tolerance       1e-06;\n"
+            "        relTol          0;\n"
+            "    }\n"
+            "}\n\n"
+            f"{outer_block_name}\n"
+            "{\n"
+            "    nNonOrthogonalCorrectors 0;\n"
+            "}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    # ── Per-region 0/<region>/* field files ───────────────────────────────
+
+    @staticmethod
+    def _coupled_T_patches(region: "RegionSpec") -> str:
+        """Render the coupled BC blocks for every interface this region has.
+
+        Fluid sides use ``kappaMethod fluidThermo``; solid sides use
+        ``kappaMethod solidThermo``.  Patch names follow the OF
+        ``<self>_to_<other>`` convention.
+        """
+        if not region.interfaces:
+            return ""
+        kappa_method = "fluidThermo" if region.kind == "fluid" else "solidThermo"
+        blocks = []
+        for nbr in region.interfaces:
+            patch = f"{region.name}_to_{nbr}"
+            blocks.append(
+                f"    {patch}\n"
+                "    {\n"
+                "        type            compressible::turbulentTemperatureCoupledBaffleMixed;\n"
+                "        Tnbr            T;\n"
+                f"        kappaMethod     {kappa_method};\n"
+                f"        value           uniform {region.T_init:g};\n"
+                "    }\n"
+            )
+        return "\n".join(blocks)
+
+    def build_region_0_T(self, region: "RegionSpec") -> str:
+        """``0/<region>/T`` with coupled BCs at every interface."""
+        coupled = self._coupled_T_patches(region)
+        # Solids only have wall + coupled patches; fluids also have inlet/outlet.
+        if region.kind == "fluid":
+            other_patches = (
+                "    \".*\"\n"
+                "    {\n"
+                "        type            zeroGradient;\n"
+                "    }\n"
+            )
+        else:
+            other_patches = (
+                "    \".*\"\n"
+                "    {\n"
+                "        type            zeroGradient;\n"
+                f"        value           uniform {region.T_init:g};\n"
+                "    }\n"
+            )
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       volScalarField;\n"
+            f"    location    \"0/{region.name}\";\n"
+            "    object      T;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "dimensions      [0 0 0 1 0 0 0];\n"
+            f"internalField   uniform {region.T_init:g};\n\n"
+            "boundaryField\n{\n"
+            f"{other_patches}"
+            f"{coupled}"
+            "}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    @staticmethod
+    def build_region_0_U(region: "RegionSpec") -> str:
+        """``0/<fluid>/U`` — wall noSlip, catch-all fixedValue at init."""
+        u = region.U_init
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       volVectorField;\n"
+            f"    location    \"0/{region.name}\";\n"
+            "    object      U;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "dimensions      [0 1 -1 0 0 0 0];\n"
+            f"internalField   uniform ({u[0]:g} {u[1]:g} {u[2]:g});\n\n"
+            "boundaryField\n{\n"
+            "    \".*\"\n"
+            "    {\n"
+            "        type            fixedValue;\n"
+            "        value           uniform (0 0 0);\n"
+            "    }\n"
+            "}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    @staticmethod
+    def build_region_0_p_rgh(region: "RegionSpec") -> str:
+        """``0/<fluid>/p_rgh`` — fixedFluxPressure on all patches."""
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       volScalarField;\n"
+            f"    location    \"0/{region.name}\";\n"
+            "    object      p_rgh;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "dimensions      [1 -1 -2 0 0 0 0];\n"
+            f"internalField   uniform {region.p_init:g};\n\n"
+            "boundaryField\n{\n"
+            "    \".*\"\n"
+            "    {\n"
+            "        type            fixedFluxPressure;\n"
+            f"        value           uniform {region.p_init:g};\n"
+            "    }\n"
+            "}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    @staticmethod
+    def build_region_0_p(region: "RegionSpec") -> str:
+        """``0/<fluid>/p`` — calculated (synthesised from p_rgh + ρgh)."""
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       volScalarField;\n"
+            f"    location    \"0/{region.name}\";\n"
+            "    object      p;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "dimensions      [1 -1 -2 0 0 0 0];\n"
+            f"internalField   uniform {region.p_init:g};\n\n"
+            "boundaryField\n{\n"
+            "    \".*\"\n"
+            "    {\n"
+            "        type            calculated;\n"
+            f"        value           uniform {region.p_init:g};\n"
+            "    }\n"
+            "}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    @staticmethod
+    def build_region_0_k(region: "RegionSpec") -> str:
+        """``0/<fluid>/k`` — kqRWallFunction on walls."""
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       volScalarField;\n"
+            f"    location    \"0/{region.name}\";\n"
+            "    object      k;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "dimensions      [0 2 -2 0 0 0 0];\n"
+            f"internalField   uniform {region.k_init:g};\n\n"
+            "boundaryField\n{\n"
+            "    \".*\"\n"
+            "    {\n"
+            "        type            kqRWallFunction;\n"
+            f"        value           uniform {region.k_init:g};\n"
+            "    }\n"
+            "}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    @staticmethod
+    def build_region_0_epsilon(region: "RegionSpec") -> str:
+        """``0/<fluid>/epsilon`` — epsilonWallFunction on walls."""
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       volScalarField;\n"
+            f"    location    \"0/{region.name}\";\n"
+            "    object      epsilon;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            "dimensions      [0 2 -3 0 0 0 0];\n"
+            f"internalField   uniform {region.epsilon_init:g};\n\n"
+            "boundaryField\n{\n"
+            "    \".*\"\n"
+            "    {\n"
+            "        type            epsilonWallFunction;\n"
+            f"        value           uniform {region.epsilon_init:g};\n"
+            "    }\n"
+            "}\n\n"
+            "// ************************************************************************* //\n"
+        )
+
+    # ── changeDictionaryDict per region ───────────────────────────────────
+
+    def build_change_dictionary_dict(self, region: "RegionSpec") -> str:
+        """Per-region ``system/<region>/changeDictionaryDict``.
+
+        Applied after ``splitMeshRegions`` to:
+          1. Reclassify any boundary types if needed (mainly for solids
+             whose boundaries become ``patch`` after splitting).
+          2. Set the coupled fluid-solid temperature BC on the interface
+             patches with the right ``kappaMethod`` per side.
+        """
+        coupled = self._coupled_T_patches(region)
+        # We keep the changeDictionaryDict minimal — just the T overrides
+        # at the interfaces.  More elaborate patches (renaming, type
+        # changes) can be added per-case later.
+        body = (
+            "T\n"
+            "{\n"
+            f"    internalField   uniform {region.T_init:g};\n\n"
+            "    boundaryField\n"
+            "    {\n"
+            f"{coupled}"
+            "    }\n"
+            "}\n"
+        )
+        return (
+            "FoamFile\n{\n"
+            "    version     2.0;\n    format      ascii;\n"
+            "    class       dictionary;\n"
+            f"    location    \"system/{region.name}\";\n"
+            "    object      changeDictionaryDict;\n}\n"
+            "// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n"
+            + body
+            + "\n// ************************************************************************* //\n"
+        )
+
     # ── Deterministic-files registry override ─────────────────────────────
 
     def render_deterministic_files(self, config: dict[str, Any]) -> dict[str, str]:
-        """Render the multi-region deterministic file tree.
+        """Render the full multi-region deterministic file tree (Phase 2).
 
-        Phase 1 — emits the minimum CHT skeleton:
-          * ``constant/regionProperties``
-          * ``constant/<region>/thermophysicalProperties`` for each region
-            (fluid uses heRhoThermo + perfectGas; solid uses heSolidThermo)
+        Emits:
 
-        Phase 2 will add: per-region turbulenceProperties, per-region
-        fvSchemes / fvSolution, per-region 0/T with coupled fluid-solid
-        boundary patches, top-level fvSchemes / fvSolution (shared).
+          * ``constant/regionProperties`` — region listing
+          * Per-region ``constant/<region>/thermophysicalProperties``
+            (fluid: ``heRhoThermo`` + ``perfectGas``; solid: ``heSolidThermo``)
+          * Per-fluid ``constant/<region>/turbulenceProperties``
+          * Per-fluid ``constant/<region>/g``  (Earth gravity in -y)
+          * Per-region ``system/<region>/fvSchemes`` and ``fvSolution``
+            (fluid: full N-S + energy + turb; solid: only ``laplacian(alpha,h)``)
+          * Per-region ``system/<region>/changeDictionaryDict``
+            (coupled T BCs on interface patches)
+          * Per-region ``0/<region>/T`` (with
+            ``compressible::turbulentTemperatureCoupledBaffleMixed`` at
+            every interface patch)
+          * Per-fluid ``0/<region>/{U, p, p_rgh, k, epsilon}``
+
+        Still TODO outside this method:
+
+          * Top-level ``system/fvSchemes`` / ``system/fvSolution`` (kept
+            as placeholders by the plugin's ``_build_fv_*`` methods).
+          * Orchestrator wiring to actually emit the tree of files.
+          * packaging.py zip layout for multi-region cases.
         """
         files: dict[str, str] = {}
         regions = self.extract_regions(config)
@@ -313,15 +795,47 @@ class MultiRegionBase(SolverPlugin):
         # 1. regionProperties.
         files["constant/regionProperties"] = self.build_region_properties(config)
 
-        # 2. Per-region thermophysicalProperties.
+        # 2. Per-region thermophysicalProperties + (fluid only) turb + g.
         for r in regions.fluid_regions:
             files[f"constant/{r.name}/thermophysicalProperties"] = (
                 self.build_fluid_thermo(r)
             )
+            files[f"constant/{r.name}/turbulenceProperties"] = (
+                self.build_fluid_turbulence_properties(r)
+            )
+            files[f"constant/{r.name}/g"] = self.build_region_gravity(r)
         for r in regions.solid_regions:
             files[f"constant/{r.name}/thermophysicalProperties"] = (
                 self.build_solid_thermo(r)
             )
+
+        # 3. Per-region system/<region>/{fvSchemes, fvSolution, changeDictionaryDict}.
+        for r in regions.fluid_regions:
+            files[f"system/{r.name}/fvSchemes"] = self.build_fluid_fv_schemes(r)
+            files[f"system/{r.name}/fvSolution"] = self.build_fluid_fv_solution(r)
+            files[f"system/{r.name}/changeDictionaryDict"] = (
+                self.build_change_dictionary_dict(r)
+            )
+        for r in regions.solid_regions:
+            files[f"system/{r.name}/fvSchemes"] = self.build_solid_fv_schemes(r)
+            files[f"system/{r.name}/fvSolution"] = self.build_solid_fv_solution(r)
+            files[f"system/{r.name}/changeDictionaryDict"] = (
+                self.build_change_dictionary_dict(r)
+            )
+
+        # 4. Per-region 0/<region>/* fields.
+        for r in regions.fluid_regions:
+            files[f"0/{r.name}/T"] = self.build_region_0_T(r)
+            files[f"0/{r.name}/U"] = self.build_region_0_U(r)
+            files[f"0/{r.name}/p"] = self.build_region_0_p(r)
+            files[f"0/{r.name}/p_rgh"] = self.build_region_0_p_rgh(r)
+            tm = (r.turbulence_model or "").lower()
+            if "kepsilon" in tm or "komega" in tm:
+                files[f"0/{r.name}/k"] = self.build_region_0_k(r)
+            if "kepsilon" in tm:
+                files[f"0/{r.name}/epsilon"] = self.build_region_0_epsilon(r)
+        for r in regions.solid_regions:
+            files[f"0/{r.name}/T"] = self.build_region_0_T(r)
 
         return files
 

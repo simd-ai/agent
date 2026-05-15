@@ -473,6 +473,20 @@ class RegionSpec(BaseModel):
     rho_solid: float = Field(default=8000.0, gt=0.0)  # kg/m³ — steel-like
     kappa_solid: float = Field(default=80.0, gt=0.0)  # W/(m·K) — steel-like
     Cp_solid: float = Field(default=450.0, gt=0.0)    # J/(kg·K) — steel-like
+    # Names of regions this one couples with via mapped temperature BCs at
+    # fluid-solid interfaces.  Patch names follow the OF convention
+    # ``<self.name>_to_<other>`` (e.g. ``topAir_to_heater``).  Mesh-derived
+    # — the user / precheck pipeline must populate from the actual mesh
+    # boundary file.  Empty tuple = no interfaces (the region is isolated;
+    # only meaningful as a test fixture).
+    interfaces: tuple[str, ...] = ()
+    # Initial / reference values for the field BCs.  Hot-room defaults
+    # (300 K, 1 atm, atmospheric air) are fine for most cases.
+    T_init: float = Field(default=300.0, gt=0.0)       # K
+    p_init: float = Field(default=1.0e5, gt=0.0)       # Pa
+    U_init: tuple[float, float, float] = (0.0, 0.0, 0.0)  # m/s
+    k_init: float = Field(default=0.1, gt=0.0)         # m²/s²
+    epsilon_init: float = Field(default=0.01, gt=0.0)  # m²/s³
 
     model_config = ConfigDict(frozen=True)
 
