@@ -289,6 +289,129 @@ class TestZeroFieldShape:
 # ── Required-files manifest tracks the rendered files ───────────────────────
 
 
+class TestRegionPresets:
+    """Fluid + solid preset tables drive the physics defaults.
+
+    ``fluid_preset = "water"`` fills Cp / μ / Pr / mol_weight from the
+    water preset; explicit per-field overrides still win.
+    """
+
+    def test_water_fluid_preset_applies(self):
+        plugin = ChtMultiRegionFoamSolver()
+        cfg = {
+            "regions": {
+                "fluid": [{"name": "h2o", "fluid_preset": "water"}],
+                "solid": [{"name": "s"}],
+            },
+        }
+        regions = plugin.extract_regions(cfg)
+        water = regions.fluid_regions[0]
+        assert water.Cp == 4182.0
+        assert water.mu == 1.002e-3
+        assert water.Pr == 7.0
+        assert water.mol_weight == 18.02
+
+    def test_ln2_fluid_preset_sets_cryogenic_profile(self):
+        """Cryogenic presets carry the right thermo_profile."""
+        plugin = ChtMultiRegionFoamSolver()
+        cfg = {
+            "regions": {
+                "fluid": [{"name": "cryo", "fluid_preset": "ln2"}],
+                "solid": [{"name": "vessel", "solid_preset": "steel"}],
+            },
+        }
+        regions = plugin.extract_regions(cfg)
+        assert regions.fluid_regions[0].thermo_profile == "cryogenic"
+        assert regions.fluid_regions[0].Cp == 2042.0
+
+    def test_copper_solid_preset_applies(self):
+        plugin = ChtMultiRegionFoamSolver()
+        cfg = {
+            "regions": {
+                "fluid": [{"name": "f"}],
+                "solid": [{"name": "cu", "solid_preset": "copper"}],
+            },
+        }
+        regions = plugin.extract_regions(cfg)
+        cu = regions.solid_regions[0]
+        assert cu.rho_solid == 8960.0
+        assert cu.kappa_solid == 400.0
+        assert cu.Cp_solid == 385.0
+
+    def test_explicit_override_beats_preset(self):
+        """Per-field override wins; other preset fields still apply."""
+        plugin = ChtMultiRegionFoamSolver()
+        cfg = {
+            "regions": {
+                "fluid": [{
+                    "name": "custom",
+                    "fluid_preset": "air",   # Cp=1006, μ=1.8e-5, Pr=0.71
+                    "Cp": 1200,              # override only Cp
+                }],
+                "solid": [{"name": "s"}],
+            },
+        }
+        regions = plugin.extract_regions(cfg)
+        f = regions.fluid_regions[0]
+        # Override applied:
+        assert f.Cp == 1200.0
+        # Other preset values preserved:
+        assert f.mu == 1.8e-5
+        assert f.Pr == 0.71
+
+    def test_unknown_preset_silently_falls_back_to_defaults(self):
+        """Unknown preset names = no preset applied; air-like defaults."""
+        plugin = ChtMultiRegionFoamSolver()
+        cfg = {
+            "regions": {
+                "fluid": [{"name": "x", "fluid_preset": "unobtainium"}],
+                "solid": [{"name": "s"}],
+            },
+        }
+        regions = plugin.extract_regions(cfg)
+        # Falls back to RegionSpec's air-like defaults.
+        assert regions.fluid_regions[0].Cp == 1006.0
+        assert regions.fluid_regions[0].mu == 1.8e-5
+
+    def test_preset_values_flow_into_rendered_thermo(self):
+        """End-to-end: preset → RegionSpec → rendered thermophysicalProperties."""
+        plugin = ChtMultiRegionFoamSolver()
+        cfg = {
+            "regions": {
+                "fluid": [{"name": "water", "fluid_preset": "water",
+                           "interfaces": ["cu"]}],
+                "solid": [{"name": "cu", "solid_preset": "copper",
+                           "interfaces": ["water"]}],
+            },
+        }
+        files = plugin.render_deterministic_files(cfg)
+        fluid_thermo = files["constant/water/thermophysicalProperties"]
+        solid_thermo = files["constant/cu/thermophysicalProperties"]
+        # Water values in fluid file.
+        assert "Cp              4182" in fluid_thermo
+        assert "mu              0.001002" in fluid_thermo
+        assert "molWeight       18.02" in fluid_thermo
+        # Copper values in solid file.
+        assert "kappa       400" in solid_thermo
+        assert "Cp          385" in solid_thermo
+        assert "rho         8960" in solid_thermo
+
+    def test_all_fluid_presets_well_formed(self):
+        """Every preset has the required keys (Cp, μ, Pr, mol_weight)."""
+        from simd_agent.solvers.families._multi_region import MultiRegionBase
+        for name, preset in MultiRegionBase.FLUID_REGION_PRESETS.items():
+            for key in ("Cp", "mu", "Pr", "mol_weight"):
+                assert key in preset, f"{name} missing {key}"
+                assert preset[key] > 0, f"{name}.{key} must be positive"
+
+    def test_all_solid_presets_well_formed(self):
+        from simd_agent.solvers.families._multi_region import MultiRegionBase
+        for name, preset in MultiRegionBase.SOLID_REGION_PRESETS.items():
+            for key in ("rho_solid", "kappa_solid", "Cp_solid"):
+                assert key in preset, f"{name} missing {key}"
+                assert preset[key] > 0, f"{name}.{key} must be positive"
+
+
 class TestManifestMatchesRendered:
     """Every file in required_files() must actually be rendered (or LLM-generated)."""
 

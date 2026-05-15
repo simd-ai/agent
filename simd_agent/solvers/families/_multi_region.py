@@ -73,29 +73,156 @@ class MultiRegionBase(SolverPlugin):
     # handler (Phase 2 — orchestration.py / packaging.py work).
     is_multi_region: bool = True
 
+    # ── Region presets ────────────────────────────────────────────────────
+    #
+    # Per-preset physics values used to fill ``RegionSpec`` defaults.  The
+    # user supplies ``"fluid_preset": "water"`` (or ``"solid_preset":
+    # "copper"``) on a region config dict; the renderer auto-populates
+    # Cp / μ / Pr / ρ / κ / mol_weight from the matching table.  Explicit
+    # per-field values still win — these are *defaults*, not constraints.
+    #
+    # Values sourced from NIST / standard tables at the reference
+    # temperature noted in each entry.  Where Pr isn't tabulated it's
+    # computed as μ·Cp/κ.
+
+    FLUID_REGION_PRESETS: dict[str, dict[str, float | str]] = {
+        # Air at 293 K, 1 atm.
+        "air": {
+            "thermo_profile": "gas",
+            "Cp": 1006.0, "mol_weight": 28.97,
+            "mu": 1.8e-5, "Pr": 0.71,
+        },
+        # Water at 293 K, 1 atm.
+        "water": {
+            "thermo_profile": "gas",          # Boussinesq treats it as p,T-driven
+            "Cp": 4182.0, "mol_weight": 18.02,
+            "mu": 1.002e-3, "Pr": 7.0,
+        },
+        # SAE 30 oil at 293 K.
+        "oil": {
+            "thermo_profile": "gas",
+            "Cp": 1900.0, "mol_weight": 250.0,
+            "mu": 0.29, "Pr": 3800.0,         # very viscous, very high Pr
+        },
+        # Liquid nitrogen at 77 K, 1 atm.
+        "ln2": {
+            "thermo_profile": "cryogenic",
+            "Cp": 2042.0, "mol_weight": 28.01,
+            "mu": 1.58e-4, "Pr": 2.3,
+        },
+        # Liquid oxygen at 90 K, 1 atm.
+        "lox": {
+            "thermo_profile": "cryogenic",
+            "Cp": 1699.0, "mol_weight": 32.00,
+            "mu": 1.95e-4, "Pr": 2.2,
+        },
+        # Liquid hydrogen at 20 K, 1 atm.
+        "lh2": {
+            "thermo_profile": "cryogenic",
+            "Cp": 9668.0, "mol_weight": 2.016,
+            "mu": 1.33e-5, "Pr": 1.3,
+        },
+        # Liquefied natural gas at 111 K (mostly methane).
+        "lng": {
+            "thermo_profile": "cryogenic",
+            "Cp": 3500.0, "mol_weight": 16.04,
+            "mu": 1.2e-4, "Pr": 2.3,
+        },
+        # Helium gas at 293 K.
+        "helium": {
+            "thermo_profile": "gas",
+            "Cp": 5193.0, "mol_weight": 4.003,
+            "mu": 1.96e-5, "Pr": 0.67,
+        },
+    }
+
+    SOLID_REGION_PRESETS: dict[str, dict[str, float]] = {
+        # Carbon steel at 293 K.
+        "steel": {
+            "rho_solid": 8000.0, "kappa_solid": 80.0, "Cp_solid": 450.0,
+        },
+        # Pure copper at 293 K.
+        "copper": {
+            "rho_solid": 8960.0, "kappa_solid": 400.0, "Cp_solid": 385.0,
+        },
+        # Pure aluminum at 293 K.
+        "aluminum": {
+            "rho_solid": 2700.0, "kappa_solid": 237.0, "Cp_solid": 900.0,
+        },
+        # Standard concrete at 293 K.
+        "concrete": {
+            "rho_solid": 2300.0, "kappa_solid": 1.4, "Cp_solid": 880.0,
+        },
+        # Soda-lime glass at 293 K.
+        "glass": {
+            "rho_solid": 2500.0, "kappa_solid": 1.05, "Cp_solid": 840.0,
+        },
+        # Mild stainless 304 at 293 K.
+        "stainless": {
+            "rho_solid": 7900.0, "kappa_solid": 16.2, "Cp_solid": 500.0,
+        },
+    }
+
     # ── Region extraction from config ─────────────────────────────────────
 
     # ── Helper: marshal extra region fields from config dict ──────────────
 
-    @staticmethod
-    def _region_kwargs_from_dict(raw: dict[str, Any], kind: str) -> dict[str, Any]:
+    @classmethod
+    def _region_kwargs_from_dict(
+        cls, raw: dict[str, Any], kind: str
+    ) -> dict[str, Any]:
         """Translate a region dict (user-supplied JSON / YAML) to RegionSpec kwargs.
 
-        Accepts both snake_case (precheck shape) and camelCase (frontend
-        shape) keys.  Validates ``interfaces`` shape (must be list of str).
+        Two layers of values are applied, in order:
+
+          1. **Preset defaults** — when ``raw["fluid_preset"]`` or
+             ``raw["solid_preset"]`` names a known entry in
+             ``FLUID_REGION_PRESETS`` / ``SOLID_REGION_PRESETS``, those
+             physics values (Cp / μ / Pr / ρ / κ / mol_weight) are
+             applied first.  This is what lets the user say
+             ``{"name": "topWater", "fluid_preset": "water"}`` and get
+             Cp=4182 / μ=1e-3 / Pr=7.0 automatically.
+
+          2. **Explicit overrides** — any per-field value in ``raw``
+             (``Cp``, ``mu``, ``rho_solid``, …) wins over the preset.
+
+        Accepts both snake_case (precheck) and camelCase (frontend) keys.
         """
         kw: dict[str, Any] = {
             "name": raw["name"],
             "kind": kind,
         }
+
+        # ── Layer 1: apply preset defaults ──
+        preset_name = (
+            raw.get("fluid_preset" if kind == "fluid" else "solid_preset")
+            or raw.get("fluidPreset" if kind == "fluid" else "solidPreset")
+            or raw.get("preset")
+        )
+        preset_table = (
+            cls.FLUID_REGION_PRESETS if kind == "fluid"
+            else cls.SOLID_REGION_PRESETS
+        )
+        if preset_name and preset_name in preset_table:
+            kw.update(preset_table[preset_name])
+            # Stash the preset name on the spec for traceability / debugging.
+            kw[f"{kind}_preset"] = preset_name
+
+        # ── Layer 2: kind-specific fields ──
         if kind == "fluid":
-            kw["thermo_profile"] = raw.get("thermo_profile") or raw.get(
-                "thermoProfile", "gas"
-            )
+            # thermo_profile / turbulence_model: explicit > preset > default.
+            if "thermo_profile" not in kw:
+                kw["thermo_profile"] = raw.get("thermo_profile") or raw.get(
+                    "thermoProfile", "gas"
+                )
+            elif "thermo_profile" in raw:
+                kw["thermo_profile"] = raw["thermo_profile"]
             kw["turbulence_model"] = (
                 raw.get("turbulence_model")
-                or raw.get("turbulenceModel", "kEpsilon")
+                or raw.get("turbulenceModel")
+                or kw.get("turbulence_model", "kEpsilon")
             )
+            # Explicit fluid-physics overrides.
             for src, dst in (
                 ("Cp", "Cp"), ("mol_weight", "mol_weight"),
                 ("molWeight", "mol_weight"), ("mu", "mu"), ("Pr", "Pr"),

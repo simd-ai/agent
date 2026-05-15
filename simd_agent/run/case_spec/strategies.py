@@ -464,12 +464,22 @@ class RegionSpec(BaseModel):
     thermo_profile: Literal["gas", "cryogenic", "solid"]
     # Fluid regions: RAS / LES / laminar.  Solids must leave this None.
     turbulence_model: str | None = None
+    # Preset references — drive the physics defaults.  When set, the
+    # plugin's ``_region_kwargs_from_dict`` fills Cp / μ / Pr / ρ / κ
+    # from the matching preset table; explicit per-field values still
+    # win over the preset (override semantics).  Allowed preset names
+    # are defined in ``FLUID_REGION_PRESETS`` / ``SOLID_REGION_PRESETS``
+    # on ``MultiRegionBase``.
+    fluid_preset: str | None = None      # e.g. "air", "water", "ln2"
+    solid_preset: str | None = None      # e.g. "steel", "copper", "concrete"
     # Fluid-region transport / thermo numbers (use defaults if unknown).
+    # Air-like defaults preserved for backward compat with tests that
+    # don't specify a preset.
     Cp: float = Field(default=1006.0, gt=0.0)         # J/(kg·K)
     mol_weight: float = Field(default=28.97, gt=0.0)  # g/mol — air-like default
     mu: float = Field(default=1.8e-5, gt=0.0)         # Pa·s
     Pr: float = Field(default=0.7, gt=0.0)
-    # Solid-region thermal properties.
+    # Solid-region thermal properties.  Steel-like defaults preserved.
     rho_solid: float = Field(default=8000.0, gt=0.0)  # kg/m³ — steel-like
     kappa_solid: float = Field(default=80.0, gt=0.0)  # W/(m·K) — steel-like
     Cp_solid: float = Field(default=450.0, gt=0.0)    # J/(kg·K) — steel-like
