@@ -163,7 +163,7 @@ class RhoSimpleFoamSolver(SolverPlugin):
         ctx = self._fv_context(config)
         return (
             self._foam_file_header("fvSchemes")
-            + self._build_ddt_block() + "\n"
+            + self._build_ddt_block(ctx) + "\n"
             + self._build_grad_block(ctx) + "\n"
             + self._build_div_block(ctx) + "\n"
             + self._build_laplacian_block(ctx) + "\n"

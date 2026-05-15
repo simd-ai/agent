@@ -33,6 +33,7 @@ from .resolvers import (
     resolve_fv_options_max,
     resolve_pressure_solver_from_config,
     resolve_pressure_solver_strategy,
+    resolve_regime_profile,
     resolve_turbulence_spec,
 )
 from .spec import _SOLVER_PROPS, _TURB_FIELDS, CaseSpec
@@ -42,6 +43,7 @@ from .strategies import (
     FluidThermo,
     InletTurbulence,
     PressureSolverStrategy,
+    TurbulenceRegimeProfile,
     TurbulenceSpec,
 )
 from .thermo_profile import (
@@ -59,6 +61,7 @@ __all__ = [
     "CoarsestLevelCorr",
     "CompressibleBounds",
     "InletTurbulence",
+    "TurbulenceRegimeProfile",
     "TurbulenceSpec",
     # Public — resolvers (Phase 2)
     "resolve_pressure_solver_strategy",
@@ -66,6 +69,7 @@ __all__ = [
     "resolve_compressible_bounds",
     "resolve_fv_options_max",
     "resolve_div_phi_h_scheme",
+    "resolve_regime_profile",
     "resolve_turbulence_spec",
     # Private (kept for backward compat with existing imports across the codebase)
     "_select_thermo_profile",

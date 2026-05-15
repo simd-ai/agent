@@ -811,6 +811,8 @@ class SolverPlugin(ABC):
         from simd_agent.run.case_spec import (
             _mesh_quality_decisions,
             _thermo_profile_from_config,
+            resolve_regime_profile,
+            resolve_turbulence_spec,
         )
         from simd_agent.solvers.contexts import FvBuildContext
 
@@ -861,6 +863,36 @@ class SolverPlugin(ABC):
             except (TypeError, ValueError):
                 pass
 
+        # Resolve the per-regime scheme bundle (laminar / RAS / LES) once.
+        # The renderer helpers read attribute access against this object
+        # instead of nested if/else over a string regime tag.  Algorithm
+        # comes from the plugin (SIMPLE / PIMPLE / PISO); energy_var comes
+        # from the plugin's class attribute.
+        try:
+            _turb_spec = resolve_turbulence_spec(self, config)
+            sim_type = _turb_spec.simulation_type
+            model_for_block = _turb_spec.model
+        except Exception:
+            # Defensive — if the resolver can't run (corrupt config), fall
+            # back to RAS+kOmegaSST so the renderer still emits a working
+            # case.  The actual fault will surface elsewhere as a lint issue.
+            sim_type = "RAS"
+            model_for_block = turb_model or "kOmegaSST"
+
+        from typing import Literal as _Literal, cast as _cast
+        _algo = _cast(
+            _Literal["SIMPLE", "PIMPLE", "PISO"],
+            (self.algorithm if self.algorithm in ("SIMPLE", "PIMPLE", "PISO")
+             else "SIMPLE"),
+        )
+        regime_profile = resolve_regime_profile(
+            simulation_type=sim_type,
+            turb_model=model_for_block,
+            algorithm=_algo,
+            is_compressible=self.is_compressible,
+            energy_var=self.energy_var,
+        )
+
         return FvBuildContext(
             tier=mq["mesh_quality_tier"],
             non_ortho=mq.get("mesh_max_non_orthogonality") or 0.0,
@@ -874,6 +906,7 @@ class SolverPlugin(ABC):
             heat_transfer_active=heat_transfer_active,
             turb_model=turb_model,
             mesh_quality=mq,
+            regime_profile=regime_profile,
         )
 
     # ── Equation field lookup ─────────────────────────────────────────────
@@ -1413,8 +1446,22 @@ class SolverPlugin(ABC):
 
     # ── fvSchemes section helpers ─────────────────────────────────────────
 
-    def _build_ddt_block(self) -> str:
-        ddt = "Euler" if self.is_transient else "steadyState"
+    def _build_ddt_block(
+        self,
+        ctx: "FvBuildContext | None" = None,
+    ) -> str:
+        """ddtSchemes — read from the resolved regime_profile when available.
+
+        LES needs ``backward`` (2nd-order time accuracy) instead of
+        ``Euler``; SIMPLE-mode steady solvers stay on ``steadyState``.
+        The regime resolver encodes those choices.  Falls back to the
+        plugin's algorithm-driven default when ctx is not provided
+        (legacy callers / tests).
+        """
+        if ctx is not None and ctx.regime_profile is not None:
+            ddt = ctx.regime_profile.ddt_scheme
+        else:
+            ddt = "Euler" if self.is_transient else "steadyState"
         return (
             "ddtSchemes\n"
             "{\n"
@@ -1437,102 +1484,115 @@ class SolverPlugin(ABC):
         )
 
     def _build_div_block(self, ctx: "FvBuildContext",) -> str:
-        """divSchemes — profile-aware (gas/cryogenic) and speed-aware.
+        """divSchemes — driven by the resolved regime_profile.
 
-        Phase 2: the ``div(phi,h)`` scheme decision (upwind vs linearUpwind
-        based on ΔT) lives in ``resolve_div_phi_h_scheme``.  Replaces Check 7d.
+        Every per-regime scheme choice (laminar / RAS / LES) is encoded in
+        ``ctx.regime_profile`` via ``resolve_regime_profile``.  This renderer
+        is now a pure assembly step over those values.
+
+        Legacy fallback: when ctx.regime_profile is None (test callers that
+        build FvBuildContext directly), the previous algorithm-aware /
+        speed-aware literals are used.  Production code always goes through
+        ``_fv_context`` which now constructs the profile.
         """
         from simd_agent.run.case_spec import resolve_div_phi_h_scheme
 
         speed_tier = ctx.speed_tier
         profile = ctx.profile
         turb_model = ctx.turb_model
-
-        # BC temperature spread — used by the energy-div resolver.
-        # Read from ctx if available, otherwise approximate as no spread.
-        _bc_temps = list(ctx.bc_temps)
+        rp = ctx.regime_profile  # may be None (legacy path)
 
         lines: list[str] = ["    default         none;"]
-        if self.is_compressible:
-            # SIMPLE-mode compressible (rhoSimpleFoam, buoyantSimpleFoam): the
-            # OpenFOAM reference tutorials use ``bounded Gauss upwind`` for
-            # ``div(phi,U)`` **unconditionally** — the steady solver lacks a
-            # time-derivative to absorb the acoustic overshoot that
-            # ``linearUpwindV`` produces at startup, so accuracy is correctly
-            # traded for robustness.  We follow the same policy.
-            #
-            # PIMPLE / PISO compressible (rhoPimpleFoam): keep
-            # ``linearUpwindV grad(U)`` for low/moderate speed gas — the Δt
-            # in the transient loop damps the overshoot, and accuracy
-            # matters for unsteady prediction.  Fall back to plain upwind
-            # at high speed or under a strong pressure ratio.
-            if self.algorithm == "SIMPLE":
-                lines.append("    div(phi,U)      bounded Gauss upwind;")
-            else:
-                _high_dp = ctx.pressure_ratio >= 3.0
-                if (
-                    profile == "gas"
-                    and speed_tier in ("low", "moderate")
-                    and not _high_dp
-                ):
-                    lines.append("    div(phi,U)      bounded Gauss linearUpwindV grad(U);")
-                else:
-                    lines.append("    div(phi,U)      bounded Gauss upwind;")
+
+        if rp is not None:
+            # ── Profile-driven path (Phase 5 — typed regime resolver) ──
+            lines.append(f"    div(phi,U)      {rp.div_phi_U};")
             if self.supports_energy:
-                _h_scheme = resolve_div_phi_h_scheme(
-                    is_compressible_energy=True,
-                    bc_temps=_bc_temps if _bc_temps else None,
-                )
-                # Use the solver's energy variable name — ``e`` for
-                # rhoSimpleFoam (sensibleInternalEnergy) or ``h`` elsewhere
-                # (sensibleEnthalpy).  Must match thermophysicalProperties.
                 lines.append(
-                    f"    div(phi,{self.energy_var})      {_h_scheme};"
+                    f"    div(phi,{self.energy_var})      {rp.div_phi_energy};"
                 )
                 # Kinetic-energy convection term — name depends on the
-                # energy variable.  With sensibleEnthalpy (h) the pressure-
-                # work term ``p/ρ`` is folded into h, so only the bare
-                # kinetic energy ``K = ½|U|²`` is convected → ``div(phi,K)``.
-                # With sensibleInternalEnergy (e), internal energy excludes
-                # ``p/ρ`` so the solver convects ``Ekp = K + p/ρ`` instead
-                # → ``div(phi,Ekp)``.  Missing either term is a fatal
-                # ``Entry 'div(phi,...)' not found`` since ``default none``
-                # requires every transport term to be listed explicitly.
-                if self.energy_var == "e":
-                    lines.append(
-                        "    div(phi,Ekp)    bounded Gauss upwind;"
-                    )
-                else:
-                    lines.append(
-                        "    div(phi,K)      bounded Gauss upwind;"
-                    )
-            # div(phid,p) — rho* solvers only (NOT buoyant p_rgh solvers)
-            if not self.needs_gravity:
-                lines.append("    div(phid,p)     Gauss upwind;")
+                # energy variable (Ekp for sensibleInternalEnergy, K
+                # otherwise).  Scheme comes from the regime profile.
+                ke_name = "Ekp" if self.energy_var == "e" else "K"
+                lines.append(
+                    f"    div(phi,{ke_name})      {rp.div_phi_K};"
+                )
+            # Pressure-work term — uses the flux name dictated by the regime
+            # (phid for compressible RAS, phiv for laminar / LES / low-Mach).
+            # rho* solvers only — buoyant p_rgh solvers don't have this term.
+            if self.is_compressible and not self.needs_gravity:
+                lines.append(
+                    f"    div({rp.pressure_flux},p)     {rp.div_phi_p};"
+                )
+            # Transported turbulence fields — None for laminar.
+            if rp.div_phi_turb is not None:
+                turb_fields = self.turbulence_fields(turb_model)
+                transported = [
+                    f for f in turb_fields
+                    if f in ("k", "omega", "epsilon", "nuTilda")
+                ]
+                if transported:
+                    lines.append("")
+                    for f in transported:
+                        lines.append(f"    div(phi,{f})    {rp.div_phi_turb};")
         else:
-            if speed_tier == "high":
-                lines.append("    div(phi,U)      bounded Gauss upwind;")
+            # ── Legacy literal path (kept for tests that build the ctx
+            # directly without a regime_profile — primarily unit tests for
+            # the renderer helpers).  Mirrors the pre-Phase-5 behaviour.
+            _bc_temps = list(ctx.bc_temps)
+            if self.is_compressible:
+                if self.algorithm == "SIMPLE":
+                    lines.append("    div(phi,U)      bounded Gauss upwind;")
+                else:
+                    _high_dp = ctx.pressure_ratio >= 3.0
+                    if (
+                        profile == "gas"
+                        and speed_tier in ("low", "moderate")
+                        and not _high_dp
+                    ):
+                        lines.append("    div(phi,U)      bounded Gauss linearUpwindV grad(U);")
+                    else:
+                        lines.append("    div(phi,U)      bounded Gauss upwind;")
+                if self.supports_energy:
+                    _h_scheme = resolve_div_phi_h_scheme(
+                        is_compressible_energy=True,
+                        bc_temps=_bc_temps if _bc_temps else None,
+                    )
+                    lines.append(
+                        f"    div(phi,{self.energy_var})      {_h_scheme};"
+                    )
+                    if self.energy_var == "e":
+                        lines.append("    div(phi,Ekp)    bounded Gauss upwind;")
+                    else:
+                        lines.append("    div(phi,K)      bounded Gauss upwind;")
+                if not self.needs_gravity:
+                    lines.append("    div(phid,p)     Gauss upwind;")
             else:
-                lines.append("    div(phi,U)      bounded Gauss linearUpwind grad(U);")
+                if speed_tier == "high":
+                    lines.append("    div(phi,U)      bounded Gauss upwind;")
+                else:
+                    lines.append("    div(phi,U)      bounded Gauss linearUpwind grad(U);")
 
-        turb_fields = (
-            self.turbulence_fields(turb_model)
-            if turb_model != "laminar"
-            else []
-        )
-        transported = [
-            f for f in turb_fields if f in ("k", "omega", "epsilon", "nuTilda")
-        ]
-        if transported:
-            lines.append("")
-            turb_scheme = (
-                "bounded Gauss upwind" if speed_tier == "high"
-                else "bounded Gauss limitedLinear 1"
+            turb_fields = (
+                self.turbulence_fields(turb_model)
+                if turb_model != "laminar"
+                else []
             )
-            for f in transported:
-                lines.append(f"    div(phi,{f})    {turb_scheme};")
+            transported = [
+                f for f in turb_fields
+                if f in ("k", "omega", "epsilon", "nuTilda")
+            ]
+            if transported:
+                lines.append("")
+                turb_scheme = (
+                    "bounded Gauss upwind" if speed_tier == "high"
+                    else "bounded Gauss limitedLinear 1"
+                )
+                for f in transported:
+                    lines.append(f"    div(phi,{f})    {turb_scheme};")
 
-        # Viscous stress tensor
+        # Viscous stress tensor — same form in all regimes.
         lines.append("")
         if self.is_compressible:
             lines.append("    div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;")
@@ -1616,35 +1676,56 @@ class SolverPlugin(ABC):
     def _build_turbulence_properties(self, config: dict[str, Any]) -> str:
         """Render ``constant/turbulenceProperties`` from scratch.
 
-        Delegates to ``resolve_turbulence_spec`` so the (flow_regime, model,
-        simulation_type) trio comes from the same solver-aware resolver that
-        ``build_case_spec`` uses.  Eliminates the historical drift where this
-        renderer read the model from one config path and the rest of the
-        pipeline read it from another (and silently fell back to laminar).
+        Uses the resolved ``TurbulenceRegimeProfile`` (which carries the
+        full simulationType + model sub-dict text — including the LES
+        ``delta`` / ``cubeRootVolCoeffs`` block — directly).  Falls back
+        to the legacy in-line composition when the profile can't be
+        built (e.g. corrupt config) so the renderer never raises.
         """
-        from simd_agent.run.case_spec import resolve_turbulence_spec
+        from typing import Literal as _Literal, cast as _cast
+        from simd_agent.run.case_spec import (
+            resolve_regime_profile,
+            resolve_turbulence_spec,
+        )
 
         spec = resolve_turbulence_spec(self, config)
-        if spec.simulation_type == "laminar":
-            body = "simulationType  laminar;\n"
-        elif spec.simulation_type == "LES":
-            body = (
-                "simulationType  LES;\n\n"
-                "LES\n{\n"
-                f"    LESModel        {spec.model};\n"
-                "    turbulence      on;\n"
-                "    printCoeffs     on;\n"
-                "}\n"
+        try:
+            _algo = _cast(
+                _Literal["SIMPLE", "PIMPLE", "PISO"],
+                (self.algorithm
+                 if self.algorithm in ("SIMPLE", "PIMPLE", "PISO")
+                 else "SIMPLE"),
             )
-        else:
-            body = (
-                "simulationType  RAS;\n\n"
-                "RAS\n{\n"
-                f"    RASModel        {spec.model};\n"
-                "    turbulence      on;\n"
-                "    printCoeffs     on;\n"
-                "}\n"
+            rp = resolve_regime_profile(
+                simulation_type=spec.simulation_type,
+                turb_model=spec.model,
+                algorithm=_algo,
+                is_compressible=self.is_compressible,
+                energy_var=self.energy_var,
             )
+            body = rp.turbulence_properties_block
+        except Exception:
+            # Legacy fallback — identical to pre-Phase-5 behaviour.
+            if spec.simulation_type == "laminar":
+                body = "simulationType  laminar;\n"
+            elif spec.simulation_type == "LES":
+                body = (
+                    "simulationType  LES;\n\n"
+                    "LES\n{\n"
+                    f"    LESModel        {spec.model};\n"
+                    "    turbulence      on;\n"
+                    "    printCoeffs     on;\n"
+                    "}\n"
+                )
+            else:
+                body = (
+                    "simulationType  RAS;\n\n"
+                    "RAS\n{\n"
+                    f"    RASModel        {spec.model};\n"
+                    "    turbulence      on;\n"
+                    "    printCoeffs     on;\n"
+                    "}\n"
+                )
         return (
             self._foam_file_header("turbulenceProperties")
             + body

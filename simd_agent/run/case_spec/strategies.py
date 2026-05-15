@@ -326,3 +326,86 @@ class InletTurbulence(BaseModel):
     @property
     def epsilon(self) -> float:
         return float(0.09 ** 0.75 * (self.k ** 1.5) / self.length_scale)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# TurbulenceRegimeProfile — per-regime fvSchemes / turbulenceProperties knobs
+# ────────────────────────────────────────────────────────────────────────────
+#
+# The three OpenFOAM regimes (laminar / RAS / LES) differ in numerical scheme
+# choice everywhere they touch:
+#
+#   * ``constant/turbulenceProperties`` — different blocks entirely
+#   * ``fvSchemes.ddtSchemes``           — backward (LES) vs Euler
+#   * ``fvSchemes.divSchemes``           — every div(phi,X) line differs
+#
+# Encoding the per-regime decisions as one frozen Pydantic model means the
+# renderers read attribute access (``ctx.regime_profile.div_phi_U``) instead
+# of nested if/else over a string regime tag.  Bug class that disappears: a
+# scheme line that's correct for RAS but wrong for LES (e.g. ``LUST grad(U)``
+# is meaningless in RAS).
+
+# Pressure flux name — ``phid`` (compressible flux, ψ·U) for rho-pressure-
+# coupled solvers; ``phiv`` (kinematic flux, U) for solvers that integrate
+# the pressure equation differently.  Renderer emits ``div(<flux>,p)``.
+PressureFlux = Literal["phid", "phiv"]
+
+
+class TurbulenceRegimeProfile(BaseModel):
+    """Resolved per-regime scheme bundle for fvSchemes + turbulenceProperties.
+
+    The renderer reads attribute access against this frozen object instead
+    of branching on a string regime tag.  Construction is driven by
+    ``resolve_regime_profile`` in resolvers.py — one profile per
+    (regime × solver_algorithm × thermo_profile) triple.
+
+    Fields:
+
+      * ``simulation_type`` — laminar / RAS / LES.  Drives every other choice.
+      * ``ddt_scheme``      — Euler (transient pseudo-steady), backward (LES),
+                              steadyState (SIMPLE), or CrankNicolson 0.9 (DNS-y).
+      * ``div_phi_U``       — divergence scheme for momentum.
+      * ``div_phi_energy``  — divergence for the energy variable (h or e).
+      * ``div_phi_K``       — divergence for kinetic-energy convection.
+      * ``div_phi_p``       — divergence for the pressure-work term.
+      * ``div_phi_turb``    — divergence for transported turbulence fields
+                              (None for laminar — no such fields exist).
+      * ``pressure_flux``   — ``phid`` (compressible flux) or ``phiv``
+                              (kinematic).  Renderer emits
+                              ``div(<pressure_flux>,p)``.
+      * ``turbulence_properties_block`` — the full ``simulationType …`` text
+                              for ``constant/turbulenceProperties``, including
+                              any model-specific sub-dict (LES needs
+                              ``delta``, ``cubeRootVolCoeffs``, …).
+    """
+
+    simulation_type: Literal["laminar", "RAS", "LES"]
+    ddt_scheme: str = Field(min_length=1)
+    div_phi_U: str = Field(min_length=1)
+    div_phi_energy: str = Field(min_length=1)
+    div_phi_K: str = Field(min_length=1)
+    div_phi_p: str = Field(min_length=1)
+    div_phi_turb: str | None = None
+    pressure_flux: PressureFlux = "phid"
+    turbulence_properties_block: str = Field(min_length=1)
+
+    model_config = ConfigDict(frozen=True)
+
+    @model_validator(mode="after")
+    def _enforce_regime_consistency(self) -> "TurbulenceRegimeProfile":
+        # Laminar carries no transported turbulence fields → div_phi_turb must
+        # be absent.  RAS / LES carry at least one transported scalar.
+        if self.simulation_type == "laminar" and self.div_phi_turb is not None:
+            raise ValueError(
+                "simulation_type='laminar' must not declare div_phi_turb — "
+                "laminar carries no transported turbulence fields."
+            )
+        if (
+            self.simulation_type in ("RAS", "LES")
+            and self.div_phi_turb is None
+        ):
+            raise ValueError(
+                f"simulation_type={self.simulation_type!r} requires "
+                "div_phi_turb (e.g. 'Gauss upwind' or 'Gauss limitedLinear 1')."
+            )
+        return self

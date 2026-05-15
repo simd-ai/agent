@@ -22,6 +22,7 @@ from .strategies import (
     CoarsestLevelCorr,
     CompressibleBounds,
     PressureSolverStrategy,
+    TurbulenceRegimeProfile,
     TurbulenceSpec,
 )
 
@@ -382,3 +383,154 @@ def resolve_div_phi_h_scheme(
     # Default for compressible energy solvers — upwind is the textbook
     # safe choice; linearUpwind is only worth it for moderate ΔT.
     return "bounded Gauss upwind"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Turbulence regime profile — per-(simulation_type × algorithm) scheme bundle
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Encodes the per-regime choices observed across the three OpenFOAM 4.x
+# rhoPimpleFoam reference tutorials:
+#
+#   compressible/rhoPimpleFoam/laminar/helmholtzResonance
+#   compressible/rhoPimpleFoam/ras/angledDuct
+#   compressible/rhoPimpleFoam/les/pitzDaily
+#
+# plus the rhoSimpleFoam RAS reference (angledDuctExplicitFixedCoeff) for the
+# SIMPLE-mode steady case.  Renderers in ``solvers/base.py`` read this
+# resolved profile and emit the right scheme line for the regime; no inline
+# branching, no string-tag comparisons.
+
+
+def _laminar_properties_block() -> str:
+    return "simulationType  laminar;\n"
+
+
+def _ras_properties_block(model: str) -> str:
+    return (
+        "simulationType  RAS;\n\n"
+        "RAS\n"
+        "{\n"
+        f"    RASModel        {model};\n"
+        "    turbulence      on;\n"
+        "    printCoeffs     on;\n"
+        "}\n"
+    )
+
+
+def _les_properties_block(model: str) -> str:
+    # Minimal LES block — covers kEqn / Smagorinsky / dynamicKEqn.
+    # The cubeRootVol delta is the textbook OF choice for unstructured
+    # meshes; sub-block ``cubeRootVolCoeffs { deltaCoeff 1; }`` keeps
+    # the OpenFOAM dict reader happy across forks.
+    return (
+        "simulationType  LES;\n\n"
+        "LES\n"
+        "{\n"
+        f"    LESModel        {model};\n"
+        "    turbulence      on;\n"
+        "    printCoeffs     on;\n"
+        "    delta           cubeRootVol;\n\n"
+        "    cubeRootVolCoeffs\n"
+        "    {\n"
+        "        deltaCoeff      1;\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def resolve_regime_profile(
+    simulation_type: Literal["laminar", "RAS", "LES"],
+    turb_model: str,
+    algorithm: Literal["SIMPLE", "PIMPLE", "PISO"],
+    is_compressible: bool,
+    energy_var: str = "h",
+) -> TurbulenceRegimeProfile:
+    """Resolve the full per-regime scheme bundle in one place.
+
+    The three OF reference tutorials drive every choice here:
+
+      laminar (helmholtzResonance) — accuracy-preferred, no turb fields:
+        ``ddt Euler``, ``div(phi,U) Gauss limitedLinearV 1``,
+        ``div(phi,e) Gauss limitedLinear 1``, ``div(phi,K) Gauss
+        limitedLinear 1``, ``div(phiv,p) Gauss limitedLinear 1``.
+
+      RAS (angledDuct) — robustness-preferred, transported k/ε/ω:
+        ``ddt Euler``, ``div(phi,U) Gauss upwind``,
+        ``div(phi,h) Gauss upwind``, ``div(phi,K) Gauss linear``,
+        ``div(phid,p) Gauss upwind``, ``div(phi,k) Gauss upwind``.
+        SIMPLE mode (rhoSimpleFoam) uses ``ddt steadyState`` instead of
+        ``Euler``.
+
+      LES (pitzDaily) — eddy-resolved, second-order time:
+        ``ddt backward``, ``div(phi,U) Gauss LUST grad(U)``,
+        ``div(phi,e) Gauss LUST grad(e)``, ``div(phi,K) Gauss linear``,
+        ``div(phiv,p) Gauss linear``, ``div(phi,k) Gauss limitedLinear 1``.
+
+    Pressure flux:
+      * RAS rhoPimple uses ``phid`` (compressibility-coupled flux,
+        because ``transonic`` is set explicitly).
+      * Laminar + LES use ``phiv`` (kinematic — they integrate the
+        pressure equation in a low-Mach form).
+      * SIMPLE-mode steady (rhoSimpleFoam) uses ``phid``.
+    """
+    # ── ddt ──
+    if algorithm == "SIMPLE":
+        ddt = "steadyState"
+    elif simulation_type == "LES":
+        ddt = "backward"  # 2nd-order time accuracy for resolved turbulence
+    else:
+        ddt = "Euler"
+
+    # ── turbulenceProperties block ──
+    if simulation_type == "laminar":
+        tp_block = _laminar_properties_block()
+    elif simulation_type == "LES":
+        tp_block = _les_properties_block(turb_model)
+    else:
+        tp_block = _ras_properties_block(turb_model)
+
+    # ── div(phi,*) schemes ──
+    if simulation_type == "laminar":
+        div_U = "Gauss limitedLinearV 1"
+        div_energy = "Gauss limitedLinear 1"
+        div_K = "Gauss limitedLinear 1"
+        div_p = "Gauss limitedLinear 1"
+        div_turb: str | None = None
+        flux = "phiv"
+    elif simulation_type == "LES":
+        div_U = "Gauss LUST grad(U)"
+        div_energy = f"Gauss LUST grad({energy_var})"
+        div_K = "Gauss linear"
+        div_p = "Gauss linear"
+        div_turb = "Gauss limitedLinear 1"
+        flux = "phiv"
+    else:
+        # RAS — robustness pattern from the OF rhoPimpleFoam ras tutorial.
+        # rhoSimpleFoam (SIMPLE) uses the same RAS scheme set; the algorithm
+        # affects ddt + pressure-flux choice, not divSchemes.
+        div_U = "bounded Gauss upwind"
+        div_energy = "bounded Gauss upwind"
+        # div(phi,K) — Gauss linear for rhoPimpleFoam (transient, h energy),
+        # bounded Gauss upwind elsewhere.  rhoSimpleFoam tutorial uses
+        # ``bounded Gauss upwind`` for div(phi,Ekp)/K so SIMPLE keeps the
+        # safer choice.
+        div_K = "Gauss linear" if algorithm == "PIMPLE" else "bounded Gauss upwind"
+        div_p = "Gauss upwind"
+        div_turb = "bounded Gauss upwind" if algorithm == "PIMPLE" \
+            else "bounded Gauss limitedLinear 1"
+        flux = "phid" if is_compressible else "phiv"
+
+    pressure_flux = cast(Literal["phid", "phiv"], flux)
+
+    return TurbulenceRegimeProfile(
+        simulation_type=simulation_type,
+        ddt_scheme=ddt,
+        div_phi_U=div_U,
+        div_phi_energy=div_energy,
+        div_phi_K=div_K,
+        div_phi_p=div_p,
+        div_phi_turb=div_turb,
+        pressure_flux=pressure_flux,
+        turbulence_properties_block=tp_block,
+    )

@@ -20,7 +20,10 @@ Conventions:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from simd_agent.run.case_spec.strategies import TurbulenceRegimeProfile
 
 # ── Closed value sets ──────────────────────────────────────────────────────
 
@@ -92,6 +95,13 @@ class FvBuildContext:
     # (high inlet/outlet ratio forces ``upwind`` for startup safety).
     # Defaults to empty for legacy test callers that don't set it.
     bc_pressures: tuple[float, ...] = ()
+
+    # Resolved per-regime scheme bundle — laminar / RAS / LES knobs for
+    # fvSchemes (ddt, div(phi,*)) and constant/turbulenceProperties.
+    # See ``simd_agent.run.case_spec.resolvers.resolve_regime_profile``.
+    # Defaults to None so legacy test callers don't have to build a profile;
+    # renderers fall back to the previous RAS-only literals when missing.
+    regime_profile: "TurbulenceRegimeProfile | None" = None
 
     # ── Convenience computed views ──────────────────────────────────────
 
