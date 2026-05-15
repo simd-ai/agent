@@ -13,15 +13,15 @@ from typing import Any
 
 from simd_agent.solvers.base import (
     MatchResult,
-    SolverPlugin,
     ValidationIssue,
     ValidationResult,
 )
+from simd_agent.solvers.families import TransientBase
 
 logger = logging.getLogger(__name__)
 
 
-class PimpleFoamSolver(SolverPlugin):
+class PimpleFoamSolver(TransientBase):
     """pimpleFoam — transient incompressible isothermal RANS."""
 
     name = "pimpleFoam"

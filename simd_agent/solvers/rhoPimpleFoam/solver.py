@@ -13,15 +13,15 @@ from typing import Any
 
 from simd_agent.solvers.base import (
     MatchResult,
-    SolverPlugin,
     ValidationIssue,
     ValidationResult,
 )
+from simd_agent.solvers.families import CompressibleMixin, TransientBase
 
 logger = logging.getLogger(__name__)
 
 
-class RhoPimpleFoamSolver(SolverPlugin):
+class RhoPimpleFoamSolver(TransientBase, CompressibleMixin):
     """rhoPimpleFoam — transient compressible energy RANS."""
 
     name = "rhoPimpleFoam"
@@ -153,6 +153,14 @@ class RhoPimpleFoamSolver(SolverPlugin):
         # _build_pressure_solver_block().  The post-gen regex hack
         # (_fix_isothermal_pimple) is no longer needed.
         fixed = self._unify_inlet_turbulence(fixed, issues, config)
+
+        # Hoisted BC robustness fixers (shared with rhoSimpleFoam) — match
+        # the OF rhoPimpleFoam reference tutorials:
+        #   * outlet U/T/k/ω/ε  → inletOutlet (handle backflow)
+        #   * inlet k/ω/ε       → turbulentIntensity… / mixingLength…
+        #     (derive from actual U rather than precheck-precomputed values)
+        fixed = self._fix_outlet_backflow_bcs(fixed, issues, config)
+        fixed = self._fix_inlet_turbulence_bc_types(fixed, issues, config)
 
         return ValidationResult(files=fixed, issues=issues)
 

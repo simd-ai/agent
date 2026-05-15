@@ -298,380 +298,57 @@ class SolverPlugin(ABC):
         files: dict[str, str],
         issues: list[ValidationIssue],
     ) -> dict[str, str]:
-        """Fix mismatched curly braces in OpenFOAM dictionary files.
-
-        LLMs sometimes generate an extra ``}`` after a sub-dictionary,
-        prematurely closing the parent block.  OpenFOAM reports::
-
-            FOAM FATAL IO ERROR: Unexpected '}' while reading dictionary entry
-
-        This validator removes lone ``}`` lines that push brace depth
-        negative, and appends missing ``}`` at EOF when depth stays positive.
-        Runs in ``validate_full()`` *before* all other validators since they
-        depend on balanced syntax for regex parsing.
-        """
-        for fpath in list(files.keys()):
-            content = files[fpath]
-            fixed = self._balance_braces(content)
-            if fixed != content:
-                files[fpath] = fixed
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        fpath,
-                        "Fixed mismatched curly braces — LLM generated "
-                        "unbalanced dictionary syntax.",
-                        fix="Balanced { } in OpenFOAM dictionary",
-                    )
-                )
-        return files
+        """Fix mismatched curly braces (thin wrapper, see ``legacy_fixers``)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_brace_balance(files, issues)
 
     @staticmethod
     def _balance_braces(content: str) -> str:
-        """Balance curly braces in an OpenFOAM dictionary file.
-
-        Handles the two most common LLM brace errors:
-
-        1. **Double-close** — two consecutive ``}``-only lines at the same
-           indentation with only blank lines between them.  The second one
-           is the extra brace that prematurely closes the parent block.
-           Detected by indentation analysis (Pass 1).
-
-        2. **Missing ``}``** at EOF — appends before the footer comment.
-
-        A depth-based fallback (Pass 2) catches any remaining imbalance
-        that the indentation heuristic missed.
-        """
-        # --- Count braces outside comments ---
-        stripped = re.sub(r"//[^\n]*", "", content)
-        stripped = re.sub(r"/\*.*?\*/", "", stripped, flags=re.DOTALL)
-        opens = stripped.count("{")
-        closes = stripped.count("}")
-
-        if opens == closes:
-            return content  # already balanced
-
-        if closes > opens:
-            excess = closes - opens
-            lines = content.split("\n")
-
-            # ── Pass 1: indentation-based double-close detection ─────────
-            # Two consecutive '}'-only lines at the SAME indent level (with
-            # only blank lines between) is the classic LLM double-close.
-            # In valid OpenFOAM dicts, consecutive '}' lines always have
-            # DECREASING indent (closing nested blocks outward).
-            to_remove: set[int] = set()
-            removed = 0
-            in_block_comment = False
-            prev_brace: tuple[int, int] | None = None  # (line_idx, indent)
-
-            for i, line in enumerate(lines):
-                if in_block_comment:
-                    if "*/" in line:
-                        in_block_comment = False
-                    continue
-
-                analysis = re.sub(r"//.*$", "", line)
-                analysis = re.sub(r"/\*.*?\*/", "", analysis)
-                if "/*" in analysis:
-                    analysis = analysis[: analysis.find("/*")]
-                    in_block_comment = True
-
-                stripped_part = analysis.strip()
-
-                if stripped_part == "":
-                    continue  # blank line — don't reset prev_brace
-
-                if stripped_part == "}":
-                    indent = len(line) - len(line.lstrip())
-                    if prev_brace is not None:
-                        _, prev_indent = prev_brace
-                        if indent == prev_indent and removed < excess:
-                            to_remove.add(i)
-                            removed += 1
-                            continue  # keep prev_brace for chained triples
-                    prev_brace = (i, indent)
-                else:
-                    prev_brace = None
-
-            if to_remove:
-                lines = [
-                    l for idx, l in enumerate(lines) if idx not in to_remove
-                ]
-
-            # ── Pass 2: depth-based fallback for remaining excess ────────
-            remaining = excess - removed
-            if remaining > 0:
-                result: list[str] = []
-                depth = 0
-                in_block_comment = False
-                removed2 = 0
-
-                for line in lines:
-                    analysis = line
-                    if in_block_comment:
-                        end_idx = analysis.find("*/")
-                        if end_idx >= 0:
-                            analysis = analysis[end_idx + 2 :]
-                            in_block_comment = False
-                        else:
-                            result.append(line)
-                            continue
-
-                    analysis = re.sub(r"//.*$", "", analysis)
-                    analysis = re.sub(r"/\*.*?\*/", "", analysis)
-                    if "/*" in analysis:
-                        analysis = analysis[: analysis.find("/*")]
-                        in_block_comment = True
-
-                    line_opens = analysis.count("{")
-                    line_closes = analysis.count("}")
-                    new_depth = depth + line_opens - line_closes
-
-                    if (
-                        new_depth < 0
-                        and removed2 < remaining
-                        and analysis.strip() == "}"
-                    ):
-                        removed2 += 1
-                        depth = depth + line_opens
-                        continue
-
-                    depth = new_depth
-                    result.append(line)
-
-                return "\n".join(result)
-
-            return "\n".join(lines)
-
-        # Missing closing braces — append before the standard footer comment
-        missing = opens - closes
-        closing = "}\n" * missing
-        footer_re = re.compile(r"\n(// \*{10,}.*?)\s*$", re.DOTALL)
-        m = footer_re.search(content)
-        if m:
-            return content[: m.start()] + "\n" + closing + content[m.start() :]
-        return content.rstrip() + "\n" + closing
+        """Balance curly braces (thin wrapper, see ``legacy_fixers``)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.balance_braces(content)
 
     def _fix_controldict_solver(
         self, files: dict[str, str], issues: list[ValidationIssue]
     ) -> dict[str, str]:
-        """Ensure controlDict declares the correct solver application."""
-        control_dict = files.get("system/controlDict", "")
-        if not control_dict:
-            return files
-        app_match = re.search(r"application\s+(\w+)\s*;", control_dict)
-        if app_match and app_match.group(1) != self.name:
-            issues.append(
-                ValidationIssue(
-                    "warning",
-                    "system/controlDict",
-                    f"LLM wrote 'application {app_match.group(1)}' but solver is "
-                    f"'{self.name}'. Correcting.",
-                    fix=f"application     {self.name};",
-                )
-            )
-            files["system/controlDict"] = re.sub(
-                r"application\s+\w+\s*;",
-                f"application     {self.name};",
-                control_dict,
-            )
-        return files
+        """Ensure controlDict declares the correct solver (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_controldict_solver(
+            files, issues, solver_name=self.name
+        )
 
     def _fix_pressure_field(
         self, files: dict[str, str], issues: list[ValidationIssue]
     ) -> dict[str, str]:
-        """Ensure the correct pressure field (p vs p_rgh) is present."""
-        if self.pressure_field == "p":
-            # Solvers that use p should not have p_rgh
-            if "0/p_rgh" in files and "0/p" not in files:
-                issues.append(
-                    ValidationIssue(
-                        "error",
-                        "0/p_rgh",
-                        f"'{self.name}' requires 0/p, not 0/p_rgh. Renaming.",
-                        fix="Renamed 0/p_rgh -> 0/p",
-                    )
-                )
-                content = files.pop("0/p_rgh")
-                content = content.replace("object      p_rgh;", "object      p;")
-                content = content.replace("object p_rgh;", "object p;")
-                files["0/p"] = content
-            if "0/p_rgh" in files and "0/p" in files:
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        "0/p_rgh",
-                        "Both 0/p and 0/p_rgh exist. Removing 0/p_rgh.",
-                    )
-                )
-                del files["0/p_rgh"]
-
-        elif self.pressure_field == "p_rgh":
-            # Buoyant solvers need BOTH p_rgh (solved) and p (calculated)
-            if "0/p_rgh" in files and "0/p" not in files:
-                content = (
-                    files["0/p_rgh"]
-                    .replace("object      p_rgh;", "object      p;")
-                    .replace("object p_rgh;", "object p;")
-                )
-                files["0/p"] = content
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        "0/p",
-                        f"'{self.name}' needs both 0/p_rgh and 0/p. Synthesised 0/p.",
-                    )
-                )
-            elif "0/p" in files and "0/p_rgh" not in files:
-                content = (
-                    files["0/p"]
-                    .replace("object      p;", "object      p_rgh;")
-                    .replace("object p;", "object p_rgh;")
-                )
-                files["0/p_rgh"] = content
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        "0/p_rgh",
-                        f"'{self.name}' needs both 0/p_rgh and 0/p. Synthesised 0/p_rgh.",
-                    )
-                )
-        return files
+        """Ensure the correct pressure field is present (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_pressure_field(
+            files, issues,
+            solver_name=self.name,
+            pressure_field=self.pressure_field,
+        )
 
     def _fix_pressure_value(
         self, files: dict[str, str], issues: list[ValidationIssue]
     ) -> dict[str, str]:
-        """Fix absolute pressure values in 0/p for incompressible solvers.
-
-        Incompressible solvers (simpleFoam, pimpleFoam) use kinematic gauge
-        pressure with dimensions [0 2 -2 0 0 0 0] and values in m²/s².
-        The reference pressure is 0 — only gradients matter.
-
-        The LLM frequently writes ``internalField uniform 101325`` (absolute
-        Pa), which is nonsensical for kinematic pressure and causes SIGFPE
-        because GAMG sees a huge uniform field with near-zero gradients,
-        creating ill-conditioned coarse levels.
-
-        This validator:
-        - Fixes internalField to 0 when value > 1000 (clearly absolute Pa)
-        - Fixes outlet fixedValue to 0 when value > 1000
-        - Also fixes wrong dimensions [1 -1 -2 0 0 0 0] → [0 2 -2 0 0 0 0]
-        """
-        if self.is_compressible:
-            return files  # compressible solvers use absolute Pa — leave alone
-
-        p_content = files.get("0/p", "")
-        if not p_content:
-            return files
-
-        changed = False
-
-        # Fix dimensions: Pa [1 -1 -2 0 0 0 0] → kinematic [0 2 -2 0 0 0 0]
-        if re.search(r"dimensions\s+\[\s*1\s+-1\s+-2\s+0\s+0\s+0\s+0\s*\]", p_content):
-            p_content = re.sub(
-                r"dimensions\s+\[\s*1\s+-1\s+-2\s+0\s+0\s+0\s+0\s*\]",
-                "dimensions      [0 2 -2 0 0 0 0]",
-                p_content,
-            )
-            changed = True
-            issues.append(
-                ValidationIssue(
-                    "warning",
-                    "0/p",
-                    f"'{self.name}' is incompressible — pressure dimensions "
-                    f"must be [0 2 -2 0 0 0 0] (kinematic, m²/s²), "
-                    f"not [1 -1 -2 0 0 0 0] (Pa). Corrected.",
-                    fix="dimensions [0 2 -2 0 0 0 0];",
-                )
-            )
-
-        # Fix internalField: absolute value → 0
-        m_int = re.search(
-            r"(internalField\s+uniform\s+)([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
-            p_content,
+        """Fix absolute pressure in 0/p for incompressible (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_pressure_value(
+            files, issues,
+            solver_name=self.name,
+            is_compressible=self.is_compressible,
         )
-        if m_int:
-            try:
-                p_val = float(m_int.group(2))
-                if abs(p_val) > 1000:
-                    p_content = (
-                        p_content[: m_int.start()]
-                        + f"{m_int.group(1)}0"
-                        + p_content[m_int.end() :]
-                    )
-                    changed = True
-                    issues.append(
-                        ValidationIssue(
-                            "warning",
-                            "0/p",
-                            f"'{self.name}' is incompressible — internalField "
-                            f"p={p_val} is absolute Pa, but kinematic gauge "
-                            f"pressure should be 0. Corrected to prevent SIGFPE.",
-                            fix="internalField uniform 0;",
-                        )
-                    )
-            except ValueError:
-                pass
-
-        # Fix outlet fixedValue: absolute value → 0
-        # Find all fixedValue patches and fix values > 1000
-        for m_patch in re.finditer(
-            r"(\w+)\s*\{([^}]*)\}", p_content, re.DOTALL
-        ):
-            block = m_patch.group(2)
-            if "fixedValue" not in block:
-                continue
-            m_val = re.search(
-                r"(value\s+uniform\s+)([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)",
-                block,
-            )
-            if not m_val:
-                continue
-            try:
-                fv = float(m_val.group(2))
-            except ValueError:
-                continue
-            if abs(fv) > 1000:
-                # Replace value in the original content
-                abs_start = m_patch.start(2) + m_val.start()
-                abs_end = m_patch.start(2) + m_val.end()
-                p_content = (
-                    p_content[:abs_start]
-                    + f"{m_val.group(1)}0"
-                    + p_content[abs_end:]
-                )
-                changed = True
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        "0/p",
-                        f"Outlet fixedValue p={fv} is absolute Pa — "
-                        f"corrected to 0 for incompressible kinematic pressure.",
-                        fix="value uniform 0;",
-                    )
-                )
-
-        if changed:
-            files["0/p"] = p_content
-        return files
 
     def _remove_unneeded_thermo(
         self, files: dict[str, str], issues: list[ValidationIssue]
     ) -> dict[str, str]:
-        """Remove thermophysicalProperties and g for non-energy solvers."""
-        if not self.supports_energy:
-            for extra in ["constant/thermophysicalProperties", "constant/g"]:
-                if extra in files:
-                    issues.append(
-                        ValidationIssue(
-                            "warning",
-                            extra,
-                            f"'{extra}' not needed for {self.name}. Removing.",
-                        )
-                    )
-                    del files[extra]
-        return files
+        """Remove thermo files for non-energy solvers (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.remove_unneeded_thermo(
+            files, issues,
+            solver_name=self.name,
+            supports_energy=self.supports_energy,
+        )
 
     # ── Velocity classification ──────────────────────────────────────────
 
@@ -936,94 +613,9 @@ class SolverPlugin(ABC):
         ctx: "FvBuildContext",
         is_simple: bool | None = None,
     ) -> tuple[str, str]:
-        """Build the ``p`` (or ``p_rgh``) solver block and optional ``pFinal``.
-
-        Returns ``(p_block, p_final_block)``.  ``p_final_block`` is empty
-        for SIMPLE.
-
-        Phase 2: the (GAMG vs PBiCGStab, coarsestLevelCorr settings,
-        rhoPimpleFoam-isothermal special-case) decisions live entirely in
-        ``resolve_pressure_solver_strategy``.  This helper is now a pure
-        renderer that consumes the resolved strategy.  Replaces what used
-        to be Check 7c (GAMG hardening) and Check 7e (isothermal rho*).
-        """
-        from simd_agent.run.case_spec import resolve_pressure_solver_strategy
-
-        if is_simple is None:
-            is_simple = self.algorithm == "SIMPLE"
-        pf = self.pressure_field
-
-        # Read heat-transfer flag from ctx (extracted from config by _fv_context).
-        # Falls back to True for compressible-energy solvers if not set.
-        heat = ctx.heat_transfer_active
-
-        strategy = resolve_pressure_solver_strategy(
-            solver_name=self.name,
-            is_compressible=self.is_compressible,
-            mesh_tier=ctx.tier,
-            heat_transfer_active=heat,
-        )
-
-        rel_tol_str = f"{strategy.rel_tol:g}"
-
-        if strategy.top_level == "GAMG":
-            assert strategy.coarsest is not None  # enforced by Pydantic
-            cl = strategy.coarsest
-            p_block = (
-                f"    {pf}\n"
-                "    {\n"
-                "        solver          GAMG;\n"
-                f"        smoother        {strategy.smoother_or_precond};\n"
-                f"        nCoarsestCells  {strategy.n_coarsest_cells};\n"
-                f"        tolerance       {strategy.tolerance:g};\n"
-                f"        relTol          {rel_tol_str};\n"
-                "        coarsestLevelCorr\n"
-                "        {\n"
-                f"            solver          {cl.solver};\n"
-                f"            preconditioner  {cl.preconditioner};\n"
-                f"            tolerance       {cl.tolerance:g};\n"
-                f"            relTol          {cl.rel_tol:g};\n"
-                "        }\n"
-                "    }\n"
-            )
-        else:
-            # Direct Krylov path (PBiCGStab or PCG) — no coarsestLevelCorr.
-            p_block = (
-                f"    {pf}\n"
-                "    {\n"
-                f"        solver          {strategy.top_level};\n"
-                f"        preconditioner  {strategy.smoother_or_precond};\n"
-                f"        tolerance       {strategy.tolerance:g};\n"
-                f"        relTol          {rel_tol_str};\n"
-                "    }\n"
-            )
-
-        p_final_block = ""
-        if not is_simple:
-            p_final_block = (
-                f"\n    {pf}Final\n"
-                "    {\n"
-                f"        ${pf};\n"
-                "        relTol          0;\n"
-                "    }\n"
-            )
-        return p_block, p_final_block
-
-    # ── Density (rho) solver block ────────────────────────────────────────
-
-    def _build_rho_solver_block(self) -> str:
-        """Compressible solvers need a ``rho`` solver entry; empty otherwise."""
-        if not self.is_compressible:
-            return ""
-        return (
-            "\n    rho\n"
-            "    {\n"
-            "        solver          PCG;\n"
-            "        preconditioner  DIC;\n"
-            "        tolerance       1e-06;\n"
-            "        relTol          0;\n"
-            "    }\n"
-        )
+        """Build ``p`` solver block + optional ``pFinal`` (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.pressure_solver_block(self, ctx, is_simple=is_simple)
 
     # ── Equation solver block (regex over U, turb fields, h) ──────────────
 
@@ -1032,417 +624,9 @@ class SolverPlugin(ABC):
         eq_fields: list[str],
         is_simple: bool | None = None,
     ) -> tuple[str, str]:
-        """Build the equation regex solver block and its PIMPLE Final variant.
-
-        Returns ``(eq_block, eq_final_block)`` — Final is empty for SIMPLE.
-
-        Energy split: when the solver carries an energy equation, the
-        energy variable (``e`` or ``h``) is broken out of the smoothSolver
-        regex into its own ``PBiCG + DILU`` block.  This matches the
-        OpenFOAM rhoSimpleFoam reference tutorial
-        (``compressible/rhoSimpleFoam/angledDuctExplicitFixedCoeff``):
-        smoothSolver tends to under-converge ``h``/``e`` in a single
-        outer SIMPLE iteration (``Solving for h, Initial residual = 1,
-        No Iterations 1-2``), leaving the energy field perpetually behind
-        the pressure–velocity coupling and amplifying continuity errors.
-        ``PBiCG`` with ``DILU`` preconditioning is the OF-tutorial choice
-        for scalar transport equations on asymmetric matrices.
-        """
-        if is_simple is None:
-            is_simple = self.algorithm == "SIMPLE"
-
-        # Split: regex group covers everything except the energy variable.
-        # When supports_energy is true the energy var gets its own block.
-        if self.supports_energy and self.energy_var in eq_fields:
-            non_energy = [f for f in eq_fields if f != self.energy_var]
-        else:
-            non_energy = list(eq_fields)
-
-        if len(non_energy) == 1:
-            eq_regex = non_energy[0]
-        elif len(non_energy) >= 2:
-            eq_regex = f'"({"|".join(non_energy)})"'
-        else:
-            eq_regex = ""  # only energy in eq_fields (rare / degenerate)
-
-        eq_block = ""
-        if eq_regex:
-            eq_block = (
-                f"\n    {eq_regex}\n"
-                "    {\n"
-                "        solver          smoothSolver;\n"
-                "        smoother        symGaussSeidel;\n"
-                "        tolerance       1e-05;\n"
-                "        relTol          0.1;\n"
-                "    }\n"
-            )
-
-        # Dedicated energy block — PBiCG + DILU.
-        if self.supports_energy and self.energy_var in eq_fields:
-            eq_block += (
-                f"\n    {self.energy_var}\n"
-                "    {\n"
-                "        solver          PBiCG;\n"
-                "        preconditioner  DILU;\n"
-                "        tolerance       1e-06;\n"
-                "        relTol          0.1;\n"
-                "    }\n"
-            )
-
-        eq_final_block = ""
-        if not is_simple:
-            if eq_regex:
-                if eq_regex.startswith('"'):
-                    inner = eq_regex[1:-1]
-                    final_regex = f'"{inner}Final"'
-                else:
-                    final_regex = f"{eq_regex}Final"
-                eq_final_block = (
-                    f"\n    {final_regex}\n"
-                    "    {\n"
-                    "        solver          smoothSolver;\n"
-                    "        smoother        symGaussSeidel;\n"
-                    "        tolerance       1e-06;\n"
-                    "        relTol          0;\n"
-                    "    }\n"
-                )
-            if self.supports_energy and self.energy_var in eq_fields:
-                eq_final_block += (
-                    f"\n    {self.energy_var}Final\n"
-                    "    {\n"
-                    "        solver          PBiCG;\n"
-                    "        preconditioner  DILU;\n"
-                    "        tolerance       1e-06;\n"
-                    "        relTol          0;\n"
-                    "    }\n"
-                )
-        return eq_block, eq_final_block
-
-    # ── Compressible bounds (rhoMin / rhoMax / transonic) ─────────────────
-
-    def _build_compressible_bounds(
-        self,
-        config: dict[str, Any],
-        ctx: "FvBuildContext",
-    ) -> str:
-        """Render the rhoMin / rhoMax / transonic bounds block.
-
-        Phase 2: delegates to ``resolve_compressible_bounds`` which returns
-        a typed ``CompressibleBounds``.  This helper extracts the inputs
-        (ρ, BC temperatures, operating pressure, Mach) from the config and
-        renders the resolved strategy as OpenFOAM dict text.  Replaces the
-        in-place arithmetic that lived here before.
-        """
-        if not self.is_compressible:
-            return ""
-        from simd_agent.run.case_spec import resolve_compressible_bounds
-
-        profile = ctx.profile
-        vel_mag = ctx.vel_mag
-
-        fluid = config.get("fluid") or {}
-        rho_cfg: float | None = None
-        if isinstance(fluid, dict):
-            for k in ("density", "rho"):
-                v = fluid.get(k)
-                if v is None:
-                    continue
-                try:
-                    rho_cfg = float(v)
-                    break
-                except (TypeError, ValueError):
-                    pass
-
-        bc_temps: list[float] = []
-        inlet_t: float | None = None
-        for pbc in (config.get("boundary_conditions") or {}).values():
-            if not isinstance(pbc, dict):
-                continue
-            t_entry = pbc.get("temperature") or pbc.get("T")
-            t_val = (
-                t_entry.get("value") or t_entry.get("uniform")
-                if isinstance(t_entry, dict)
-                else t_entry
-            )
-            try:
-                tv = float(t_val)
-            except (TypeError, ValueError):
-                continue
-            bc_temps.append(tv)
-            if inlet_t is None:
-                inlet_t = tv
-
-        # Inlet Mach for the transonic decision (gas only).
-        if profile == "cryogenic":
-            mach = 0.0
-        else:
-            t_for_a = inlet_t if inlet_t and inlet_t > 0 else 300.0
-            a_sound = (1.4 * 287.0 * t_for_a) ** 0.5
-            mach = (vel_mag / a_sound) if a_sound > 0 else 0.0
-
-        # Operating pressure — pull from outlet BC if present.
-        # Inlet pressure — pull the highest pressure across all BCs; used
-        # to size rho_max (ρ ≈ p / (R·T)) and pMax for the pressure clamp.
-        op_p = 101325.0
-        inlet_p: float | None = None
-        bcs = config.get("boundary_conditions") or {}
-        try:
-            outlet_p_entry = (
-                bcs.get("outlet", {})
-                .get("pressure", {})
-            )
-            if isinstance(outlet_p_entry, dict):
-                pv = outlet_p_entry.get("value") or outlet_p_entry.get("uniform")
-                if pv is not None:
-                    op_p = float(pv)
-        except (TypeError, ValueError, AttributeError):
-            pass
-        for _name, _pbc in bcs.items():
-            if _name == "outlet" or not isinstance(_pbc, dict):
-                continue
-            p_entry = _pbc.get("pressure") or _pbc.get("p")
-            p_val = (
-                p_entry.get("value") or p_entry.get("uniform")
-                if isinstance(p_entry, dict) else p_entry
-            )
-            try:
-                pv = float(p_val)
-            except (TypeError, ValueError):
-                continue
-            if pv > 0 and (inlet_p is None or pv > inlet_p):
-                inlet_p = pv
-
-        bounds = resolve_compressible_bounds(
-            is_compressible=True,
-            profile=profile,
-            rho=rho_cfg,
-            bc_temps=sorted(set(bc_temps)),
-            eos_t_ceiling=None,
-            op_p=op_p,
-            mach=mach,
-            inlet_p=inlet_p,
-        )
-
-        lines = ""
-        if bounds.rho_min is not None and bounds.rho_max is not None:
-            lines += (
-                f"    rhoMin          {bounds.rho_min:.3g};\n"
-                f"    rhoMax          {bounds.rho_max:.3g};\n"
-            )
-        # pMin / pMax — without these, ``pressureControl`` is effectively
-        # unbounded and a divergent rhoSimpleFoam can push p to ±1e+42
-        # before the SIGFPE finally fires inside ``GAMGSolver::scale``.
-        # The resolver always returns them for compressible cases, so this
-        # branch is just for safety in unit tests.
-        if bounds.p_min is not None and bounds.p_max is not None:
-            lines += (
-                f"    pMin            {bounds.p_min:.6g};\n"
-                f"    pMax            {bounds.p_max:.6g};\n"
-            )
-        if bounds.transonic:
-            lines += "    transonic       yes;\n"
-        return lines
-
-    # ── SIMPLE algorithm block ────────────────────────────────────────────
-
-    def _build_simple_block(
-        self,
-        ctx: "FvBuildContext",
-        eq_fields: list[str],
-        bounds_block: str,
-    ) -> str:
-        """Build the ``SIMPLE { … }`` algorithm block.
-
-        Encodes: non-ortho correctors, SIMPLEC switch, compressible bounds,
-        pRef, and residualControl.  Pure assembly — no plugin-specific logic.
-        """
-        n_non_ortho = ctx.n_non_ortho
-        use_simplec = ctx.use_simplec
-        tier = ctx.tier
-        profile = ctx.profile
-        speed_tier = ctx.speed_tier
-        pf = self.pressure_field
-
-        # Bump correctors at high speed
-        if speed_tier == "high" and n_non_ortho < 2:
-            n_non_ortho = 2
-
-        simplec_line = ""
-        if (
-            profile == "gas"
-            and use_simplec
-            and tier != "unknown"
-            and speed_tier != "high"
-        ):
-            simplec_line = "    consistent      yes;\n"
-
-        # residualControl — plain scalars for SIMPLE
-        # Pressure tolerance — per-solver (rhoSimpleFoam: 1e-3, others: 1e-4).
-        # Format with enough precision for both: 1e-04 / 1e-03 print as "1e-04"
-        # and "1e-03" which OpenFOAM accepts identically to "1e-4" / "1e-3".
-        p_tol = self.pressure_residual_tol
-        p_tol_str = f"{p_tol:.0e}".replace("e-0", "e-").replace("e+0", "e+")
-        res_lines = (
-            f"        {pf:<16}{p_tol_str};\n"
-            f"        U               1e-4;\n"
-        )
-        turb_res_fields = [
-            f for f in eq_fields if f not in ("U", self.energy_var)
-        ]
-        if turb_res_fields:
-            if len(turb_res_fields) == 1:
-                res_lines += f"        {turb_res_fields[0]:<16}1e-3;\n"
-            else:
-                turb_regex = f'"({"|".join(turb_res_fields)})"'
-                res_lines += f"        {turb_regex:<16}1e-3;\n"
-        if self.supports_energy:
-            res_lines += f"        {self.energy_var:<16}1e-3;\n"
-
-        return (
-            f"\n{self.algorithm}\n"
-            "{\n"
-            f"    nNonOrthogonalCorrectors {n_non_ortho};\n"
-            f"{simplec_line}"
-            f"{bounds_block}"
-            "    pRefCell        0;\n"
-            "    pRefValue       0;\n"
-            "\n"
-            "    residualControl\n"
-            "    {\n"
-            f"{res_lines}"
-            "    }\n"
-            "}\n"
-        )
-
-    # ── PIMPLE algorithm block ────────────────────────────────────────────
-
-    def _build_pimple_block(
-        self,
-        ctx: "FvBuildContext",
-        eq_fields: list[str],
-        bounds_block: str,
-    ) -> str:
-        """Build the ``PIMPLE { … }`` algorithm block."""
-        n_non_ortho = ctx.n_non_ortho
-        speed_tier = ctx.speed_tier
-        pf = self.pressure_field
-
-        if speed_tier == "high" and n_non_ortho < 2:
-            n_non_ortho = 2
-
-        res_lines = (
-            f"        {pf}   {{ tolerance 1e-4; relTol 0; }}\n"
-            "        U   { tolerance 1e-4; relTol 0; }\n"
-        )
-        turb_res_fields = [
-            f for f in eq_fields if f not in ("U", self.energy_var)
-        ]
-        for tf in turb_res_fields:
-            res_lines += f"        {tf}   {{ tolerance 1e-3; relTol 0; }}\n"
-        if self.supports_energy:
-            res_lines += (
-                f"        {self.energy_var}   "
-                f"{{ tolerance 5e-3; relTol 0; }}\n"
-            )
-
-        return (
-            f"\n{self.algorithm}\n"
-            "{\n"
-            "    nOuterCorrectors    2;\n"
-            "    nCorrectors         2;\n"
-            f"    nNonOrthogonalCorrectors {n_non_ortho};\n"
-            "    momentumPredictor   yes;\n"
-            f"{bounds_block}"
-            "\n"
-            "    residualControl\n"
-            "    {\n"
-            f"{res_lines}"
-            "    }\n"
-            "}\n"
-        )
-
-    # ── Relaxation blocks ─────────────────────────────────────────────────
-
-    def _build_relaxation_simple(
-        self,
-        ctx: "FvBuildContext",
-        eq_fields: list[str],
-    ) -> str:
-        """Build the ``relaxationFactors { … }`` block for a SIMPLE solver.
-
-        Profile-aware: cryogenic forces conservative h=0.05, gas uses
-        velocity-tier-aware textbook values.
-        """
-        profile = ctx.profile
-        speed_tier = ctx.speed_tier
-        pf = self.pressure_field
-
-        if profile == "cryogenic":
-            u_relax, p_relax, turb_relax, h_relax = 0.5, 0.3, 0.5, 0.05
-        elif speed_tier == "high":
-            u_relax, p_relax, turb_relax, h_relax = 0.3, 0.2, 0.3, 0.3
-        elif speed_tier == "moderate":
-            u_relax, p_relax, turb_relax, h_relax = 0.5, 0.3, 0.5, 0.5
-        else:
-            u_relax, p_relax, turb_relax, h_relax = 0.7, 0.3, 0.7, 0.5
-
-        relax_eq_lines = f"        U               {u_relax};\n"
-        for f in eq_fields:
-            if f == "U":
-                continue
-            if f == self.energy_var:
-                relax_eq_lines += (
-                    f"        {self.energy_var:<16}{h_relax};\n"
-                )
-            else:
-                relax_eq_lines += f"        {f:<16}{turb_relax};\n"
-
-        # Density under-relaxation — compressible SIMPLE solvers only.
-        # The OpenFOAM rhoSimpleFoam reference tutorials damp ρ by 95 %
-        # (``rho 0.05``).  Without it the density jumps freely between
-        # iterations, amplifying the pressure-correction → density-update
-        # → continuity-error loop that drove the user's case to ±1e+42 Pa
-        # before SIGFPE.  No downside: ρ converges to the same fixed point
-        # either way, just smoother.  Incompressible / Boussinesq solvers
-        # (simpleFoam, buoyantSimpleFoam) don't need this — their ρ is
-        # either constant or derived analytically from T.
-        rho_relax_line = ""
-        if self.is_compressible:
-            rho_relax_line = "        rho             0.05;\n"
-
-        return (
-            "\nrelaxationFactors\n"
-            "{\n"
-            "    fields\n"
-            "    {\n"
-            f"        {pf:<16}{p_relax};\n"
-            f"{rho_relax_line}"
-            "    }\n"
-            "    equations\n"
-            "    {\n"
-            f"{relax_eq_lines}"
-            "    }\n"
-            "}\n"
-        )
-
-    def _build_relaxation_pimple(self, ctx: "FvBuildContext",) -> str:
-        """Build the ``relaxationFactors { … }`` block for a PIMPLE solver."""
-        profile = ctx.profile
-        speed_tier = ctx.speed_tier
-        if profile == "cryogenic":
-            u_relax, catch_all = 0.5, 0.5
-        elif speed_tier == "high":
-            u_relax, catch_all = 0.3, 0.3
-        elif speed_tier == "moderate":
-            u_relax, catch_all = 0.5, 0.5
-        else:
-            u_relax, catch_all = 0.7, 0.7
-        return (
-            "\nrelaxationFactors\n"
-            "{\n"
-            f'    equations {{ U {u_relax}; ".*" {catch_all}; }}\n'
-            "}\n"
-        )
+        """Build equation solver block + Final variant (thin wrapper)."""
+        from simd_agent.solvers import blocks
+        return blocks.equation_solver_block(self, eq_fields, is_simple=is_simple)
 
     # ── fvSchemes section helpers ─────────────────────────────────────────
 
@@ -1450,226 +634,52 @@ class SolverPlugin(ABC):
         self,
         ctx: "FvBuildContext | None" = None,
     ) -> str:
-        """ddtSchemes — read from the resolved regime_profile when available.
-
-        LES needs ``backward`` (2nd-order time accuracy) instead of
-        ``Euler``; SIMPLE-mode steady solvers stay on ``steadyState``.
-        The regime resolver encodes those choices.  Falls back to the
-        plugin's algorithm-driven default when ctx is not provided
-        (legacy callers / tests).
-        """
-        if ctx is not None and ctx.regime_profile is not None:
-            ddt = ctx.regime_profile.ddt_scheme
-        else:
-            ddt = "Euler" if self.is_transient else "steadyState"
-        return (
-            "ddtSchemes\n"
-            "{\n"
-            f"    default         {ddt};\n"
-            "}\n"
-        )
+        """ddtSchemes (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.ddt_block(self, ctx)
 
     def _build_grad_block(self, ctx: "FvBuildContext",) -> str:
-        """gradSchemes — cellLimited grad(U) for compressible gas only."""
-        if self.is_compressible and ctx.profile == "gas":
-            grad_u_line = "    grad(U)         cellLimited Gauss linear 1;\n"
-        else:
-            grad_u_line = ""
-        return (
-            "gradSchemes\n"
-            "{\n"
-            "    default         Gauss linear;\n"
-            f"{grad_u_line}"
-            "}\n"
-        )
+        """gradSchemes (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.grad_block(self, ctx)
 
     def _build_div_block(self, ctx: "FvBuildContext",) -> str:
-        """divSchemes — driven by the resolved regime_profile.
-
-        Every per-regime scheme choice (laminar / RAS / LES) is encoded in
-        ``ctx.regime_profile`` via ``resolve_regime_profile``.  This renderer
-        is now a pure assembly step over those values.
-
-        Legacy fallback: when ctx.regime_profile is None (test callers that
-        build FvBuildContext directly), the previous algorithm-aware /
-        speed-aware literals are used.  Production code always goes through
-        ``_fv_context`` which now constructs the profile.
-        """
-        from simd_agent.run.case_spec import resolve_div_phi_h_scheme
-
-        speed_tier = ctx.speed_tier
-        profile = ctx.profile
-        turb_model = ctx.turb_model
-        rp = ctx.regime_profile  # may be None (legacy path)
-
-        lines: list[str] = ["    default         none;"]
-
-        if rp is not None:
-            # ── Profile-driven path (Phase 5 — typed regime resolver) ──
-            lines.append(f"    div(phi,U)      {rp.div_phi_U};")
-            if self.supports_energy:
-                lines.append(
-                    f"    div(phi,{self.energy_var})      {rp.div_phi_energy};"
-                )
-                # Kinetic-energy convection term — name depends on the
-                # energy variable (Ekp for sensibleInternalEnergy, K
-                # otherwise).  Scheme comes from the regime profile.
-                ke_name = "Ekp" if self.energy_var == "e" else "K"
-                lines.append(
-                    f"    div(phi,{ke_name})      {rp.div_phi_K};"
-                )
-            # Pressure-work term — uses the flux name dictated by the regime
-            # (phid for compressible RAS, phiv for laminar / LES / low-Mach).
-            # rho* solvers only — buoyant p_rgh solvers don't have this term.
-            if self.is_compressible and not self.needs_gravity:
-                lines.append(
-                    f"    div({rp.pressure_flux},p)     {rp.div_phi_p};"
-                )
-            # Transported turbulence fields — None for laminar.
-            if rp.div_phi_turb is not None:
-                turb_fields = self.turbulence_fields(turb_model)
-                transported = [
-                    f for f in turb_fields
-                    if f in ("k", "omega", "epsilon", "nuTilda")
-                ]
-                if transported:
-                    lines.append("")
-                    for f in transported:
-                        lines.append(f"    div(phi,{f})    {rp.div_phi_turb};")
-        else:
-            # ── Legacy literal path (kept for tests that build the ctx
-            # directly without a regime_profile — primarily unit tests for
-            # the renderer helpers).  Mirrors the pre-Phase-5 behaviour.
-            _bc_temps = list(ctx.bc_temps)
-            if self.is_compressible:
-                if self.algorithm == "SIMPLE":
-                    lines.append("    div(phi,U)      bounded Gauss upwind;")
-                else:
-                    _high_dp = ctx.pressure_ratio >= 3.0
-                    if (
-                        profile == "gas"
-                        and speed_tier in ("low", "moderate")
-                        and not _high_dp
-                    ):
-                        lines.append("    div(phi,U)      bounded Gauss linearUpwindV grad(U);")
-                    else:
-                        lines.append("    div(phi,U)      bounded Gauss upwind;")
-                if self.supports_energy:
-                    _h_scheme = resolve_div_phi_h_scheme(
-                        is_compressible_energy=True,
-                        bc_temps=_bc_temps if _bc_temps else None,
-                    )
-                    lines.append(
-                        f"    div(phi,{self.energy_var})      {_h_scheme};"
-                    )
-                    if self.energy_var == "e":
-                        lines.append("    div(phi,Ekp)    bounded Gauss upwind;")
-                    else:
-                        lines.append("    div(phi,K)      bounded Gauss upwind;")
-                if not self.needs_gravity:
-                    lines.append("    div(phid,p)     Gauss upwind;")
-            else:
-                if speed_tier == "high":
-                    lines.append("    div(phi,U)      bounded Gauss upwind;")
-                else:
-                    lines.append("    div(phi,U)      bounded Gauss linearUpwind grad(U);")
-
-            turb_fields = (
-                self.turbulence_fields(turb_model)
-                if turb_model != "laminar"
-                else []
-            )
-            transported = [
-                f for f in turb_fields
-                if f in ("k", "omega", "epsilon", "nuTilda")
-            ]
-            if transported:
-                lines.append("")
-                turb_scheme = (
-                    "bounded Gauss upwind" if speed_tier == "high"
-                    else "bounded Gauss limitedLinear 1"
-                )
-                for f in transported:
-                    lines.append(f"    div(phi,{f})    {turb_scheme};")
-
-        # Viscous stress tensor — same form in all regimes.
-        lines.append("")
-        if self.is_compressible:
-            lines.append("    div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;")
-        else:
-            lines.append("    div((nuEff*dev2(T(grad(U))))) Gauss linear;")
-
-        block_body = "\n".join(lines)
-        return (
-            "divSchemes\n"
-            "{\n"
-            f"{block_body}\n"
-            "}\n"
-        )
+        """divSchemes (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.div_block(self, ctx)
 
     def _build_laplacian_block(self, ctx: "FvBuildContext",) -> str:
-        scheme = self._mesh_blended_scheme(ctx, kind="laplacian")
-        return (
-            "laplacianSchemes\n"
-            "{\n"
-            f"    default         {scheme};\n"
-            "}\n"
-        )
+        """laplacianSchemes (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.laplacian_block(self, ctx)
 
     def _build_sngrad_block(self, ctx: "FvBuildContext",) -> str:
-        scheme = self._mesh_blended_scheme(ctx, kind="sngrad")
-        return (
-            "snGradSchemes\n"
-            "{\n"
-            f"    default         {scheme};\n"
-            "}\n"
-        )
+        """snGradSchemes (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.sngrad_block(self, ctx)
 
     @staticmethod
     def _mesh_blended_scheme(ctx: "FvBuildContext", kind: str) -> str:
-        """Pick laplacian / snGrad scheme from mesh tier + non-orthogonality."""
-        tier = ctx.tier
-        non_ortho = ctx.non_ortho
-        if tier == "good" and non_ortho < 40:
-            return "Gauss linear corrected" if kind == "laplacian" else "corrected"
-        if non_ortho >= 65 or tier == "poor":
-            return (
-                "Gauss linear limited corrected 0.33"
-                if kind == "laplacian" else "limited corrected 0.33"
-            )
-        return (
-            "Gauss linear limited corrected 0.5"
-            if kind == "laplacian" else "limited corrected 0.5"
-        )
+        """Pick mesh-aware scheme (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.mesh_blended_scheme(ctx, kind)
 
     @staticmethod
     def _build_interpolation_block() -> str:
-        return (
-            "interpolationSchemes\n"
-            "{\n"
-            "    default         linear;\n"
-            "}\n"
-        )
+        """interpolationSchemes (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.interpolation_block()
 
     def _build_flux_required_block(self) -> str:
-        return (
-            "fluxRequired\n"
-            "{\n"
-            "    default         no;\n"
-            f"    {self.pressure_field};\n"
-            "}\n"
-        )
+        """fluxRequired (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.flux_required_block(self)
 
     @staticmethod
     def _build_wall_dist_block(turb_model: str) -> str:
-        if turb_model == "laminar":
-            return ""
-        return (
-            "wallDist\n"
-            "{\n"
-            "    method          meshWave;\n"
-            "}\n"
-        )
+        """wallDist (thin wrapper, see ``blocks``)."""
+        from simd_agent.solvers import blocks
+        return blocks.wall_dist_block(turb_model)
 
     # ── Whole-file deterministic renderers (Phase 4) ─────────────────────
 
@@ -1955,102 +965,9 @@ class SolverPlugin(ABC):
         issues: list[ValidationIssue],
         config: dict[str, Any],
     ) -> dict[str, str]:
-        """Harden laplacian/snGrad schemes for non-orthogonal meshes.
-
-        On meshes with non-orthogonality > 40°, ``Gauss linear corrected``
-        creates an ill-conditioned pressure Laplacian that causes SIGFPE in
-        GAMGSolver::scale (or PBiCGStab divergence).  Switch to
-        ``limited corrected <factor>`` which blends corrected and uncorrected
-        based on mesh quality — stable on poor meshes while preserving
-        accuracy on good cells.
-
-        When no checkMesh data is available (unknown tier), be conservative
-        and apply ``limited corrected 0.5`` — it never hurts accuracy on
-        good meshes, but prevents the crash on bad ones.
-        """
-        fvs = files.get("system/fvSchemes", "")
-        if not fvs:
-            return files
-
-        # Extract mesh quality — delegate to case_spec helper
-        mesh = (config.get("mesh", {}) or {})
-        check_mesh = mesh.get("check_mesh") or mesh.get("checkMesh")
-        from simd_agent.run.case_spec import _mesh_quality_decisions
-
-        mq = _mesh_quality_decisions(check_mesh)
-        non_ortho = mq.get("mesh_max_non_orthogonality") or 0.0
-        tier = mq["mesh_quality_tier"]
-
-        # Good meshes with low non-ortho — no intervention needed
-        if tier == "good" and non_ortho < 40:
-            return files
-
-        # Determine the blending factor
-        if non_ortho >= 65 or tier == "poor":
-            factor = "0.33"
-        else:
-            # moderate, unknown, or non_ortho >= 40
-            factor = "0.5"
-
-        changed = False
-
-        # Fix laplacianSchemes: "Gauss linear corrected" → "Gauss linear limited corrected <f>"
-        if re.search(
-            r"laplacianSchemes[^}]*default\s+Gauss\s+linear\s+corrected\s*;",
-            fvs, re.DOTALL,
-        ):
-            fvs = re.sub(
-                r"(laplacianSchemes[^}]*default\s+)Gauss\s+linear\s+corrected(\s*;)",
-                rf"\1Gauss linear limited corrected {factor}\2",
-                fvs,
-            )
-            changed = True
-
-        # Fix snGradSchemes: "corrected" → "limited corrected <f>"
-        if re.search(
-            r"snGradSchemes[^}]*default\s+corrected\s*;", fvs, re.DOTALL
-        ):
-            fvs = re.sub(
-                r"(snGradSchemes[^}]*default\s+)corrected(\s*;)",
-                rf"\1limited corrected {factor}\2",
-                fvs,
-            )
-            changed = True
-
-        if changed:
-            files["system/fvSchemes"] = fvs
-            issues.append(
-                ValidationIssue(
-                    "warning",
-                    "system/fvSchemes",
-                    f"Hardened laplacian/snGrad → 'limited corrected {factor}' "
-                    f"(mesh tier='{tier}', non-ortho={non_ortho:.1f}°). "
-                    f"Pure 'corrected' causes SIGFPE on non-orthogonal meshes.",
-                    fix=f"limited corrected {factor}",
-                )
-            )
-
-        return files
-
-    def _ensure_gravity(
-        self, files: dict[str, str], issues: list[ValidationIssue]
-    ) -> dict[str, str]:
-        """Ensure constant/g exists for solvers that need it."""
-        if self.needs_gravity and "constant/g" not in files:
-            issues.append(
-                ValidationIssue(
-                    "error",
-                    "constant/g",
-                    f"'{self.name}' requires constant/g. Adding default.",
-                    fix="Added constant/g",
-                )
-            )
-            files["constant/g"] = (
-                "FoamFile\n{\n    version 2.0;\n    format ascii;\n"
-                "    class uniformDimensionedVectorField;\n    object g;\n}\n"
-                "dimensions [0 1 -2 0 0 0 0];\nvalue (0 -9.81 0);\n"
-            )
-        return files
+        """Harden laplacian/snGrad for non-orthogonal meshes (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_fv_schemes_non_ortho(files, issues, config)
 
     def _unify_inlet_turbulence(
         self,
@@ -2288,35 +1205,9 @@ class SolverPlugin(ABC):
     def _fix_thermo_type_key(
         self, files: dict[str, str], issues: list[ValidationIssue]
     ) -> dict[str, str]:
-        """Fix 'thermodynamics' → 'thermo' inside thermoType blocks.
-
-        OpenFOAM 2406 requires 'thermo' as the key inside thermoType{}.
-        The LLM often writes 'thermodynamics' which is only valid inside mixture{}.
-        """
-        thermo_paths = [
-            k
-            for k in files
-            if k == "constant/thermophysicalProperties"
-            or k.startswith("constant/thermophysicalProperties.")
-        ]
-        for tp_path in thermo_paths:
-            content = files[tp_path]
-            fixed = re.sub(
-                r"\bthermodynamics(\s+)(hConst|eConst|janaf|hTabular|eTabular|hPolynomial|ePolynomial|hIcoTabular|eIcoTabular)\s*;",
-                r"thermo\1\2;",
-                content,
-            )
-            if fixed != content:
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        tp_path,
-                        "Auto-fixed: 'thermodynamics' -> 'thermo' in thermoType block.",
-                        fix="thermodynamics -> thermo in thermoType block",
-                    )
-                )
-                files[tp_path] = fixed
-        return files
+        """Fix 'thermodynamics' → 'thermo' key (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_thermo_type_key(files, issues)
 
     def _fix_relaxation_factors(
         self,
@@ -2324,102 +1215,14 @@ class SolverPlugin(ABC):
         issues: list[ValidationIssue],
         max_equation_relaxation: float = 0.8,
     ) -> dict[str, str]:
-        """Enforce safe relaxation factors in fvSolution.
-
-        Two checks (SIMPLE algorithm only):
-        1. Pressure field relaxation must exist in ``fields {}`` block.
-        2. Equation relaxation values above *max_equation_relaxation* are
-           clamped to 0.7 (the industry-standard conservative default).
-
-        This is a safety net — even when the prompt template is correct,
-        the LLM may hallucinate aggressive values.  Commercial solvers like
-        Ansys Fluent enforce similar guardrails.
-        """
-        fv = files.get("system/fvSolution", "")
-        if not fv:
-            return files
-
-        changed = False
-        pf = self.pressure_field  # "p" or "p_rgh"
-
-        # --- 1. Ensure fields { <pf> 0.3; } exists for SIMPLE solvers ---
-        if self.algorithm == "SIMPLE":
-            has_pressure_relax = bool(
-                re.search(
-                    rf"fields\s*\{{[^}}]*\b{re.escape(pf)}\s+[\d.]+",
-                    fv,
-                    re.DOTALL,
-                )
-            )
-            if not has_pressure_relax:
-                m = re.search(r"(relaxationFactors\s*\{)", fv)
-                if m:
-                    fv = (
-                        fv[: m.end()]
-                        + f"\n    fields      {{ {pf} 0.3; }}"
-                        + fv[m.end() :]
-                    )
-                    changed = True
-                    issues.append(
-                        ValidationIssue(
-                            "warning",
-                            "system/fvSolution",
-                            f"Missing pressure field relaxation. "
-                            f"Added: fields {{ {pf} 0.3; }}",
-                            fix=f"fields {{ {pf} 0.3; }}",
-                        )
-                    )
-
-        # --- 2. Clamp equation relaxation > max → 0.7 ---
-        eq_match = re.search(r"equations\s*\{", fv)
-        if eq_match:
-            start = eq_match.end()
-            depth = 1
-            pos = start
-            while pos < len(fv) and depth > 0:
-                if fv[pos] == "{":
-                    depth += 1
-                elif fv[pos] == "}":
-                    depth -= 1
-                pos += 1
-            eq_end = pos  # position after closing brace
-            eq_inner = fv[start : eq_end - 1]
-
-            clamped_names: list[str] = []
-
-            def _clamp(m: re.Match) -> str:
-                name = m.group(1)
-                val_str = m.group(3)
-                try:
-                    val = float(val_str)
-                except ValueError:
-                    return m.group(0)
-                if val > max_equation_relaxation:
-                    clamped_names.append(f"{name}={val_str}")
-                    return f"{m.group(1)}{m.group(2)}0.7;"
-                return m.group(0)
-
-            new_eq = re.sub(
-                r'((?:"[^"]*"|\w+))(\s+)([\d.]+)\s*;',
-                _clamp,
-                eq_inner,
-            )
-            if new_eq != eq_inner:
-                fv = fv[:start] + new_eq + fv[eq_end - 1 :]
-                changed = True
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        "system/fvSolution",
-                        f"Equation relaxation too aggressive "
-                        f"({', '.join(clamped_names)}). Clamped to 0.7.",
-                        fix="Clamped equation relaxation to 0.7",
-                    )
-                )
-
-        if changed:
-            files["system/fvSolution"] = fv
-        return files
+        """Enforce safe relaxation factors (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_relaxation_factors(
+            files, issues,
+            algorithm=self.algorithm,
+            pressure_field=self.pressure_field,
+            max_equation_relaxation=max_equation_relaxation,
+        )
 
     def _fix_non_orthogonal_correctors(
         self,
@@ -2427,257 +1230,76 @@ class SolverPlugin(ABC):
         issues: list[ValidationIssue],
         minimum: int = 1,
     ) -> dict[str, str]:
-        """Ensure nNonOrthogonalCorrectors >= *minimum* in fvSolution.
-
-        With 0 correctors, any mesh non-orthogonality degrades pressure
-        accuracy.  At least 1 corrector is needed for general meshes;
-        compressible energy solvers often need 2.
-        """
-        fv = files.get("system/fvSolution", "")
-        if not fv:
-            return files
-
-        m = re.search(r"nNonOrthogonalCorrectors\s+(\d+)\s*;", fv)
-        if m:
-            val = int(m.group(1))
-            if val < minimum:
-                fv = (
-                    fv[: m.start()]
-                    + f"nNonOrthogonalCorrectors {minimum};"
-                    + fv[m.end() :]
-                )
-                files["system/fvSolution"] = fv
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        "system/fvSolution",
-                        f"nNonOrthogonalCorrectors {val} too low for "
-                        f"general meshes. Set to {minimum}.",
-                        fix=f"nNonOrthogonalCorrectors {minimum};",
-                    )
-                )
-        return files
+        """Ensure nNonOrthogonalCorrectors >= minimum (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_non_orthogonal_correctors(
+            files, issues, minimum=minimum,
+        )
 
     def _fix_gamg_coarsest_level(
         self,
         files: dict[str, str],
         issues: list[ValidationIssue],
     ) -> dict[str, str]:
-        """Harden GAMG pressure solver against tet-mesh SIGFPE.
-
-        On unstructured tet meshes, GAMG agglomerates down to a tiny
-        coarsest level where the matrix diagonal can have zeros.  Every
-        smoother and preconditioner that computes D^{-1} (DIC, DILU,
-        GaussSeidel, symGaussSeidel) will SIGFPE.
-
-        Two-part fix applied to the pressure GAMG block:
-
-        1. ``nCoarsestCells 20`` — matches the OpenFOAM
-           ``rhoSimpleFoam/angledDuctExplicitFixedCoeff`` reference.
-           OF's default is 10; 20 is a conservative middle that keeps
-           coarse solves small while leaving a safety margin against
-           the over-agglomeration SIGFPE on tet meshes.
-        2. ``coarsestLevelCorr`` with ``PBiCGStab; preconditioner none``
-           — pure Krylov iteration with no diagonal inverse, so even a
-           degenerate coarsest-level matrix cannot cause SIGFPE.
-
-        Also patches existing coarsestLevelCorr blocks that use
-        ``smoothSolver + symGaussSeidel`` (our earlier fix that still
-        divides by diagonal and therefore still crashes).
-        """
-        fv = files.get("system/fvSolution", "")
-        if not fv:
-            return files
-
-        pf = self.pressure_field  # "p" or "p_rgh"
-
-        # Match the pressure solver block (supports one level of nested
-        # sub-blocks like coarsestLevelCorr {}).  [^{}] in the non-nested
-        # segments ensures we don't accidentally consume a nested '{'.
-        p_block_re = re.compile(
-            rf"{re.escape(pf)}\s*\{{([^{{}}]*(?:\{{[^{{}}]*\}}[^{{}}]*)*)\}}",
-            re.DOTALL,
+        """Harden GAMG pressure solver (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_gamg_coarsest_level(
+            files, issues, pressure_field=self.pressure_field,
         )
-        m = p_block_re.search(fv)
-        if not m:
-            return files
 
-        block_inner = m.group(1)
+    # ── Outlet / inlet BC robustness (universal, paradigm-agnostic) ─────────
+    #
+    # Applied across every solver that has a 0/ directory.  Hoisted into
+    # SolverPlugin (rather than a family base) because the same OF tutorial
+    # pattern — outlet ``inletOutlet`` + inlet ``turbulentIntensity…`` BCs —
+    # applies regardless of whether the algorithm is SIMPLE or PIMPLE.
 
-        # Only applies to GAMG
-        if not re.search(r"solver\s+GAMG\s*;", block_inner):
-            return files
+    @staticmethod
+    def _rewrite_patch_body(
+        content: str, patch_name: str, new_body: str
+    ) -> str | None:
+        """Replace one patch block's body (thin wrapper, see ``bc_fixers``)."""
+        from simd_agent.solvers import bc_fixers
+        return bc_fixers.rewrite_patch_body(content, patch_name, new_body)
 
-        changed = False
+    @staticmethod
+    def _classify_patches(
+        config: dict[str, Any],
+    ) -> tuple[list[str], list[str]]:
+        """Return ``(outlets, inlets)`` (thin wrapper, see ``bc_fixers``)."""
+        from simd_agent.solvers import bc_fixers
+        return bc_fixers.classify_patches(config)
 
-        # --- 1. Ensure nCoarsestCells is set ---
-        if "nCoarsestCells" not in block_inner:
-            # Insert right after "solver GAMG;" for clean formatting
-            fv = re.sub(
-                r"(solver\s+GAMG\s*;)",
-                r"\1\n        nCoarsestCells  20;",
-                fv,
-                count=1,
-            )
-            changed = True
-            issues.append(
-                ValidationIssue(
-                    "warning",
-                    "system/fvSolution",
-                    "GAMG: added nCoarsestCells 20 to match the OF "
-                    "rhoSimpleFoam reference and keep coarse solves small.",
-                    fix="nCoarsestCells 20;",
-                )
-            )
-            # Re-match after insertion
-            m = p_block_re.search(fv)
-            if not m:
-                files["system/fvSolution"] = fv
-                return files
-            block_inner = m.group(1)
+    def _fix_outlet_backflow_bcs(
+        self,
+        files: dict[str, str],
+        issues: list[ValidationIssue],
+        config: dict[str, Any],
+    ) -> dict[str, str]:
+        """Outlet zeroGradient → inletOutlet (thin wrapper)."""
+        from simd_agent.solvers import bc_fixers
+        return bc_fixers.fix_outlet_backflow_bcs(files, issues, config)
 
-        # --- 2. Fix or inject coarsestLevelCorr ---
-        if "coarsestLevelCorr" in block_inner:
-            # Patch existing block: replace smoother-based solvers with
-            # PBiCGStab + no preconditioner (no diagonal inverse).
-            if "symGaussSeidel" in block_inner or "smoothSolver" in block_inner:
-                old_corr_re = re.compile(
-                    r"coarsestLevelCorr\s*\{[^}]*\}",
-                    re.DOTALL,
-                )
-                new_corr = (
-                    "coarsestLevelCorr\n"
-                    "        {\n"
-                    "            solver          PBiCGStab;\n"
-                    "            preconditioner  none;\n"
-                    "            tolerance       1e-9;\n"
-                    "            relTol          0;\n"
-                    "        }"
-                )
-                new_fv = old_corr_re.sub(new_corr, fv, count=1)
-                if new_fv != fv:
-                    fv = new_fv
-                    changed = True
-                    issues.append(
-                        ValidationIssue(
-                            "warning",
-                            "system/fvSolution",
-                            "GAMG coarsestLevelCorr: replaced "
-                            "smoothSolver+symGaussSeidel with "
-                            "PBiCGStab+none (no diagonal inverse "
-                            "→ immune to tet-mesh SIGFPE).",
-                            fix="coarsestLevelCorr { solver PBiCGStab; "
-                            "preconditioner none; }",
-                        )
-                    )
-        else:
-            # Inject new coarsestLevelCorr block
-            coarsest = (
-                "\n        coarsestLevelCorr\n"
-                "        {\n"
-                "            solver          PBiCGStab;\n"
-                "            preconditioner  none;\n"
-                "            tolerance       1e-9;\n"
-                "            relTol          0;\n"
-                "        }"
-            )
-            insert_pos = m.start(1) + len(block_inner)
-            fv = fv[:insert_pos] + coarsest + "\n    " + fv[insert_pos:]
-            changed = True
-            issues.append(
-                ValidationIssue(
-                    "warning",
-                    "system/fvSolution",
-                    "GAMG: injected coarsestLevelCorr with "
-                    "PBiCGStab+none — prevents SIGFPE on tet meshes "
-                    "(no diagonal inverse at coarsest level).",
-                    fix="coarsestLevelCorr { solver PBiCGStab; "
-                    "preconditioner none; }",
-                )
-            )
-
-        if changed:
-            files["system/fvSolution"] = fv
-        return files
+    def _fix_inlet_turbulence_bc_types(
+        self,
+        files: dict[str, str],
+        issues: list[ValidationIssue],
+        config: dict[str, Any],
+    ) -> dict[str, str]:
+        """Inlet k/ω/ε runtime-derived BCs (thin wrapper)."""
+        from simd_agent.solvers import bc_fixers
+        return bc_fixers.fix_inlet_turbulence_bc_types(files, issues, config)
 
     def _fix_residual_control_format(
         self,
         files: dict[str, str],
         issues: list[ValidationIssue],
     ) -> dict[str, str]:
-        """Convert plain-scalar residualControl entries to sub-dictionaries.
-
-        PIMPLE's ``pimpleControl`` calls ``solutionControl::read(false)``
-        which requires each residualControl entry to be a sub-dictionary:
-        ``p { tolerance 1e-4; relTol 0; }``
-        Plain scalars like ``p 1e-4;`` cause a fatal crash:
-          "Residual data for p must be specified as a dictionary"
-
-        SIMPLE's ``simpleControl`` calls ``solutionControl::read(true)``
-        (absTolOnly) so plain scalars are valid — but sub-dictionaries
-        also work, so we convert unconditionally for safety.
-        """
-        fv = files.get("system/fvSolution", "")
-        if not fv or "residualControl" not in fv:
-            return files
-        # SIMPLE-based solvers accept both formats — only PIMPLE crashes on scalars.
-        # For SIMPLE, skip this fix since scalar format is canonical.
-        if self.algorithm == "SIMPLE":
-            return files
-
-        # Find the residualControl block(s) — there may be more than one
-        # (SIMPLE + PIMPLE in some configs, though rare)
-        # Pattern: residualControl { ... }
-        _rc_re = re.compile(
-            r'(residualControl\s*\{)(.*?)(\})',
-            re.DOTALL,
+        """Convert plain-scalar residualControl to sub-dicts (thin wrapper)."""
+        from simd_agent.solvers import legacy_fixers
+        return legacy_fixers.fix_residual_control_format(
+            files, issues, algorithm=self.algorithm,
         )
-
-        def _fix_rc_block(m: re.Match) -> str:
-            header = m.group(1)
-            body = m.group(2)
-            closing = m.group(3)
-
-            # Check if any entry is already a sub-dict (has { })
-            # If all entries are already dicts, skip
-            # Pattern for scalar entry: field_name  scalar_value;
-            # where field_name can be quoted regex like "(k|omega)"
-            _scalar_re = re.compile(
-                r'^(\s+)'                           # leading whitespace
-                r'("?\(?[\w|.*]+\)?"?)'             # field name (may be quoted regex)
-                r'\s+'
-                r'([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)'  # numeric value
-                r'\s*;',
-                re.MULTILINE,
-            )
-
-            fixed_body = body
-            found_any = False
-            for sm in reversed(list(_scalar_re.finditer(body))):
-                indent = sm.group(1)
-                field_name = sm.group(2)
-                value = sm.group(3)
-                replacement = f"{indent}{field_name} {{ tolerance {value}; relTol 0; }}"
-                fixed_body = fixed_body[:sm.start()] + replacement + fixed_body[sm.end():]
-                found_any = True
-
-            if found_any:
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        "system/fvSolution",
-                        "residualControl entries were plain scalars — "
-                        "converted to sub-dictionaries (OF2406 requirement).",
-                        fix="{ tolerance X; relTol 0; }",
-                    )
-                )
-
-            return header + fixed_body + closing
-
-        new_fv = _rc_re.sub(_fix_rc_block, fv)
-        if new_fv != fv:
-            files["system/fvSolution"] = new_fv
-        return files
 
     # ── Internal helpers ──────────────────────────────────────────────────
 

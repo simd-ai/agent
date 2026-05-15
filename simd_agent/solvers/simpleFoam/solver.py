@@ -14,15 +14,15 @@ from typing import Any
 
 from simd_agent.solvers.base import (
     MatchResult,
-    SolverPlugin,
     ValidationIssue,
     ValidationResult,
 )
+from simd_agent.solvers.families import SteadyBase
 
 logger = logging.getLogger(__name__)
 
 
-class SimpleFoamSolver(SolverPlugin):
+class SimpleFoamSolver(SteadyBase):
     """simpleFoam — steady incompressible isothermal RANS."""
 
     name = "simpleFoam"

@@ -12,15 +12,19 @@ from typing import Any
 
 from simd_agent.solvers.base import (
     MatchResult,
-    SolverPlugin,
     ValidationIssue,
     ValidationResult,
+)
+from simd_agent.solvers.families import (
+    BoussinesqMixin,
+    CompressibleMixin,
+    SteadyBase,
 )
 
 logger = logging.getLogger(__name__)
 
 
-class BuoyantSimpleFoamSolver(SolverPlugin):
+class BuoyantSimpleFoamSolver(SteadyBase, CompressibleMixin, BoussinesqMixin):
     """buoyantSimpleFoam — steady buoyant compressible RANS."""
 
     name = "buoyantSimpleFoam"
