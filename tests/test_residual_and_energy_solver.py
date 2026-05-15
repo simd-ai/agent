@@ -17,9 +17,9 @@ Both fixes track the OpenFOAM
 from __future__ import annotations
 
 from simd_agent.solvers.contexts import FvBuildContext
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
-from simd_agent.solvers.rhoPimpleFoam.solver import RhoPimpleFoamSolver
-from simd_agent.solvers.simpleFoam.solver import SimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.compressible.rhoPimpleFoam.solver import RhoPimpleFoamSolver
+from simd_agent.solvers.incompressible.simpleFoam.solver import SimpleFoamSolver
 
 
 def _ctx(**overrides) -> FvBuildContext:

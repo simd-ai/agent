@@ -12,9 +12,9 @@ For each file migrated, verify:
 import pytest
 
 from simd_agent.run.case_spec import build_case_spec
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
-from simd_agent.solvers.simpleFoam.solver import SimpleFoamSolver
-from simd_agent.solvers.rhoPimpleFoam.solver import RhoPimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.incompressible.simpleFoam.solver import SimpleFoamSolver
+from simd_agent.solvers.compressible.rhoPimpleFoam.solver import RhoPimpleFoamSolver
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────

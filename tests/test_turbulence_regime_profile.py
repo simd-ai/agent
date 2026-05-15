@@ -20,8 +20,8 @@ from simd_agent.run.case_spec import (
     TurbulenceRegimeProfile,
     resolve_regime_profile,
 )
-from simd_agent.solvers.rhoPimpleFoam.solver import RhoPimpleFoamSolver
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.compressible.rhoPimpleFoam.solver import RhoPimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
 
 
 # ── Pydantic invariants ─────────────────────────────────────────────────────

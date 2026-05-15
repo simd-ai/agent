@@ -17,7 +17,7 @@ from __future__ import annotations
 from simd_agent.run.case_spec.resolvers import resolve_pressure_solver_strategy
 from simd_agent.run.case_spec.strategies import PressureSolverStrategy
 from simd_agent.solvers.contexts import FvBuildContext
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
 
 
 def _ctx(**overrides) -> FvBuildContext:

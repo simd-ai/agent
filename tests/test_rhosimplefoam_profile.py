@@ -14,7 +14,7 @@ from simd_agent.run.case_spec import (
     _estimate_inlet_mach,
     build_case_spec,
 )
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
 
 
 # ── Profile selection ─────────────────────────────────────────────────────────
@@ -268,7 +268,7 @@ def test_compressible_coarsest_uses_PCG_DIC() -> None:
 
 
 def test_incompressible_coarsest_uses_PCG_DIC() -> None:
-    from simd_agent.solvers.simpleFoam.solver import SimpleFoamSolver
+    from simd_agent.solvers.incompressible.simpleFoam.solver import SimpleFoamSolver
     plugin = SimpleFoamSolver()
     cfg = _air_config()
     cfg["physics"]["compressibility"] = "incompressible"

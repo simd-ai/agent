@@ -18,7 +18,7 @@ Both fixers track the OpenFOAM rhoSimpleFoam reference tutorial
 from __future__ import annotations
 
 from simd_agent.solvers.base import ValidationIssue
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
 
 
 # ── _rewrite_patch_body helper ──────────────────────────────────────────────

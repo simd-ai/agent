@@ -43,11 +43,15 @@ Why this layout (vs a single 2700-LOC base.py):
 from simd_agent.solvers.families._steady import SteadyBase
 from simd_agent.solvers.families._transient import TransientBase
 from simd_agent.solvers.families._compressible import CompressibleMixin
-from simd_agent.solvers.families._boussinesq import BoussinesqMixin
+from simd_agent.solvers.families._boussinesq import (
+    BoussinesqMixin,
+    IncompressibleBoussinesqMixin,
+)
 
 __all__ = [
     "SteadyBase",
     "TransientBase",
     "CompressibleMixin",
     "BoussinesqMixin",
+    "IncompressibleBoussinesqMixin",
 ]

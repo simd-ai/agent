@@ -253,10 +253,15 @@ def div_block(plugin: "SolverPlugin", ctx: "FvBuildContext") -> str:
             lines.append(
                 f"    div(phi,{plugin.energy_var})      {rp.div_phi_energy};"
             )
-            ke_name = "Ekp" if plugin.energy_var == "e" else "K"
-            lines.append(
-                f"    div(phi,{ke_name})      {rp.div_phi_K};"
-            )
+            # Kinetic-energy convection term — only compressible energy
+            # equations carry it.  Boussinesq (incompressible energy)
+            # transports T directly via ∂T/∂t + ∇·(φT) = ∇·(α∇T) — no K
+            # or Ekp source, so the line must be omitted.
+            if plugin.is_compressible:
+                ke_name = "Ekp" if plugin.energy_var == "e" else "K"
+                lines.append(
+                    f"    div(phi,{ke_name})      {rp.div_phi_K};"
+                )
         if plugin.is_compressible and not plugin.needs_gravity:
             lines.append(
                 f"    div({rp.pressure_flux},p)     {rp.div_phi_p};"

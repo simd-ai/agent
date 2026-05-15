@@ -3,7 +3,7 @@
 import pytest
 
 from simd_agent.solvers.contexts import FvBuildContext
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
 
 
 # ── Construction & immutability ──────────────────────────────────────────────

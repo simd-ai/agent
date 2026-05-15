@@ -20,8 +20,8 @@ tutorial.  Three changes covered here:
 from __future__ import annotations
 
 from simd_agent.solvers.base import SolverPlugin
-from simd_agent.solvers.rhoPimpleFoam.solver import RhoPimpleFoamSolver
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.compressible.rhoPimpleFoam.solver import RhoPimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
 
 
 # ── BC fixers are inherited, not duplicated ─────────────────────────────────
@@ -177,7 +177,7 @@ class TestRelaxationFactorsStructure:
 
     def test_incompressible_pimple_has_no_fields_block(self):
         """Incompressible pimpleFoam — fields block is omitted (no rho)."""
-        from simd_agent.solvers.pimpleFoam.solver import PimpleFoamSolver
+        from simd_agent.solvers.incompressible.pimpleFoam.solver import PimpleFoamSolver
         plugin = PimpleFoamSolver()
         cfg = {
             "physics": {

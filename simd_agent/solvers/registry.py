@@ -54,31 +54,56 @@ class SolverRegistry:
         logger.debug("Registered solver plugin: %s", plugin.name)
 
     def discover(self) -> None:
-        """Auto-discover solver plugins from sub-packages.
+        """Auto-discover solver plugins from sub-packages (recursively).
 
-        Scans every direct sub-package of ``simd_agent/solvers/`` and looks
-        for a module-level attribute named ``solver_plugin`` (a SolverPlugin
-        instance) or a class named ``Solver`` (instantiated automatically).
+        Walks every package under ``simd_agent/solvers/`` — both direct
+        children and nested ones under physics-grouped subdirectories
+        (``incompressible/``, ``compressible/``, ``heatTransfer/``).
+        Looks for a module-level ``solver_plugin`` instance or a
+        ``Solver`` class.
 
-        Convention for a solver package ``simd_agent/solvers/simpleFoam/``::
+        Convention for a solver package
+        ``simd_agent/solvers/<group>/simpleFoam/``::
 
             # __init__.py
-            from simd_agent.solvers.simpleFoam.solver import SimpleFoamSolver
+            from simd_agent.solvers.<group>.simpleFoam.solver import SimpleFoamSolver
             solver_plugin = SimpleFoamSolver()
 
-        Or shorter::
-
-            # __init__.py
-            from .solver import Solver
+        Mirrors the OpenFOAM tutorial layout (``incompressible/``,
+        ``compressible/``, ``heatTransfer/``); the grouping is for
+        organisation only — the registry produces a flat
+        ``name -> plugin`` map regardless of nesting.
         """
         if self._discovered:
             return
 
-        for importer, modname, ispkg in pkgutil.iter_modules(
+        # Subpackages we deliberately skip — they contain shared code, not
+        # solver plugins.  Anything else is treated as a candidate.
+        _NON_SOLVER_SUBPKGS = {"families"}
+
+        for modinfo in pkgutil.walk_packages(
             [str(_SOLVERS_DIR)], prefix=f"{_SOLVERS_PKG}."
         ):
+            modname = modinfo.name
+            ispkg = modinfo.ispkg
             if not ispkg:
-                continue  # skip non-package modules (base.py, registry.py)
+                continue
+
+            # Skip non-solver subpackages (e.g. families/).  Match against
+            # the last path segment so nested packages still work.
+            leaf = modname.rsplit(".", 1)[-1]
+            if leaf in _NON_SOLVER_SUBPKGS:
+                continue
+
+            # Skip the physics-group containers themselves — they don't
+            # define a solver, they just hold sub-packages.
+            # (They'll still be walked; this just skips the registration
+            # attempt for the container.)
+            parent = modname.rsplit(".", 1)[0] if "." in modname else ""
+            if parent == _SOLVERS_PKG and leaf in (
+                "incompressible", "compressible", "heatTransfer"
+            ):
+                continue
 
             try:
                 mod = importlib.import_module(modname)

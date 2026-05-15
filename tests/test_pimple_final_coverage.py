@@ -20,10 +20,10 @@ from __future__ import annotations
 
 import re
 
-from simd_agent.solvers.rhoPimpleFoam.solver import RhoPimpleFoamSolver
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
-from simd_agent.solvers.buoyantPimpleFoam.solver import BuoyantPimpleFoamSolver
-from simd_agent.solvers.buoyantSimpleFoam.solver import BuoyantSimpleFoamSolver
+from simd_agent.solvers.compressible.rhoPimpleFoam.solver import RhoPimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.heatTransfer.buoyantPimpleFoam.solver import BuoyantPimpleFoamSolver
+from simd_agent.solvers.heatTransfer.buoyantSimpleFoam.solver import BuoyantSimpleFoamSolver
 
 
 _BASE_CFG = {

@@ -160,7 +160,7 @@ class TestDivPhiUStartupSafety:
         # (SIMPLE) uses upwind unconditionally now (see
         # test_rhosimplefoam_of_reference.py), so this guard's role has
         # narrowed to the PIMPLE/PISO branch only.
-        from simd_agent.solvers.rhoPimpleFoam.solver import RhoPimpleFoamSolver
+        from simd_agent.solvers.compressible.rhoPimpleFoam.solver import RhoPimpleFoamSolver
         plugin = RhoPimpleFoamSolver()
         ctx = _ctx(bc_pressures=(101325.0, 1.435e6), speed_tier="low")
         out = plugin._build_div_block(ctx)
@@ -171,7 +171,7 @@ class TestDivPhiUStartupSafety:
         # Atmospheric outlet against atmospheric inlet → ratio ≈ 1.
         # linearUpwindV remains the accuracy-preferred choice for
         # PIMPLE-mode compressible — the Δt absorbs any startup overshoot.
-        from simd_agent.solvers.rhoPimpleFoam.solver import RhoPimpleFoamSolver
+        from simd_agent.solvers.compressible.rhoPimpleFoam.solver import RhoPimpleFoamSolver
         plugin = RhoPimpleFoamSolver()
         ctx = _ctx(bc_pressures=(101325.0, 1.2e5), speed_tier="low")
         out = plugin._build_div_block(ctx)
@@ -179,7 +179,7 @@ class TestDivPhiUStartupSafety:
 
     def test_high_speed_pimple_still_upwind_regardless_of_dp(self):
         # The pre-existing high-speed guard still forces upwind for PIMPLE.
-        from simd_agent.solvers.rhoPimpleFoam.solver import RhoPimpleFoamSolver
+        from simd_agent.solvers.compressible.rhoPimpleFoam.solver import RhoPimpleFoamSolver
         plugin = RhoPimpleFoamSolver()
         ctx = _ctx(bc_pressures=(101325.0,), speed_tier="high")
         out = plugin._build_div_block(ctx)

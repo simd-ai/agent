@@ -14,12 +14,12 @@ from simd_agent.run.case_spec import (
     resolve_turbulence_spec,
 )
 from simd_agent.run.normalizer import _normalize_physics
-from simd_agent.solvers.buoyantPimpleFoam.solver import BuoyantPimpleFoamSolver
-from simd_agent.solvers.buoyantSimpleFoam.solver import BuoyantSimpleFoamSolver
-from simd_agent.solvers.pimpleFoam.solver import PimpleFoamSolver
-from simd_agent.solvers.rhoPimpleFoam.solver import RhoPimpleFoamSolver
-from simd_agent.solvers.rhoSimpleFoam.solver import RhoSimpleFoamSolver
-from simd_agent.solvers.simpleFoam.solver import SimpleFoamSolver
+from simd_agent.solvers.heatTransfer.buoyantPimpleFoam.solver import BuoyantPimpleFoamSolver
+from simd_agent.solvers.heatTransfer.buoyantSimpleFoam.solver import BuoyantSimpleFoamSolver
+from simd_agent.solvers.incompressible.pimpleFoam.solver import PimpleFoamSolver
+from simd_agent.solvers.compressible.rhoPimpleFoam.solver import RhoPimpleFoamSolver
+from simd_agent.solvers.compressible.rhoSimpleFoam.solver import RhoSimpleFoamSolver
+from simd_agent.solvers.incompressible.simpleFoam.solver import SimpleFoamSolver
 
 ALL_PLUGINS = [
     SimpleFoamSolver,
