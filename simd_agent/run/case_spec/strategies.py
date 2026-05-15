@@ -409,3 +409,146 @@ class TurbulenceRegimeProfile(BaseModel):
                 "div_phi_turb (e.g. 'Gauss upwind' or 'Gauss limitedLinear 1')."
             )
         return self
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# RegionSpec / CaseRegions — multi-region (CHT) configuration
+# ────────────────────────────────────────────────────────────────────────────
+#
+# Conjugate heat transfer (chtMultiRegionFoam / chtMultiRegionSimpleFoam)
+# solves multiple regions — typically one or more fluids coupled with one
+# or more solids via mapped boundaries at fluid-solid interfaces.  Every
+# region carries its own ``constant/<region>/`` and ``system/<region>/``
+# trees plus per-region ``0/<region>/`` initial conditions.
+#
+# These types capture *what* a region is at the level the renderer needs:
+# its name (= subdirectory in constant/ and system/), its kind (fluid or
+# solid), and the thermo / turbulence settings that drive file generation.
+
+RegionKind = Literal["fluid", "solid"]
+"""A CHT region is either a fluid (Navier–Stokes + energy) or a solid (only
+heat conduction)."""
+
+
+class RegionSpec(BaseModel):
+    """One region in a multi-region case.
+
+    The renderer uses ``name`` to namespace files
+    (``constant/<name>/thermophysicalProperties`` etc.); the per-region
+    fvSolution / fvSchemes / 0-field files are also written under
+    ``<name>/`` subdirectories.
+
+    Fluid regions:
+      * ``kind = "fluid"`` — gets a Navier–Stokes solver, turbulence
+        model, ν / Cp / Pr (via thermo_profile + the existing
+        ``CompressibleBounds`` resolver).
+      * ``turbulence_model`` is required (RAS / LES); ``"laminar"`` is
+        valid for low-Re slow fluids.
+
+    Solid regions:
+      * ``kind = "solid"`` — heat conduction only, no momentum,
+        no turbulence.  Uses ``heSolidThermo`` with ``rhoConst`` +
+        ``constIso`` (constant isotropic thermal conductivity).
+      * ``turbulence_model`` must be ``None`` (or ``"none"``) — solid
+        regions don't transport k / ε / ω.
+
+    Invariants enforced at construction:
+      * Region names are non-empty and safe directory names
+        (``^[A-Za-z][A-Za-z0-9_]*$``).
+      * Solid regions can't declare a turbulence model.
+      * Fluid regions must declare ``thermo_profile`` (gas / cryogenic).
+    """
+
+    name: str = Field(min_length=1, pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    kind: RegionKind
+    thermo_profile: Literal["gas", "cryogenic", "solid"]
+    # Fluid regions: RAS / LES / laminar.  Solids must leave this None.
+    turbulence_model: str | None = None
+    # Fluid-region transport / thermo numbers (use defaults if unknown).
+    Cp: float = Field(default=1006.0, gt=0.0)         # J/(kg·K)
+    mol_weight: float = Field(default=28.97, gt=0.0)  # g/mol — air-like default
+    mu: float = Field(default=1.8e-5, gt=0.0)         # Pa·s
+    Pr: float = Field(default=0.7, gt=0.0)
+    # Solid-region thermal properties.
+    rho_solid: float = Field(default=8000.0, gt=0.0)  # kg/m³ — steel-like
+    kappa_solid: float = Field(default=80.0, gt=0.0)  # W/(m·K) — steel-like
+    Cp_solid: float = Field(default=450.0, gt=0.0)    # J/(kg·K) — steel-like
+
+    model_config = ConfigDict(frozen=True)
+
+    @model_validator(mode="after")
+    def _enforce_kind_consistency(self) -> "RegionSpec":
+        if self.kind == "solid":
+            if self.turbulence_model and self.turbulence_model.lower() not in (
+                "none", "laminar"
+            ):
+                raise ValueError(
+                    f"Solid region {self.name!r} cannot declare a turbulence "
+                    f"model (got {self.turbulence_model!r})."
+                )
+            if self.thermo_profile != "solid":
+                raise ValueError(
+                    f"Solid region {self.name!r} requires "
+                    "thermo_profile='solid' (got {self.thermo_profile!r})."
+                )
+        else:  # fluid
+            if self.thermo_profile == "solid":
+                raise ValueError(
+                    f"Fluid region {self.name!r} cannot use "
+                    "thermo_profile='solid'."
+                )
+        return self
+
+
+class CaseRegions(BaseModel):
+    """Container for all regions in a multi-region case.
+
+    The renderer reads ``fluid_regions`` and ``solid_regions`` to build
+    the per-region file trees and the ``constant/regionProperties``
+    listing.  Invariants:
+
+      * At least one fluid region (CHT without fluid is just
+        ``laplacianFoam`` on a solid — not what chtMultiRegion* is for).
+      * Region names are globally unique across fluids and solids.
+    """
+
+    fluid_regions: list[RegionSpec] = Field(default_factory=list)
+    solid_regions: list[RegionSpec] = Field(default_factory=list)
+
+    model_config = ConfigDict(frozen=True)
+
+    @model_validator(mode="after")
+    def _enforce_structural_invariants(self) -> "CaseRegions":
+        if not self.fluid_regions:
+            raise ValueError(
+                "CaseRegions requires at least one fluid region for "
+                "chtMultiRegion*Foam (no fluid → use laplacianFoam directly)."
+            )
+        # All fluid regions are kind=fluid.
+        for r in self.fluid_regions:
+            if r.kind != "fluid":
+                raise ValueError(
+                    f"Region {r.name!r} in fluid_regions has kind={r.kind!r}."
+                )
+        # All solid regions are kind=solid.
+        for r in self.solid_regions:
+            if r.kind != "solid":
+                raise ValueError(
+                    f"Region {r.name!r} in solid_regions has kind={r.kind!r}."
+                )
+        # Unique names across both lists.
+        seen: set[str] = set()
+        for r in (*self.fluid_regions, *self.solid_regions):
+            if r.name in seen:
+                raise ValueError(f"Duplicate region name: {r.name!r}.")
+            seen.add(r.name)
+        return self
+
+    @property
+    def all_regions(self) -> list[RegionSpec]:
+        """Fluids first, then solids — the same order regionProperties uses."""
+        return [*self.fluid_regions, *self.solid_regions]
+
+    @property
+    def region_names(self) -> list[str]:
+        return [r.name for r in self.all_regions]

@@ -47,6 +47,7 @@ from simd_agent.solvers.families._boussinesq import (
     BoussinesqMixin,
     IncompressibleBoussinesqMixin,
 )
+from simd_agent.solvers.families._multi_region import MultiRegionBase
 
 __all__ = [
     "SteadyBase",
@@ -54,4 +55,5 @@ __all__ = [
     "CompressibleMixin",
     "BoussinesqMixin",
     "IncompressibleBoussinesqMixin",
+    "MultiRegionBase",
 ]

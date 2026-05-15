@@ -38,11 +38,13 @@ from .resolvers import (
 )
 from .spec import _SOLVER_PROPS, _TURB_FIELDS, CaseSpec
 from .strategies import (
+    CaseRegions,
     CompressibleBounds,
     CoarsestLevelCorr,
     FluidThermo,
     InletTurbulence,
     PressureSolverStrategy,
+    RegionSpec,
     TurbulenceRegimeProfile,
     TurbulenceSpec,
 )
@@ -61,6 +63,8 @@ __all__ = [
     "CoarsestLevelCorr",
     "CompressibleBounds",
     "InletTurbulence",
+    "RegionSpec",
+    "CaseRegions",
     "TurbulenceRegimeProfile",
     "TurbulenceSpec",
     # Public — resolvers (Phase 2)
