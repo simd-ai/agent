@@ -61,13 +61,26 @@ async def run(args: argparse.Namespace, config: CliConfig) -> int:
 async def maybe_init(config: CliConfig) -> bool:
     """Run the wizard inline if no config exists.
 
-    Called by ``simd run`` when the user hasn't ``simd init``'d yet.
-    Returns True on success (and as a side effect, the config has
-    been updated).  Returns False if the user aborted or anything
-    crashed — caller should propagate the failure.
+    Called by ``simd run`` when the user hasn't run any setup yet.
+    Returns True when config already exists (no prompt needed) OR
+    when the wizard completes successfully.  Returns False if the
+    user aborted.
+
+    The "is the user configured?" signal is the presence of
+    ``~/.config/simd/config.toml``.  Both ``install.sh`` and a
+    standalone ``simd init`` write it; if neither has run, the file
+    is absent and we fall through to the wizard.
+
+    ``user_id`` is intentionally NOT checked here — it's a runtime
+    artifact that ``_ensure_simulation`` lazily bootstraps on the
+    first ``simd run``.  Missing user_id is not a "needs setup"
+    signal.
     """
-    if env_file().is_file() and config.user_id:
+    from pathlib import Path
+    cfg_path = Path.home() / ".config" / "simd" / "config.toml"
+    if cfg_path.is_file():
         return True
+
     console.print(
         "  [yellow]first run — let's set things up.  "
         "you can re-run `simd init` later to change these answers.[/]"
@@ -104,13 +117,17 @@ def _prompt_all() -> dict[str, Any] | None:
 
 def _prompt_agent_backend() -> tuple[str, str]:
     """Question 1: where does the FastAPI agent run?"""
-    console.print("[bold]where should the agent run?[/]")
-    console.print("  1) local-docker      (recommended — bundled, simd manages it)")
-    console.print("  2) local-bare-metal  (you run `uvicorn` yourself)")
-    console.print("  3) remote            (point at an existing agent)")
-    choice = _ask_choice("  > ", {"1", "2", "3"}, default="1")
+    from simd_agent.cli.display.arrow import arrow_choice
+    idx = arrow_choice(
+        "where should the agent run?",
+        [
+            "local-docker      (recommended — bundled, simd manages it)",
+            "local-bare-metal  (you run `uvicorn` yourself)",
+            "remote            (point at an existing agent)",
+        ],
+    )
 
-    if choice == "1":
+    if idx == 0:
         if not _docker_ready_or_warn():
             console.print(
                 "  [yellow]docker isn't ready — falling back to "
@@ -122,7 +139,7 @@ def _prompt_agent_backend() -> tuple[str, str]:
         port_warn(8000)
         return "local-docker", "http://localhost:8000"
 
-    if choice == "2":
+    if idx == 1:
         return "local-bare-metal", _ask_url(
             "  agent URL", default="http://localhost:8000"
         )
@@ -132,24 +149,28 @@ def _prompt_agent_backend() -> tuple[str, str]:
 
 def _prompt_runner_backend() -> tuple[str, str]:
     """Question 2: where does the OpenFOAM runner run?"""
-    console.print("\n[bold]where should the simulation runner (OpenFOAM) run?[/]")
-    console.print("  1) local-docker      (recommended — bundled, simd manages it)")
-    console.print("  2) local-bare-metal  (OpenFOAM v2406 on this machine)")
-    console.print("  3) remote            (point at an existing runner)")
-    choice = _ask_choice("  > ", {"1", "2", "3"}, default="1")
+    from simd_agent.cli.display.arrow import arrow_choice
+    idx = arrow_choice(
+        "where should the simulation runner (OpenFOAM) run?",
+        [
+            "local-docker      (recommended — bundled, simd manages it)",
+            "local-bare-metal  (OpenFOAM v2406 on this machine)",
+            "remote            (point at an existing runner)",
+        ],
+    )
 
-    if choice == "1":
+    if idx == 0:
         if not _docker_ready_or_warn():
             console.print(
                 "  [yellow]docker isn't ready — falling back to "
                 "local-bare-metal.[/]"
             )
-            choice = "2"
+            idx = 1
         else:
             port_warn(9000)
             return "local-docker", "http://localhost:9000"
 
-    if choice == "2":
+    if idx == 1:
         console.print(
             "  [yellow]heads up:[/] local-bare-metal mode needs OpenFOAM v2406 "
             "installed and the simulation-runner FastAPI app running.\n"
@@ -165,16 +186,20 @@ def _prompt_runner_backend() -> tuple[str, str]:
 
 def _prompt_llm_provider() -> tuple[str, str | None]:
     """Question 3: which LLM provider?"""
-    console.print("\n[bold]which LLM provider?[/]")
-    console.print("  1) gemini  (Google AI Studio — easiest, has a daily cap)")
-    console.print("  2) vertex  (GCP Vertex AI — no daily cap, needs SA JSON)")
-    console.print("  3) ollama  (local — no API key, runs on this machine)")
-    choice = _ask_choice("  > ", {"1", "2", "3"}, default="1")
+    from simd_agent.cli.display.arrow import arrow_choice
+    idx = arrow_choice(
+        "which LLM provider?",
+        [
+            "Gemini  — Google AI Studio (easiest, has a daily cap)",
+            "Vertex  — GCP Vertex AI (no daily cap, needs a service-account JSON)",
+            "Ollama  — local (runs models on this machine, no API key)",
+        ],
+    )
 
-    if choice == "1":
+    if idx == 0:
         key = _ask("  GEMINI_API_KEY (paste): ", masked=True)
         return "gemini", key
-    if choice == "2":
+    if idx == 1:
         path = _ask("  path to service-account JSON: ")
         return "vertex", path
     return "ollama", None
@@ -182,11 +207,15 @@ def _prompt_llm_provider() -> tuple[str, str | None]:
 
 def _prompt_storage() -> str:
     """Question 4: where do simulations land?"""
-    console.print("\n[bold]where do simulations live?[/]")
-    console.print("  1) local    (filesystem, fine for everyone)")
-    console.print("  2) gcs      (Google Cloud Storage bucket)")
-    choice = _ask_choice("  > ", {"1", "2"}, default="1")
-    if choice == "2":
+    from simd_agent.cli.display.arrow import arrow_choice
+    idx = arrow_choice(
+        "where do simulations live?",
+        [
+            "Local filesystem (default — no setup needed)",
+            "Google Cloud Storage (requires a bucket)",
+        ],
+    )
+    if idx == 1:
         bucket = _ask("  GCS bucket name: ")
         return f"gcs:{bucket}"
     return "local"
@@ -210,15 +239,6 @@ def _ask(prompt: str, *, default: str | None = None, masked: bool = False) -> st
         # Keep asking — empty isn't a valid answer here.
         return _ask(prompt.split("[")[0], default=default, masked=masked)
     return value
-
-
-def _ask_choice(prompt: str, valid: set[str], default: str) -> str:
-    """One-character menu with a default on enter."""
-    raw = input(prompt).strip() or default
-    while raw not in valid:
-        console.print(f"  unknown choice {raw!r}.  pick one of {sorted(valid)}.")
-        raw = input(prompt).strip() or default
-    return raw
 
 
 def _ask_url(prompt: str, default: str | None = None) -> str:
