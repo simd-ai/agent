@@ -599,17 +599,29 @@ else
     PID_FILE="$AGENT_DIR/.uvicorn.pid"
     LOG_FILE="$AGENT_DIR/uvicorn.log"
 
-    # If a prior PID file exists and that process is alive, reuse it.
+    # If a prior uvicorn is alive, kill it — we just wrote a fresh
+    # .env and the old process is still holding the previous env
+    # vars in memory (DATABASE_URL, LLM provider, …).  Reusing it
+    # would leave the user staring at "ConnectionRefused" against
+    # whatever database the old config pointed at.
     if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-      warn "uvicorn already running (PID $(cat "$PID_FILE")) — reusing"
-    else
-      info "starting uvicorn in the background …"
-      # Detach from the script's stdin/stdout so it survives after install.sh exits.
-      nohup "$AGENT_DIR/.venv/bin/uvicorn" simd_agent.main:app --port 8000 \
-        > "$LOG_FILE" 2>&1 &
-      echo $! > "$PID_FILE"
-      ok "uvicorn started (PID $(cat "$PID_FILE")), logs at uvicorn.log"
+      OLD_PID=$(cat "$PID_FILE")
+      info "stopping previous uvicorn (PID $OLD_PID) so the new .env takes effect …"
+      kill "$OLD_PID" 2>/dev/null || true
+      # Give it a moment to release port 8000 before we restart.
+      for _ in $(seq 1 10); do
+        kill -0 "$OLD_PID" 2>/dev/null || break
+        sleep 0.3
+      done
+      # If it's stubborn, force it.
+      kill -9 "$OLD_PID" 2>/dev/null || true
     fi
+    info "starting uvicorn in the background …"
+    # Detach from the script's stdin/stdout so it survives after install.sh exits.
+    nohup "$AGENT_DIR/.venv/bin/uvicorn" simd_agent.main:app --port 8000 \
+      > "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+    ok "uvicorn started (PID $(cat "$PID_FILE")), logs at uvicorn.log"
 
     info "waiting for the agent to come up …"
     for i in $(seq 1 30); do
