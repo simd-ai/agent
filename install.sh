@@ -360,19 +360,55 @@ if [ "$DEPLOY_MODE" = "docker" ]; then
     ok "external database configured"
   fi
 else
-  echo "  bare-metal mode needs Postgres reachable from this machine."
-  echo "  three common options:"
-  echo "    a) Neon (managed) — paste your connection string"
-  echo "    b) local install  — brew install postgresql / apt install postgresql"
-  echo "    c) in a container:"
-  hint "docker run -d --name simd-pg \\"
-  hint "  -e POSTGRES_USER=simd -e POSTGRES_PASSWORD=simd \\"
-  hint "  -e POSTGRES_DB=simd -p 5432:5432 postgres:16-alpine"
-  echo
-  ask "PostgreSQL connection URL" \
-      "postgresql+asyncpg://simd:simd@localhost:5432/simd" DATABASE_URL
-  DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
-  ok "database URL set"
+  arrow_choice "where's Postgres?" \
+    "Run it in a container now (we'll do docker run for you)" \
+    "Neon (managed) — I'll paste the connection string" \
+    "Local install (brew/apt) — already running on this machine" \
+    "Custom URL — I'll paste a connection string"
+
+  case "$_ARROW_INDEX" in
+    0)  # Container — provision it right now
+      command -v docker >/dev/null || fail \
+        "Docker isn't installed.  install Docker or pick another option."
+      docker info >/dev/null 2>&1 || fail \
+        "Docker daemon isn't running.  start Docker Desktop or pick another option."
+
+      if docker ps -a --format '{{.Names}}' | grep -q '^simd-pg$'; then
+        warn "container 'simd-pg' already exists — restarting it"
+        docker start simd-pg >/dev/null 2>&1 || true
+      else
+        info "starting Postgres container 'simd-pg' on localhost:5432 …"
+        docker run -d --name simd-pg \
+          -e POSTGRES_USER=simd -e POSTGRES_PASSWORD=simd \
+          -e POSTGRES_DB=simd -p 5432:5432 \
+          postgres:16-alpine >/dev/null || fail "docker run failed"
+      fi
+      info "waiting for Postgres to accept connections …"
+      for i in $(seq 1 20); do
+        if docker exec simd-pg pg_isready -U simd >/dev/null 2>&1; then break; fi
+        sleep 1
+      done
+      DATABASE_URL="postgresql+asyncpg://simd:simd@localhost:5432/simd"
+      ok "Postgres container ready at $DATABASE_URL"
+      ;;
+    1)  # Neon
+      ask "Neon connection URL (postgresql://user:pass@ep-xxx.neon.tech/db)" \
+          "" DATABASE_URL
+      DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
+      ok "Neon database configured"
+      ;;
+    2)  # Local install (already running)
+      ask "PostgreSQL connection URL" \
+          "postgresql+asyncpg://simd:simd@localhost:5432/simd" DATABASE_URL
+      DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
+      ok "using local Postgres at $DATABASE_URL"
+      ;;
+    3)  # Custom
+      ask "PostgreSQL connection URL" "" DATABASE_URL
+      DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
+      ok "database URL set"
+      ;;
+  esac
 fi
 
 
@@ -543,7 +579,72 @@ else
 
   header "setup complete"
 
-  cat <<EOF
+  arrow_choice "what next?" \
+    "Start the agent in the background now (and optionally run an example)" \
+    "Show me the two-terminal commands — I'll start things myself"
+
+  if [ "$_ARROW_INDEX" -eq 0 ]; then
+    # ── start uvicorn in the background ──────────────────────
+    PID_FILE="$AGENT_DIR/.uvicorn.pid"
+    LOG_FILE="$AGENT_DIR/uvicorn.log"
+
+    # If a prior PID file exists and that process is alive, reuse it.
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+      warn "uvicorn already running (PID $(cat "$PID_FILE")) — reusing"
+    else
+      info "starting uvicorn in the background …"
+      # Detach from the script's stdin/stdout so it survives after install.sh exits.
+      nohup "$AGENT_DIR/.venv/bin/uvicorn" simd_agent.main:app --port 8000 \
+        > "$LOG_FILE" 2>&1 &
+      echo $! > "$PID_FILE"
+      ok "uvicorn started (PID $(cat "$PID_FILE")), logs at uvicorn.log"
+    fi
+
+    info "waiting for the agent to come up …"
+    for i in $(seq 1 30); do
+      if curl -sf http://localhost:8000/health >/dev/null 2>&1; then
+        ok "agent ready at http://localhost:8000"
+        break
+      fi
+      [ "$i" -eq 30 ] && fail "agent didn't respond within 30s.  check uvicorn.log"
+      sleep 1
+    done
+
+    echo
+    arrow_choice "run an example now?" \
+      "u-shape-pipe        (compressible inverted-U duct)" \
+      "z-bend              (transient turbulent water flow)" \
+      "inner-outer-pipe    (2D LN2/water regasifier — multi-region CHT)" \
+      "cylindrical-cht     (natural convection — Boussinesq)" \
+      "Skip — I'll run simd commands myself"
+
+    case "$_ARROW_INDEX" in
+      0) EX="u-shape-pipe" ;;
+      1) EX="z-bend" ;;
+      2) EX="inner-outer-pipe" ;;
+      3) EX="cylindrical-cht" ;;
+      4) EX="" ;;
+    esac
+
+    if [ -n "$EX" ]; then
+      echo
+      simd run "examples/$EX/prompt.txt" "examples/$EX/mesh/$EX.msh" || \
+        warn "simd run exited non-zero — see the logs above"
+    fi
+
+    cat <<EOF
+
+  the agent keeps running in the background.
+
+    stop it:           kill \$(cat "$PID_FILE")
+    tail its logs:     tail -f "$LOG_FILE"
+    check status:      simd status
+    run more examples: simd run <prompt.txt> <mesh.msh>
+
+EOF
+  else
+    # ── print the manual commands ────────────────────────────
+    cat <<EOF
 
   next steps:
 
@@ -563,6 +664,7 @@ else
     deactivate
 
 EOF
+  fi
 fi
 
 
