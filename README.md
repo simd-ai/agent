@@ -54,19 +54,17 @@ See [Documentation/solvers](Documentation/solvers) for the full list of supporte
 | Authentication | Neon Auth · open (no auth) |
 
 
-What you need
--------------
+Quick start
+-----------
+
+You'll need:
 
   - Docker + Docker Compose
   - One LLM credential: a Gemini API key, OR a Vertex AI service-account
     JSON, OR a local Ollama install
 
-That's it. The compose stack ships OpenFOAM v2406, Postgres, the
-agent, and the frontend.
-
-
-Quick start
------------
+The compose stack ships OpenFOAM v2406, Postgres, the agent, and the
+frontend — nothing else to install.
 
     git clone https://github.com/simd-ai/agent
     cd agent
@@ -108,24 +106,12 @@ its prompt, and the generated OpenFOAM case files — so you can run
 the simulation directly with OpenFOAM, or watch the agent regenerate
 it from the prompt.
 
-    examples/u-shape-pipe/        compressible inverted-U duct,
-                                  rhoSimpleFoam + kOmegaSST
-    examples/z-bend/              transient turbulent water pipe,
-                                  pimpleFoam + kOmegaSST
-    examples/inner-outer-pipe/    2D LN2/water counter-flow
-                                  regasifier, chtMultiRegionSimpleFoam
-    examples/cylindrical-cht/     natural convection around a heated
-                                  cylinder, buoyantBoussinesqSimpleFoam
-
-Walk-throughs and screenshots in Documentation/examples/.
-
-
-Documentation
--------------
-
-See Documentation/ for installation, deployment, the WebSocket
-protocol, the solver plugin contract, and the LLM provider plugin
-contract.
+| Case | Physics | Solver |
+|---|---|---|
+| [u-shape-pipe](Documentation/examples/u-shape-pipe) | compressible inverted-U duct | rhoSimpleFoam + kOmegaSST |
+| [z-bend](Documentation/examples/z-bend) | transient turbulent water pipe | pimpleFoam + kOmegaSST |
+| [inner-outer-pipe](Documentation/examples/inner-outer-pipe) | 2D LN2/water counter-flow regasifier | chtMultiRegionSimpleFoam |
+| [cylindrical-cht](Documentation/examples/cylindrical-cht) | natural convection around a heated cylinder | buoyantBoussinesqSimpleFoam |
 
 
 Contributing
@@ -141,10 +127,3 @@ License
 -------
 
 Apache 2.0 — see LICENSE.
-
-
-Acknowledgements
-----------------
-
-OpenFOAM® is a registered trade mark of OpenCFD Ltd. This project is
-not approved or endorsed by OpenCFD or the OpenFOAM Foundation.
