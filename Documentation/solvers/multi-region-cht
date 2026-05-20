@@ -164,6 +164,6 @@ examples
     `chtMultiRegionSimpleFoam`, separated inner and outer pipes.
   - `examples/cylindrical-cht/` — concentric LN2 regasifier,
     `chtMultiRegionSimpleFoam`. The walk-through in
-    `Documentation/examples/cylindrical-cht.md` covers the regasifier
+    `Documentation/examples/cylindrical-cht` covers the regasifier
     topology rule and what counter-flow heat transfer should look
     like.

@@ -13,10 +13,10 @@ ordered simple → complex
 
   | example                            | solver                          | doc                    |
   |------------------------------------|---------------------------------|-------------------------|
-  | `examples/u-shape-pipe/`           | `rhoSimpleFoam` (kOmegaSST)     | u-shape-pipe.md        |
-  | `examples/z-bend/`                 | `pimpleFoam` (kOmegaSST)        | z-bend.md              |
-  | `examples/inner-outer-pipe/`       | `chtMultiRegionSimpleFoam`      | inner-outer-pipe.md    |
-  | `examples/cylindrical-cht/`        | `buoyantBoussinesqSimpleFoam`   | cylindrical-cht.md     |
+  | `examples/u-shape-pipe/`           | `rhoSimpleFoam` (kOmegaSST)     | u-shape-pipe        |
+  | `examples/z-bend/`                 | `pimpleFoam` (kOmegaSST)        | z-bend              |
+  | `examples/inner-outer-pipe/`       | `chtMultiRegionSimpleFoam`      | inner-outer-pipe    |
+  | `examples/cylindrical-cht/`        | `buoyantBoussinesqSimpleFoam`   | cylindrical-cht     |
   |                                    | (kOmegaSST)                     |                        |
 
 Note: the `cylindrical-cht/` directory is a misnomer — the case is

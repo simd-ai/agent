@@ -75,8 +75,8 @@ the agent diagnoses the error with a smaller LLM call and retries
 with focused fixes — up to seven attempts by default. This is the
 self-healing loop.
 
-See Documentation/architecture.md for the full design,
-Documentation/self-healing.md for a walkthrough of one real failure.
+See Documentation/architecture for the full design,
+Documentation/self-healing for a walkthrough of one real failure.
 
 
 examples
@@ -110,7 +110,7 @@ contract.
 contributing
 ------------
 
-See CONTRIBUTING.md. New solver plugins drop into
+See CONTRIBUTING. New solver plugins drop into
 `simd_agent/solvers/<name>/` and are auto-discovered; new LLM
 providers drop into `simd_agent/llm/<name>/`. No registry edits
 needed.

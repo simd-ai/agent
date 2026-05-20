@@ -11,14 +11,14 @@ what's supported
 
   | category        | solver                               | doc                  |
   |-----------------|--------------------------------------|----------------------|
-  | incompressible  | simpleFoam, pimpleFoam, icoFoam      | single-region.md     |
-  | compressible    | rhoSimpleFoam, rhoPimpleFoam         | single-region.md     |
-  | buoyant         | buoyantSimpleFoam, buoyantPimpleFoam | single-region.md     |
-  | Boussinesq      | buoyantBoussinesqSimpleFoam,         | single-region.md     |
+  | incompressible  | simpleFoam, pimpleFoam, icoFoam      | single-region     |
+  | compressible    | rhoSimpleFoam, rhoPimpleFoam         | single-region     |
+  | buoyant         | buoyantSimpleFoam, buoyantPimpleFoam | single-region     |
+  | Boussinesq      | buoyantBoussinesqSimpleFoam,         | single-region     |
   |                 | buoyantBoussinesqPimpleFoam          |                      |
-  | conjugate HT    | chtMultiRegionSimpleFoam,            | multi-region-cht.md  |
+  | conjugate HT    | chtMultiRegionSimpleFoam,            | multi-region-cht  |
   |                 | chtMultiRegionFoam                   |                      |
-  | multiphase      | compressibleInterFoam,               | multiphase.md        |
+  | multiphase      | compressibleInterFoam,               | multiphase        |
   | (experimental)  | compressibleInterIsoFoam,            |                      |
   |                 | compressibleMultiphaseInterFoam,     |                      |
   |                 | interFoam, interIsoFoam              |                      |
@@ -72,7 +72,7 @@ how plugins fit together
     ...
 
 Dropping a new directory in is the entire onboarding for a new
-solver. See `adding-a-solver.md`.
+solver. See `adding-a-solver`.
 
 
 what each plugin owns

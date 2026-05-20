@@ -145,4 +145,4 @@ Same caveat as cylindrical-cht: this is single-phase. LN2 above
 77 K should be vapor (GN2), and the latent heat of vaporization
 isn't captured. For a real Regascold sizing calculation you'd use
 `compressibleMultiphaseInterFoam` (experimental — see
-`solvers/multiphase.md`).
+`solvers/multiphase`).

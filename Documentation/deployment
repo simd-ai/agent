@@ -113,7 +113,7 @@ SDK as the public Gemini provider — model IDs are identical.
 
   4. Restart the agent.
 
-See `llm-providers/vertex.md` for the per-region model availability
+See `llm-providers/vertex` for the per-region model availability
 matrix.
 
 

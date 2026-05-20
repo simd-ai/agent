@@ -2,7 +2,7 @@ AgentEvent reference
 ====================
 
 Every server-to-client message on the run WebSockets is an
-`AgentEvent`. The envelope is documented in `websocket.md`. This
+`AgentEvent`. The envelope is documented in `websocket`. This
 document enumerates the `type` values and the shape of each
 `payload`.
 

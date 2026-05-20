@@ -10,7 +10,7 @@ useful contributions fall into one of three buckets.
 -----------------
 
 Add a new OpenFOAM solver, or improve validation for an existing
-one. See `Documentation/solvers/adding-a-solver.md` — the contract
+one. See `Documentation/solvers/adding-a-solver` — the contract
 is short and the existing plugins are good copy-paste starting
 points.
 
@@ -26,14 +26,14 @@ What we'd especially welcome:
     `compressibleMultiphaseInterFoam`, `interFoam` still use the
     legacy monolithic prompt-pack format. Porting them to the
     plugin layout brings them parity with the single-region
-    solvers. See `Documentation/solvers/multiphase.md`.
+    solvers. See `Documentation/solvers/multiphase`.
 
 
 2. LLM providers
 ----------------
 
 Add support for a new LLM. See
-`Documentation/llm-providers/adding-a-provider.md`. The current set
+`Documentation/llm-providers/adding-a-provider`. The current set
 covers Gemini (AI Studio + Vertex) and Ollama (local). Anthropic
 Claude and OpenAI-compatible endpoints are the most-requested
 additions.

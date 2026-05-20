@@ -23,7 +23,7 @@ layout per example
 ------------------
 
     examples/<name>/
-      ├── README.md         ← quick reference
+      ├── README         ← quick reference
       ├── prompt.txt        ← the natural-language prompt
       ├── mesh/
       │   └── <name>.msh    ← gmsh mesh

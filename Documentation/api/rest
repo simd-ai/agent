@@ -23,7 +23,7 @@ precheck
     prompt. Returns linted physics + suggested solver + per-patch
     boundary plan.
 
-  Streaming version is `WS /ws/precheck` (see websocket.md).
+  Streaming version is `WS /ws/precheck` (see websocket).
 
 
 runs

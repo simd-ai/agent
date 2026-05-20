@@ -25,7 +25,7 @@ flow is purely buoyancy-induced.
   - fluid:      air, β = 3.4e-3 1/K, ν = 1.5e-5 m²/s,
                 Pr = 0.7, T_ref = 300 K
 
-See `Documentation/examples/cylindrical-cht.md` for the walkthrough.
+See `Documentation/examples/cylindrical-cht` for the walkthrough.
 
 
 reproduce with OpenFOAM directly

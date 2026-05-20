@@ -7,7 +7,7 @@ tier, hard daily request cap.
 Use for: development, demos, small-volume production where the
 daily cap is comfortable.
 
-Switch to Vertex AI (`vertex.md`) when the cap starts biting.
+Switch to Vertex AI (`vertex`) when the cap starts biting.
 
 
 setup

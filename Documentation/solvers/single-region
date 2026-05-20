@@ -99,7 +99,7 @@ Each plugin declares which models are valid via the
   | SpalartAllmaras    | nuTilda, nut                    |
 
 Multi-region energy solvers add `alphat` to all RAS models — see
-`multi-region-cht.md`.
+`multi-region-cht`.
 
 
 examples

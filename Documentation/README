@@ -1,0 +1,56 @@
+Documentation
+=============
+
+Everything beyond what's in the top-level README. Pick the section
+you need.
+
+
+getting it running
+------------------
+
+  - installation         bare-metal: Python venv, system OpenFOAM,
+                            local or external Postgres
+  - deployment           production: GCS storage, Neon Auth,
+                            Vertex AI
+
+
+design
+------
+
+  - architecture         how the orchestrator, plugins, and
+                            deterministic renderer fit together
+  - self-healing         the diagnose → retry → fix loop, with a
+                            real-world walkthrough
+
+
+reference
+---------
+
+  - api/rest             REST endpoints
+  - api/websocket        WebSocket frames (/ws/run, /ws/precheck,
+                            /ws/watch)
+  - api/events           AgentEvent payloads
+  - solvers/README       supported OpenFOAM solvers
+  - llm-providers/          per-provider setup notes
+                            (gemini, vertex, ollama)
+
+
+extending it
+------------
+
+  - solvers/adding-a-solver          plugin contract — drop a
+                                        directory in, no registry edit
+  - llm-providers/adding-a-provider  LLMProvider contract
+
+
+examples
+--------
+
+  - examples/u-shape-pipe
+  - examples/z-bend
+  - examples/inner-outer-pipe
+  - examples/cylindrical-cht
+
+Each walkthrough shows the prompt, the generated case, and the
+expected result. The runnable cases live under `examples/` at the
+repo root.

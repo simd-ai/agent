@@ -18,7 +18,7 @@ you want to pin the solver instead of letting the LLM choose. The
 agent honors the explicit pick and skips the solver-selection LLM
 call.
 
-See `Documentation/examples/u-shape-pipe.md` for the walkthrough.
+See `Documentation/examples/u-shape-pipe` for the walkthrough.
 
 
 reproduce with OpenFOAM directly

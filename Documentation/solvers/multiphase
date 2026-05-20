@@ -99,7 +99,7 @@ what's missing
   - **Plugin port.** These should be self-contained directories
     under `simd_agent/solvers/multiphase/<name>/` mirroring the
     single-region plugins. PRs welcome — see
-    `adding-a-solver.md` for the contract.
+    `adding-a-solver` for the contract.
 
   - **Phase-change detection in precheck.** When a user prompts a
     regasifier ("LN2 inlet at 77 K, water at 290 K"), the precheck

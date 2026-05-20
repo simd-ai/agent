@@ -51,7 +51,7 @@ frontend as typed `AgentEvent` objects.
 
 If the solver fails, the agent feeds the stderr to a smaller LLM
 ("the diagnoser"), gets back a list of files to regenerate, and
-loops — up to seven times by default. See `self-healing.md`.
+loops — up to seven times by default. See `self-healing`.
 
 
 the modules that matter
@@ -112,7 +112,7 @@ the modules that matter
 
   llm/                   LLM provider plugins (gemini, vertex,
                          ollama). Auto-discovered. See
-                         `llm-providers/adding-a-provider.md`.
+                         `llm-providers/adding-a-provider`.
 
   solvers/               OpenFOAM solver plugins. Each one is a
                          self-contained directory:
@@ -157,22 +157,22 @@ where to look first
 -------------------
 
   - I want to add a new solver
-    → `solvers/adding-a-solver.md`, then copy `solvers/simpleFoam/`
+    → `solvers/adding-a-solver`, then copy `solvers/simpleFoam/`
        as a starting point.
 
   - I want to add a new LLM provider
-    → `llm-providers/adding-a-provider.md`, then copy
+    → `llm-providers/adding-a-provider`, then copy
        `llm/gemini/` as a starting point.
 
   - I want to understand the WebSocket protocol
-    → `api/websocket.md` + `models.py` (the `EventTypes` enum).
+    → `api/websocket` + `models.py` (the `EventTypes` enum).
 
   - I want to debug a failed run
-    → `self-healing.md` for the loop; then read the logs in
+    → `self-healing` for the loop; then read the logs in
        `[ENRICH:*]`, `[CODEGEN]`, `[VALIDATE]`, `[SIM_SERVER]`,
        `[VTK]` order.
 
   - I want to understand the multi-region (CHT) rendering
-    → `solvers/multi-region-cht.md` +
+    → `solvers/multi-region-cht` +
        `solvers/families/_multi_region.py` +
        `solvers/families/_multi_region_bcs.py`.

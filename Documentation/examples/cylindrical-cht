@@ -185,6 +185,6 @@ If you rename, four files need updates besides the directory
 itself:
 
   - `README`               (the `examples/` block)
-  - `Documentation/examples/README.md`  (the table)
-  - `Documentation/examples/cylindrical-cht.md`  → rename
-  - `examples/cylindrical-cht/README.md`  (cross-references)
+  - `Documentation/examples/README`  (the table)
+  - `Documentation/examples/cylindrical-cht`  → rename
+  - `examples/cylindrical-cht/README`  (cross-references)

@@ -64,7 +64,7 @@ Every event is one JSON object:
   - `type` is one of the `EventTypes` enum values
     (`simd_agent/models.py`).
   - `payload` carries the typed event data — schema depends on
-    `type`. See `events.md` for the catalogue.
+    `type`. See `events` for the catalogue.
 
 
 event types you'll see

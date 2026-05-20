@@ -25,5 +25,5 @@ Recommended export settings:
   - Compressed via `pngquant` or `oxipng` before committing
     (keeps the repo small).
 
-Diagrams (architecture.md, etc.) live alongside as `.svg` so they
+Diagrams (architecture, etc.) live alongside as `.svg` so they
 stay legible at any zoom.
