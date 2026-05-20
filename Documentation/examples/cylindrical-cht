@@ -1,12 +1,12 @@
 example: heated cylinder in a square cavity
 ===========================================
 
-> **Note:** the directory is `cylindrical-cht/` but the case is
-> *not* a CHT problem. It's natural convection in a single
+> Note: the directory is cylindrical-cht/ but the case is
+> not a CHT problem. It's natural convection in a single
 > incompressible fluid region — there's no solid wall to conduct
 > through. The "cylindrical" part refers to the heated cylinder
 > geometry inside the cavity. We recommend renaming the directory
-> to `heated-cylinder-cavity/` before the public release; see the
+> to heated-cylinder-cavity/ before the public release; see the
 > note at the bottom.
 
 A classical buoyancy benchmark: a hot cylinder at the centre of a
@@ -22,21 +22,21 @@ field is entirely buoyancy-induced.
 what it teaches
 ---------------
 
-  - how `buoyantBoussinesqSimpleFoam` differs from the fully-
-    compressible buoyant solvers — density varies *only* in the
+  - how buoyantBoussinesqSimpleFoam differs from the fully-
+    compressible buoyant solvers — density varies only in the
     buoyancy source term (Boussinesq approximation), everywhere
     else ρ = ρ_ref
-  - how `T_ref` and `β` (thermal expansion coefficient) enter
-    `constant/transportProperties` — these are inputs that don't
+  - how T_ref and β (thermal expansion coefficient) enter
+    constant/transportProperties — these are inputs that don't
     exist for non-buoyant solvers
-  - how a **closed cavity** flows through the BC pipeline — no
-    `_inlet` or `_outlet` patches, just `cylinder` (hot wall) and
-    `walls` (cold walls). `flow_kind` would be `"closed"` in a
+  - how a closed cavity flows through the BC pipeline — no
+    _inlet or _outlet patches, just cylinder (hot wall) and
+    walls (cold walls). flow_kind would be "closed" in a
     multi-region equivalent, but for this single-region case
     that's not surfaced
-  - how `0/p_rgh` differs from `0/p` for buoyant flows
-    (`p_rgh = p - ρ_ref·g·h`) and which one is the solved variable
-  - why natural convection needs **many more iterations** to
+  - how 0/p_rgh differs from 0/p for buoyant flows
+    (p_rgh = p - ρ_ref·g·h) and which one is the solved variable
+  - why natural convection needs many more iterations to
     converge than forced flow at the same Re — the buoyancy
     coupling is weaker than imposed inlet momentum
 
@@ -44,10 +44,10 @@ what it teaches
 the prompt
 ----------
 
-The full prompt is in `examples/cylindrical-cht/prompt.txt`. The
+The full prompt is in examples/cylindrical-cht/prompt.txt. The
 load-bearing clauses:
 
-  - solver: `Use buoyantBoussinesqSimpleFoam`
+  - solver: Use buoyantBoussinesqSimpleFoam
   - geometry: 1 m × 1 m cavity, cylinder r = 0.1 m centered
   - BCs: cylinder at 350 K, outer walls at 300 K, no inlets
   - 2D: front/back empty
@@ -60,49 +60,49 @@ load-bearing clauses:
 what the agent does
 -------------------
 
-  1. **Precheck**: parses the closed-cavity topology. The
+  1. Precheck: parses the closed-cavity topology. The
      boundary planner sees no inlet patches, so no
-     `flowRateInletVelocity` or `fixedValue (U=...)` BCs get
+     flowRateInletVelocity or fixedValue (U=...) BCs get
      stamped. Cylinder and outer-wall patches receive
-     `fixedValue T = 350` / `fixedValue T = 300` respectively.
-     U on every patch defaults to `noSlip` (closed walls).
+     fixedValue T = 350 / fixedValue T = 300 respectively.
+     U on every patch defaults to noSlip (closed walls).
 
-  2. **Lints**: detects steady (3000 iter mentioned, no end time),
-     buoyant (`gravity acts in −y`, `flow is driven entirely by
-     buoyancy`), Boussinesq (explicit β + T_ref + ν + Pr — the
+  2. Lints: detects steady (3000 iter mentioned, no end time),
+     buoyant (gravity acts in −y, flow is driven entirely by
+     buoyancy), Boussinesq (explicit β + T_ref + ν + Pr — the
      classical Boussinesq inputs). Turbulent because the prompt
      names kOmegaSST.
 
-  3. **Selects**: prompt says `Use buoyantBoussinesqSimpleFoam`,
+  3. Selects: prompt says Use buoyantBoussinesqSimpleFoam,
      selector LLM is skipped. The selector would have picked the
-     same anyway — `gravity + closed cavity + ΔT/T < 0.2 + steady`
+     same anyway — gravity + closed cavity + ΔT/T < 0.2 + steady
      unambiguously points at Boussinesq.
 
-  4. **Generates ~10 files**:
-     `system/{controlDict,fvSchemes,fvSolution}`,
-     `constant/{transportProperties,turbulenceProperties,g}`,
-     `0/{U,p_rgh,T,k,omega,nut,alphat}`.
+  4. Generates ~10 files:
+     system/{controlDict,fvSchemes,fvSolution},
+     constant/{transportProperties,turbulenceProperties,g},
+     0/{U,p_rgh,T,k,omega,nut,alphat}.
 
-       - `constant/transportProperties` carries the Boussinesq
-         block: `transportModel Newtonian; nu 1.5e-5; beta 3.4e-3;
-         TRef 300; Pr 0.7; Prt 0.85;`.
-       - `constant/g` is `(0 -9.81 0)`.
-       - `0/p_rgh` is the solved variable. `0/p` is not
+       - constant/transportProperties carries the Boussinesq
+         block: transportModel Newtonian; nu 1.5e-5; beta 3.4e-3;
+         TRef 300; Pr 0.7; Prt 0.85;.
+       - constant/g is (0 -9.81 0).
+       - 0/p_rgh is the solved variable. 0/p is not
          generated — Boussinesq treats density as constant so a
          separate hydrostatic pressure file isn't needed.
 
-  5. **Validates** (auto-fixes that fire for this case):
-       - `0/T internalField = 300` (matches the cold-wall T_ref —
+  5. Validates (auto-fixes that fire for this case):
+       - 0/T internalField = 300 (matches the cold-wall T_ref —
          the validator catches a default 300 K choice that happens
          to be right here, but would have clamped it had the
          user specified a different T_ref).
-       - `endTime = 3000`, `writeInterval = 200`,
-         `writeControl = timeStep`.
-       - `residualControl { p_rgh 1e-5; U 1e-5; T 1e-5; ... }`.
+       - endTime = 3000, writeInterval = 200,
+         writeControl = timeStep.
+       - residualControl { p_rgh 1e-5; U 1e-5; T 1e-5; ... }.
        - kOmegaSST relaxation factors set conservatively
          (under-relax for slow buoyant coupling).
 
-  6. **Submits**: sim-server runs `buoyantBoussinesqSimpleFoam`.
+  6. Submits: sim-server runs buoyantBoussinesqSimpleFoam.
      The first ~500 iterations show residuals fall fast as the
      temperature field equilibrates; then a long plateau as the
      plume settles into its steady recirculation pattern. Full
@@ -118,8 +118,8 @@ to reproduce
 From the frontend (http://localhost:3000):
 
   1. New project → upload
-     `examples/cylindrical-cht/mesh/cylindrical-cht.msh`.
-  2. Paste `examples/cylindrical-cht/prompt.txt`.
+     examples/cylindrical-cht/mesh/cylindrical-cht.msh.
+  2. Paste examples/cylindrical-cht/prompt.txt.
   3. Click Run.
 
 Or directly with OpenFOAM:
@@ -151,40 +151,40 @@ is the right choice over laminar.
 what's NOT modeled
 ------------------
 
-  - **Radiation**. At ΔT = 50 K and air, radiative heat transfer
+  - Radiation. At ΔT = 50 K and air, radiative heat transfer
     is a few percent of convective and ignoring it is fine.
     For higher ΔT or low-emissivity walls, switch to a solver with
-    radiation (`buoyantSimpleFoam + fvOptions radiation` or
+    radiation (buoyantSimpleFoam + fvOptions radiation or
     similar).
-  - **Compressibility**. Boussinesq assumes ΔT/T_ref < 0.1ish.
+  - Compressibility. Boussinesq assumes ΔT/T_ref < 0.1ish.
     Here ΔT/T_ref ≈ 50/300 = 0.17, so we're at the edge of
     Boussinesq's validity. For higher ΔT use the fully-compressible
-    `buoyantSimpleFoam` instead.
+    buoyantSimpleFoam instead.
 
 
 on the directory name
 ---------------------
 
-This directory was originally named `cylindrical-cht/` when the
+This directory was originally named cylindrical-cht/ when the
 plan was for a concentric-tube CHT regasifier (multi-region, like
-`inner-outer-pipe/`). The actual case here is single-region
+inner-outer-pipe/). The actual case here is single-region
 natural convection, which is a completely different solver and
 physics regime.
 
 Two options:
 
-  - **Rename the directory** to better reflect what's inside.
-    Candidates: `heated-cylinder-cavity/`,
-    `natural-convection-cavity/`, `boussinesq-cavity/`.
+  - Rename the directory to better reflect what's inside.
+    Candidates: heated-cylinder-cavity/,
+    natural-convection-cavity/, boussinesq-cavity/.
     Recommended for the public release.
 
-  - **Keep the name** and just live with the misnomer. Lower
+  - Keep the name and just live with the misnomer. Lower
     cost, but every reader will be confused.
 
 If you rename, four files need updates besides the directory
 itself:
 
-  - `README`               (the `examples/` block)
-  - `Documentation/examples/README`  (the table)
-  - `Documentation/examples/cylindrical-cht`  → rename
-  - `examples/cylindrical-cht/README`  (cross-references)
+  - README.md            (the examples/ block)
+  - Documentation/examples/README  (the table)
+  - Documentation/examples/cylindrical-cht  → rename
+  - examples/cylindrical-cht/README  (cross-references)

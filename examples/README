@@ -3,7 +3,7 @@ examples
 
 Four end-to-end CFD cases. Each is self-contained — you can run
 the agent on the prompt + mesh, or you can run the case files
-under `case/` directly with OpenFOAM and bypass the agent
+under case/ directly with OpenFOAM and bypass the agent
 entirely.
 
   u-shape-pipe/        compressible inverted-U duct,
@@ -38,15 +38,15 @@ running them
 
 Two ways:
 
-  - **Via the agent — frontend**: open http://localhost:3000 once
-    `install.sh` (Docker mode) has the stack up, upload the mesh,
+  - Via the agent — frontend: open http://localhost:3000 once
+    install.sh (Docker mode) has the stack up, upload the mesh,
     paste the prompt, click Run.
 
-  - **Via the agent — HTTP / WebSocket**: POST the prompt + mesh
-    to `/api/precheck`, then open `/ws/run` with op
-    `CFD_CODEGEN_RUN`. Full schema in `Documentation/api/`.
+  - Via the agent — HTTP / WebSocket: POST the prompt + mesh
+    to /api/precheck, then open /ws/run with op
+    CFD_CODEGEN_RUN. Full schema in Documentation/api/.
 
-  - **Directly with OpenFOAM (no AI)**:
+  - Directly with OpenFOAM (no AI):
 
         cd examples/<name>/case && <solver>
 

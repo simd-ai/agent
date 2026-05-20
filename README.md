@@ -1,6 +1,12 @@
 simd-agent
 ==========
 
+[![License](https://img.shields.io/github/license/simd-ai/agent)](LICENSE)
+[![Language](https://img.shields.io/github/languages/top/simd-ai/agent)](https://github.com/simd-ai/agent)
+[![Commit activity](https://img.shields.io/github/commit-activity/m/simd-ai/agent)](https://github.com/simd-ai/agent/commits/main)
+[![Last commit](https://img.shields.io/github/last-commit/simd-ai/agent)](https://github.com/simd-ai/agent/commits/main)
+[![PyPI downloads](https://static.pepy.tech/badge/simd-agent/month)](https://pepy.tech/project/simd-agent)
+
 AI-native CFD simulation agent built on OpenFOAM v2406.
 
 

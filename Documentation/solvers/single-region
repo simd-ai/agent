@@ -10,32 +10,32 @@ contribute to.
 what's here
 -----------
 
-  - **simpleFoam** — steady incompressible. Use for steady-state
+  - simpleFoam — steady incompressible. Use for steady-state
     external aero, pipe flow, mixing problems where Mach is low and
     no heat transfer matters.
 
-  - **pimpleFoam** — transient incompressible. Use for unsteady
+  - pimpleFoam — transient incompressible. Use for unsteady
     flows, vortex shedding, time-dependent boundary conditions.
 
-  - **icoFoam** — incompressible laminar (no turbulence model).
+  - icoFoam — incompressible laminar (no turbulence model).
     Use for low-Re flows, validation cases, microfluidics.
 
-  - **rhoSimpleFoam** — steady compressible with heat transfer.
+  - rhoSimpleFoam — steady compressible with heat transfer.
     Use for low-Mach compressible flows where temperature varies
     significantly (cryogenic pipe flow, hot gas systems).
 
-  - **rhoPimpleFoam** — transient compressible with heat transfer.
+  - rhoPimpleFoam — transient compressible with heat transfer.
     Use for unsteady compressible flows, transient cryogenic
     startup, time-dependent heat transfer.
 
-  - **buoyantSimpleFoam** / **buoyantPimpleFoam** — buoyant
+  - buoyantSimpleFoam / buoyantPimpleFoam — buoyant
     compressible. Natural convection driven by density variation
     with temperature, full compressible equation of state. For
     high-ΔT or large-domain problems where Boussinesq isn't
     sufficient.
 
-  - **buoyantBoussinesqSimpleFoam** /
-    **buoyantBoussinesqPimpleFoam** — buoyant incompressible with
+  - buoyantBoussinesqSimpleFoam /
+    buoyantBoussinesqPimpleFoam — buoyant incompressible with
     Boussinesq approximation. Lighter-weight thermal natural
     convection — valid when ΔT/T < 0.1 ish.
 
@@ -43,52 +43,52 @@ what's here
 what they share
 ---------------
 
-  - Generated 0/* fields: `U`, `p` (or `p_rgh` for buoyant),
-    `T` for energy solvers, turbulence fields for RAS models
-    (`k`, `omega`, `nut` for kOmegaSST; `k`, `epsilon`, `nut` for
-    kEpsilon; `nuTilda`, `nut` for Spalart-Allmaras).
+  - Generated 0/* fields: U, p (or p_rgh for buoyant),
+    T for energy solvers, turbulence fields for RAS models
+    (k, omega, nut for kOmegaSST; k, epsilon, nut for
+    kEpsilon; nuTilda, nut for Spalart-Allmaras).
 
-  - System files: `controlDict`, `fvSchemes`, `fvSolution`,
-    sometimes `fvOptions` (for energy solvers needing
-    `limitTemperature` clamps).
+  - System files: controlDict, fvSchemes, fvSolution,
+    sometimes fvOptions (for energy solvers needing
+    limitTemperature clamps).
 
-  - Constant files: `transportProperties` (incompressible) or
-    `thermophysicalProperties` (compressible),
-    `turbulenceProperties`, sometimes `g` (buoyant).
+  - Constant files: transportProperties (incompressible) or
+    thermophysicalProperties (compressible),
+    turbulenceProperties, sometimes g (buoyant).
 
 
 what's special per solver
 -------------------------
 
-The plugin docs (`simd_agent/solvers/<name>/prompts/_solver.md`)
+The plugin docs (simd_agent/solvers/<name>/prompts/_solver.md)
 carry the per-solver pitfalls the validators enforce. A few that
 matter in practice:
 
-  - **rhoSimpleFoam** — needs `div(phi,K)` and `div(phid,p)` in
-    `fvSchemes`. SIMPLEC + GAMG for `p`. h relaxation must be
+  - rhoSimpleFoam — needs div(phi,K) and div(phid,p) in
+    fvSchemes. SIMPLEC + GAMG for p. h relaxation must be
     aggressive (0.05) for cryogenic cases.
 
-  - **rhoPimpleFoam isothermal** — must use PBiCGStab+DILU for
-    `p` (not GAMG). `nOuterCorrectors=2`. `momentumPredictor yes`.
+  - rhoPimpleFoam isothermal — must use PBiCGStab+DILU for
+    p (not GAMG). nOuterCorrectors=2. momentumPredictor yes.
 
-  - **buoyantSimpleFoam** — `0/T internalField` must equal
-    `inlet_temperature`, never default to 300 K. The validator
+  - buoyantSimpleFoam — 0/T internalField must equal
+    inlet_temperature, never default to 300 K. The validator
     auto-corrects.
 
-  - **All compressible solvers** — `fvOptions limitTemperature`
+  - All compressible solvers — fvOptions limitTemperature
     clamps in-cell temperatures, but NOT boundary values. The
     validator clamps fixedValue T BCs to the EOS ceiling.
 
 The current set of validators lives in
-`simd_agent/run/genai_codegen.py:validate_generated_files()`.
-Future work folds these into per-plugin `validate()` methods.
+simd_agent/run/genai_codegen.py:validate_generated_files().
+Future work folds these into per-plugin validate() methods.
 
 
 turbulence models
 -----------------
 
 Each plugin declares which models are valid via the
-`turbulence_fields()` method. The defaults:
+turbulence_fields() method. The defaults:
 
   | model              | fields generated                |
   |--------------------|----------------------------------|
@@ -98,16 +98,16 @@ Each plugin declares which models are valid via the
   | kOmegaSST          | k, omega, nut                   |
   | SpalartAllmaras    | nuTilda, nut                    |
 
-Multi-region energy solvers add `alphat` to all RAS models — see
-`multi-region-cht`.
+Multi-region energy solvers add alphat to all RAS models — see
+multi-region-cht.
 
 
 examples
 --------
 
-  - `examples/u-shape-pipe/` — pimpleFoam + kOmegaSST,
+  - examples/u-shape-pipe/ — pimpleFoam + kOmegaSST,
     incompressible turbulent water flow through a U-bend.
-  - `examples/z-bend/` — rhoPimpleFoam (or rhoSimpleFoam),
+  - examples/z-bend/ — rhoPimpleFoam (or rhoSimpleFoam),
     compressible flow with heat transfer through a Z-bend.
 
 Both ship the full OpenFOAM case so you can run them directly.

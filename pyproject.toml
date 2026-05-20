@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "simd_agent"
 version = "0.1.0"
 description = "FastAPI service for orchestrating CFD workflows via WebSockets"
-readme = {file = "README", content-type = "text/plain"}
+readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [

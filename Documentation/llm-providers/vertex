@@ -20,14 +20,14 @@ setup — service-account JSON only, no gcloud CLI
      this is missing).
 
   3. IAM & Admin → Service Accounts → Create. Grant role
-     **Vertex AI User** (`roles/aiplatform.user`). One service
+     Vertex AI User (roles/aiplatform.user). One service
      account works for both Vertex and GCS storage if you also
-     grant **Storage Object Admin** on your bucket.
+     grant Storage Object Admin on your bucket.
 
   4. Service account → Keys → Add Key → Create new (JSON).
      Download the file. Treat it like a password.
 
-  5. In `.env`:
+  5. In .env:
 
          DEFAULT_PROVIDER=vertex
          VERTEX_PROJECT=your-gcp-project-id
@@ -44,7 +44,7 @@ getting your project ID
 
 The GCP Console's project selector dropdown shows both the project
 name and the project ID. The ID is the one you want. Looks like
-`my-org-12345` or `auto-generated-name-481923`.
+my-org-12345 or auto-generated-name-481923.
 
 There's no separate "Vertex project" — Vertex AI runs inside any
 GCP project that has the API enabled.
@@ -53,19 +53,19 @@ GCP project that has the API enabled.
 picking a location
 ------------------
 
-`us-central1` is the safe default. It has the broadest model
+us-central1 is the safe default. It has the broadest model
 availability and the fastest response from most of the world.
 
 Other regions worth knowing:
 
-  - `europe-west4` (Netherlands) — for EU data residency.
-  - `asia-southeast1` (Singapore), `asia-northeast1` (Tokyo) —
+  - europe-west4 (Netherlands) — for EU data residency.
+  - asia-southeast1 (Singapore), asia-northeast1 (Tokyo) —
     for APAC latency.
-  - `global` — auto-routes to the nearest region.
+  - global — auto-routes to the nearest region.
 
 Not every Gemini model is available in every region. Check
 https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
-if you hit `404 Publisher Model … not found`.
+if you hit 404 Publisher Model … not found.
 
 
 model defaults
@@ -75,20 +75,20 @@ model defaults
     VERTEX_SUPER_MODEL=gemini-2.5-pro   # solver selection,
                                         # verification
 
-Override either in `.env`.
+Override either in .env.
 
 
 how the credentials are loaded
 ------------------------------
 
-`pydantic-settings` reads `.env` but doesn't export to `os.environ`.
-`google-genai` (via `google-auth`) only reads from `os.environ`. To
+pydantic-settings reads .env but doesn't export to os.environ.
+google-genai (via google-auth) only reads from os.environ. To
 bridge the gap, the Vertex provider exports
-`GOOGLE_APPLICATION_CREDENTIALS` itself on first use. Same pattern
-as the GCS storage backend (`simd_agent/storage/gcs.py`).
+GOOGLE_APPLICATION_CREDENTIALS itself on first use. Same pattern
+as the GCS storage backend (simd_agent/storage/gcs.py).
 
-If `GOOGLE_APPLICATION_CREDENTIALS` is already set in your
-process's environment (Docker secret mount, systemd `Environment=`,
+If GOOGLE_APPLICATION_CREDENTIALS is already set in your
+process's environment (Docker secret mount, systemd Environment=,
 etc.), the provider leaves it alone.
 
 
@@ -104,24 +104,24 @@ env vars:
     GOOGLE_APPLICATION_CREDENTIALS=/…/key.json  # new
     # GEMINI_API_KEY=...         # can stay, becomes inactive
 
-All call sites use `get_provider()` — no source code changes
+All call sites use get_provider() — no source code changes
 needed. Restart, watch the first codegen call go through Vertex.
 
 
 common errors and what they mean
 --------------------------------
 
-  - **`403 PERMISSION_DENIED — Vertex AI API has not been used in
-    project X`** — enable the API (step 2 above), wait 2–3 minutes.
+  - 403 PERMISSION_DENIED — Vertex AI API has not been used in
+    project X — enable the API (step 2 above), wait 2–3 minutes.
 
-  - **`google.auth.exceptions.DefaultCredentialsError`** —
-    `GOOGLE_APPLICATION_CREDENTIALS` points at a missing or
+  - google.auth.exceptions.DefaultCredentialsError —
+    GOOGLE_APPLICATION_CREDENTIALS points at a missing or
     unreadable JSON file. Check the path is absolute and the
     process can read it.
 
-  - **`403 IAM permission denied`** — the service account is
-    missing `roles/aiplatform.user` on the project named in
-    `VERTEX_PROJECT`.
+  - 403 IAM permission denied — the service account is
+    missing roles/aiplatform.user on the project named in
+    VERTEX_PROJECT.
 
-  - **`404 Publisher Model …`** — the model isn't available in
-    your region. Change `VERTEX_MODEL` or `VERTEX_LOCATION`.
+  - 404 Publisher Model … — the model isn't available in
+    your region. Change VERTEX_MODEL or VERTEX_LOCATION.

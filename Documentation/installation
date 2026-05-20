@@ -12,16 +12,16 @@ what you'll be installing
 
 Three processes, side by side:
 
-  - **agent** — this repo. FastAPI service on port 8000.
-  - **frontend** — `simd-ai/simd-agent-ui`. Next.js dev server on
+  - agent — this repo. FastAPI service on port 8000.
+  - frontend — simd-ai/simd-agent-ui. Next.js dev server on
     port 3000.
-  - **sim-server** — `simd-ai/simd-agent-simulation`. OpenFOAM
+  - sim-server — simd-ai/simd-agent-simulation. OpenFOAM
     runner on port 9000.
 
 And two backing stores:
 
-  - **Postgres** — for run / event / project records.
-  - **Object storage** — for case ZIPs, meshes, VTPs. Local
+  - Postgres — for run / event / project records.
+  - Object storage — for case ZIPs, meshes, VTPs. Local
     filesystem is fine for development.
 
 
@@ -31,7 +31,7 @@ prerequisites
   - Python 3.13+
   - Node.js 20+
   - OpenFOAM v2406 (the sim-server expects exactly this version on
-    its `$PATH`)
+    its $PATH)
   - Postgres 14+ (local or Neon-hosted)
   - One LLM credential: a Gemini API key, OR a Vertex AI
     service-account JSON, OR a local Ollama install
@@ -57,16 +57,16 @@ Configure:
 
     cp .env.example .env
 
-Edit `.env`:
+Edit .env:
 
-  - `DATABASE_URL` — point at your Postgres (local or Neon).
-    Example: `postgresql+asyncpg://simd:simd@localhost:5432/simd`
-  - `SIMULATION_SERVER_URL` — `http://localhost:9000` if running
+  - DATABASE_URL — point at your Postgres (local or Neon).
+    Example: postgresql+asyncpg://simd:simd@localhost:5432/simd
+  - SIMULATION_SERVER_URL — http://localhost:9000 if running
     the sim-server locally, or the URL of your Docker-hosted runner.
-  - `GEMINI_API_KEY` — your AI Studio key. Or switch to Vertex /
-    Ollama (see `llm-providers/`).
-  - `STORAGE_BACKEND=local` and `STORAGE_LOCAL_DIR=./storage`.
-  - Leave `NEON_AUTH_BASE_URL` unset to disable auth.
+  - GEMINI_API_KEY — your AI Studio key. Or switch to Vertex /
+    Ollama (see llm-providers/).
+  - STORAGE_BACKEND=local and STORAGE_LOCAL_DIR=./storage.
+  - Leave NEON_AUTH_BASE_URL unset to disable auth.
 
 Initialize the database (the first request creates tables; no
 migration step needed today).
@@ -92,7 +92,7 @@ Smoke-test:
 The sim-server is a separate repo and a separate process because it
 owns the OpenFOAM installation. Two options.
 
-**Option A — Docker (recommended for local dev).** OpenFOAM v2406
+Option A — Docker (recommended for local dev). OpenFOAM v2406
 in a Linux container, ports to localhost:
 
     docker run -d --name simd-runner \
@@ -100,11 +100,11 @@ in a Linux container, ports to localhost:
       -v simd-runs:/tmp/simd-runs \
       ghcr.io/simd-ai/agent-runner:latest
 
-Then in the agent's `.env`:
+Then in the agent's .env:
 
     SIMULATION_SERVER_URL=http://localhost:9000
 
-**Option B — bare-metal Linux.** Install OpenFOAM v2406 from the
+Option B — bare-metal Linux. Install OpenFOAM v2406 from the
 ESI distribution, then:
 
     git clone https://github.com/simd-ai/simd-agent-simulation
@@ -113,9 +113,9 @@ ESI distribution, then:
     pip install -r requirements.txt
     uvicorn app.main:app --port 9000
 
-The sim-server expects `gmshToFoam`, `splitMeshRegions`,
-`decomposePar`, `reconstructPar`, and the chtMultiRegion* / rho* /
-simpleFoam / pimpleFoam / interFoam binaries on `$PATH`. The
+The sim-server expects gmshToFoam, splitMeshRegions,
+decomposePar, reconstructPar, and the chtMultiRegion* / rho* /
+simpleFoam / pimpleFoam / interFoam binaries on $PATH. The
 container image ships all of these.
 
 
@@ -126,7 +126,7 @@ container image ships all of these.
     cd simd-agent-ui
     npm install
 
-Configure `.env.local`:
+Configure .env.local:
 
     NEXT_PUBLIC_AGENT_URL=http://localhost:8000
     NEXT_PUBLIC_AGENT_WS_URL=ws://localhost:8000
@@ -145,13 +145,13 @@ Open http://localhost:3000.
 The agent uses Postgres for run/event persistence. Three reasonable
 setups:
 
-**Local Postgres (Homebrew, apt):**
+Local Postgres (Homebrew, apt):
 
     createdb simd
     # in .env:
     # DATABASE_URL=postgresql+asyncpg://your-username@localhost:5432/simd
 
-**Local Postgres in Docker:**
+Local Postgres in Docker:
 
     docker run -d --name simd-pg \
       -e POSTGRES_USER=simd -e POSTGRES_PASSWORD=simd \
@@ -161,23 +161,23 @@ setups:
     # in .env:
     # DATABASE_URL=postgresql+asyncpg://simd:simd@localhost:5432/simd
 
-**Neon (managed Postgres):** sign up at neon.tech, create a project,
-copy the connection string. Replace `postgresql://` with
-`postgresql+asyncpg://`.
+Neon (managed Postgres): sign up at neon.tech, create a project,
+copy the connection string. Replace postgresql:// with
+postgresql+asyncpg://.
 
 
 5. LLM provider
 ---------------
 
-Pick one. Mix-and-match is fine — set `DEFAULT_PROVIDER` to whichever
+Pick one. Mix-and-match is fine — set DEFAULT_PROVIDER to whichever
 should win.
 
-**Gemini (AI Studio API key)** — easiest, has a daily request cap.
+Gemini (AI Studio API key) — easiest, has a daily request cap.
 
     GEMINI_API_KEY=AIza…
     DEFAULT_PROVIDER=gemini
 
-**Vertex AI (GCP)** — same models, no daily cap, requires a service
+Vertex AI (GCP) — same models, no daily cap, requires a service
 account.
 
     DEFAULT_PROVIDER=vertex
@@ -185,16 +185,16 @@ account.
     VERTEX_LOCATION=us-central1
     GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/sa-key.json
 
-See `llm-providers/vertex` for the IAM role setup.
+See llm-providers/vertex for the IAM role setup.
 
-**Ollama (local)** — runs models on your machine, no network calls.
+Ollama (local) — runs models on your machine, no network calls.
 
     ollama pull gemma3
     DEFAULT_PROVIDER=ollama
     OLLAMA_HOST=http://localhost:11434
     OLLAMA_MODEL=gemma3
 
-See `llm-providers/ollama` for model recommendations.
+See llm-providers/ollama for model recommendations.
 
 
 verifying the stack
@@ -211,50 +211,50 @@ the simplest example:
 
 Within 30 seconds you should see:
 
-  - Per-file generation activity (`0/U`, `0/p`, `system/controlDict`,
-    `system/fvSchemes`, `system/fvSolution`, `constant/...`)
+  - Per-file generation activity (0/U, 0/p, system/controlDict,
+    system/fvSchemes, system/fvSolution, constant/...)
   - Mesh conversion event
   - Solver start + residual stream
   - VTK result displayed in the 3D viewer
 
 If anything in that sequence fails, the agent logs are
-`uvicorn …` and the sim-server logs are `docker logs simd-runner`.
+uvicorn … and the sim-server logs are docker logs simd-runner.
 
 
 troubleshooting
 ---------------
 
-  - **"LLM provider 'gemini' not configured"** — `GEMINI_API_KEY` is
+  - "LLM provider 'gemini' not configured" — GEMINI_API_KEY is
     missing or has whitespace. Re-set and restart.
 
-  - **`splitMeshRegions failed`** — the case is multi-region but the
+  - splitMeshRegions failed — the case is multi-region but the
     mesh doesn't have cellZones. Either generate a mesh with gmsh
-    `Physical Volume` groups, or write a single-region case.
+    Physical Volume groups, or write a single-region case.
 
-  - **VTK 404 in the browser** — the run finished but the sim-server
+  - VTK 404 in the browser — the run finished but the sim-server
     didn't produce any time folders (test-mode crashes, very short
     runs). The agent handles this gracefully; the network 404 is
     expected.
 
-  - **Frontend can't reach agent** — check
-    `NEXT_PUBLIC_AGENT_URL`. The browser, not Node, makes those
+  - Frontend can't reach agent — check
+    NEXT_PUBLIC_AGENT_URL. The browser, not Node, makes those
     requests; the URL must be reachable from the browser's
     perspective.
 
-  - **Slow first request** — first LLM call also imports the
-    `google-genai` SDK and warms a connection pool. Subsequent calls
+  - Slow first request — first LLM call also imports the
+    google-genai SDK and warms a connection pool. Subsequent calls
     are much faster.
 
 
 running tests
 -------------
 
-The agent has a test suite under `tests/`:
+The agent has a test suite under tests/:
 
     pytest -v
 
 The suite runs in parallel by default (xdist, 30 workers). Use
-`-n 0` if you need sequential output for debugging.
+-n 0 if you need sequential output for debugging.
 
 The sim-server has its own suite:
 

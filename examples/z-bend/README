@@ -16,7 +16,7 @@ A short, terse prompt — the agent's enrichment pipeline fills in
 everything else from the mesh and the standard defaults (atmospheric
 outlet, water at room T, deltaT picked from the mesh).
 
-See `Documentation/examples/z-bend` for the walkthrough.
+See Documentation/examples/z-bend for the walkthrough.
 
 
 reproduce with OpenFOAM directly

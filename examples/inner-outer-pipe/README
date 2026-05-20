@@ -20,7 +20,7 @@ boundary, every material property, and the solver. A "specification-
 grade" prompt for a real engineering use case, as opposed to the
 terse z-bend prompt.
 
-See `Documentation/examples/inner-outer-pipe` for the walkthrough,
+See Documentation/examples/inner-outer-pipe for the walkthrough,
 including how the per-region preset inference and regasifier
 topology rule fire.
 

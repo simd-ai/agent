@@ -3,9 +3,9 @@ examples
 
 Four end-to-end cases. Each ships with:
 
-  - `prompt.txt` — the natural-language prompt used to generate it
-  - `mesh/<name>.msh` — the gmsh mesh
-  - `case/` — the complete OpenFOAM case the agent produced
+  - prompt.txt — the natural-language prompt used to generate it
+  - mesh/<name>.msh — the gmsh mesh
+  - case/ — the complete OpenFOAM case the agent produced
 
 
 ordered simple → complex
@@ -13,13 +13,13 @@ ordered simple → complex
 
   | example                            | solver                          | doc                    |
   |------------------------------------|---------------------------------|-------------------------|
-  | `examples/u-shape-pipe/`           | `rhoSimpleFoam` (kOmegaSST)     | u-shape-pipe        |
-  | `examples/z-bend/`                 | `pimpleFoam` (kOmegaSST)        | z-bend              |
-  | `examples/inner-outer-pipe/`       | `chtMultiRegionSimpleFoam`      | inner-outer-pipe    |
-  | `examples/cylindrical-cht/`        | `buoyantBoussinesqSimpleFoam`   | cylindrical-cht     |
+  | examples/u-shape-pipe/           | rhoSimpleFoam (kOmegaSST)     | u-shape-pipe        |
+  | examples/z-bend/                 | pimpleFoam (kOmegaSST)        | z-bend              |
+  | examples/inner-outer-pipe/       | chtMultiRegionSimpleFoam      | inner-outer-pipe    |
+  | examples/cylindrical-cht/        | buoyantBoussinesqSimpleFoam   | cylindrical-cht     |
   |                                    | (kOmegaSST)                     |                        |
 
-Note: the `cylindrical-cht/` directory is a misnomer — the case is
+Note: the cylindrical-cht/ directory is a misnomer — the case is
 natural convection around a heated cylinder, not conjugate heat
 transfer. See the walkthrough for details and a rename suggestion.
 
@@ -29,12 +29,12 @@ running them
 
 Two paths:
 
-  1. **Via the agent** — open http://localhost:3000, upload the
+  1. Via the agent — open http://localhost:3000, upload the
      mesh, paste the prompt, hit Run. The agent regenerates the
      case from scratch each time.
 
-  2. **Directly with OpenFOAM** — `cd examples/<name>/case &&
-     <solver>`. This bypasses the agent entirely. Useful for
+  2. Directly with OpenFOAM — cd examples/<name>/case &&
+     <solver>. This bypasses the agent entirely. Useful for
      OpenFOAM users who want to study the case files without
      setting up the agent.
 

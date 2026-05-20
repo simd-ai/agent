@@ -1,8 +1,8 @@
 multi-region conjugate heat transfer
 ====================================
 
-Two solvers: `chtMultiRegionSimpleFoam` (steady) and
-`chtMultiRegionFoam` (transient). The agent picks between them based
+Two solvers: chtMultiRegionSimpleFoam (steady) and
+chtMultiRegionFoam (transient). The agent picks between them based
 on the time scheme.
 
 Use for heat transfer between solids and single-phase fluids — air,
@@ -14,87 +14,87 @@ fluid. Not for boiling, condensation, or phase change.
 what makes CHT different
 ------------------------
 
-  - **Multiple regions in one mesh.** The mesh carries cellZones
-    (gmsh `Physical Volume`s) that `splitMeshRegions` turns into
+  - Multiple regions in one mesh. The mesh carries cellZones
+    (gmsh Physical Volumes) that splitMeshRegions turns into
     separate per-region polyMesh trees.
 
-  - **Coupled interfaces.** `*_to_*` patches connect two regions.
+  - Coupled interfaces. _to_ patches connect two regions.
     OpenFOAM solves the energy equation on each region
-    independently and uses `compressible::turbulentTemperatureCoupledBaffleMixed`
+    independently and uses compressible::turbulentTemperatureCoupledBaffleMixed
     on the interface so T and heat flux match.
 
-  - **The case has tree shape.** Files live at `0/<region>/<field>`,
-    `system/<region>/`, `constant/<region>/`. The top-level
-    `system/` only holds `controlDict`, `fvSchemes`, and
-    `fvSolution`.
+  - The case has tree shape. Files live at 0/<region>/<field>,
+    system/<region>/, constant/<region>/. The top-level
+    system/ only holds controlDict, fvSchemes, and
+    fvSolution.
 
-  - **Per-region thermophysical properties.** Each fluid region has
-    its own `thermophysicalProperties` — water on one side, LN2 on
-    the other, air in a third. Solids carry `heSolidThermo` with
+  - Per-region thermophysical properties. Each fluid region has
+    its own thermophysicalProperties — water on one side, LN2 on
+    the other, air in a third. Solids carry heSolidThermo with
     their own ρ, Cp, κ.
 
 
 how the agent renders a CHT case
 --------------------------------
 
-The CHT solver plugins are mostly **deterministic**. The LLM only
-generates `system/controlDict`. Everything else
-(`constant/regionProperties`, per-region thermo, per-region
+The CHT solver plugins are mostly deterministic. The LLM only
+generates system/controlDict. Everything else
+(constant/regionProperties, per-region thermo, per-region
 fvSchemes/fvSolution, per-region 0/* fields including coupled
-interface BCs) is built in Python by `MultiRegionBase`
-(`simd_agent/solvers/families/_multi_region.py`).
+interface BCs) is built in Python by MultiRegionBase
+(simd_agent/solvers/families/_multi_region.py).
 
 Why? CHT case files are highly structured and the LLM gets details
 wrong (kappaMethod direction, coupling BC name, mapping
-patch type). A deterministic renderer driven by typed `RegionSpec`s
+patch type). A deterministic renderer driven by typed RegionSpecs
 is faster, more reliable, and easier to keep correct across
 OpenFOAM versions.
 
 The LLM contributes one file. The orchestrator validates everything
-through `plugin.validate_full()`. Per-patch values still come from
+through plugin.validate_full(). Per-patch values still come from
 the user's wizard / precheck via the enrichment pipeline.
 
 
 region detection
 ----------------
 
-`simd_agent/run/multi_region/region_detection.py` auto-detects CHT
+simd_agent/run/multi_region/region_detection.py auto-detects CHT
 topology from the mesh:
 
-  1. **cellZones (preferred)** — gmsh `Physical Volume` names are
+  1. cellZones (preferred) — gmsh Physical Volume names are
      authoritative. A region exists iff its cellZone exists in the
      mesh, independent of patch naming.
 
-  2. **patch-prefix fallback** — when cellZones are missing, the
+  2. patch-prefix fallback — when cellZones are missing, the
      detector groups mesh patches by the substring before the first
-     underscore (`innerFluid_inlet`, `innerFluid_outlet` →
-     `innerFluid`).
+     underscore (innerFluid_inlet, innerFluid_outlet →
+     innerFluid).
 
 Each detected region gets classified as fluid or solid via name
-heuristics (`wall`, `solid`, `metal`, `steel`, `tube`, `pipe`,
-`shell` → solid; everything else → fluid). The
-`RegionExtractor` LLM then refines presets and fills inlet values
+heuristics (wall, solid, metal, steel, tube, pipe,
+shell → solid; everything else → fluid). The
+RegionExtractor LLM then refines presets and fills inlet values
 from the user's prompt.
 
 
 per-region fluid presets
 ------------------------
 
-`MultiRegionBase.FLUID_REGION_PRESETS` ships ready-to-use property
-sets for: `air`, `water`, `oil`, `ln2`, `lox`, `lh2`, `lng`, `lhe`,
-`helium`. Each carries `Cp`, `mu`, `Pr`, `rho_nominal`, and the
-`thermo_profile` (gas vs cryogenic).
+MultiRegionBase.FLUID_REGION_PRESETS ships ready-to-use property
+sets for: air, water, oil, ln2, lox, lh2, lng, lhe,
+helium. Each carries Cp, mu, Pr, rho_nominal, and the
+thermo_profile (gas vs cryogenic).
 
-The enrichment step `region_fluid_presets`
-(`simd_agent/run/enrichment/region_fluid_presets.py`) infers each
+The enrichment step region_fluid_presets
+(simd_agent/run/enrichment/region_fluid_presets.py) infers each
 region's preset from:
 
-  1. the case's fluid name (e.g. "Liquid Nitrogen (LN2)" → `ln2`),
-  2. the region's `T_init` (77 K → `ln2`, 290 K → `water`),
+  1. the case's fluid name (e.g. "Liquid Nitrogen (LN2)" → ln2),
+  2. the region's T_init (77 K → ln2, 290 K → water),
   3. the case's bulk density,
-  4. **regasifier topology rule**: when exactly one cryogenic
+  4. regasifier topology rule: when exactly one cryogenic
      region exists alongside a room-temperature region defaulting
-     to `air`, the room-T region flips to `water` — air at 1.2 kg/m³
+     to air, the room-T region flips to water — air at 1.2 kg/m³
      carries ~1000× less enthalpy than the LN2 side, which makes
      the heat-exchange visualization useless.
 
@@ -105,65 +105,65 @@ RegionExtractor LLM or the UI) is preserved.
 per-region BCs
 --------------
 
-`simd_agent/solvers/families/_multi_region_bcs.py` builds each
+simd_agent/solvers/families/_multi_region_bcs.py builds each
 field file. Each builder:
 
-  - walks the region's patches (those matching `<region>_*`),
+  - walks the region's patches (those matching <region>_*),
   - picks a role-appropriate BC body (inlet, outlet, wall,
     symmetry, empty),
-  - emits the coupled-baffle block on every `*_to_*` interface.
+  - emits the coupled-baffle block on every _to_ interface.
 
-Builders exist for: `T`, `U`, `p`, `p_rgh`, `k`, `epsilon`,
-`omega`, `nut`, `alphat`.
+Builders exist for: T, U, p, p_rgh, k, epsilon,
+omega, nut, alphat.
 
 The turbulence-field set is single-sourced via
-`MultiRegionBase.turbulence_fields(model)` — which appends `alphat`
-(the compressible companion of `nut`) to whatever the single-region
-default returns. Without `alphat` the solver aborts at startup
+MultiRegionBase.turbulence_fields(model) — which appends alphat
+(the compressible companion of nut) to whatever the single-region
+default returns. Without alphat the solver aborts at startup
 with "cannot find file 0/<fluid>/alphat".
 
 
 mesh patch types after splitMeshRegions
 ---------------------------------------
 
-After `splitMeshRegions`, the sim-server runs a per-region
-`fix_boundary_types` pass that:
+After splitMeshRegions, the sim-server runs a per-region
+fix_boundary_types pass that:
 
-  - coerces patches with wall-function BCs to `type wall`,
-  - leaves `mappedPatch` interfaces alone (the coupled-baffle BC
+  - coerces patches with wall-function BCs to type wall,
+  - leaves mappedPatch interfaces alone (the coupled-baffle BC
     requires them).
 
 The exclusion is critical. Without it, the renderer would coerce
-`innerFluid_to_wall` to `wall` and OpenFOAM would crash with
+innerFluid_to_wall to wall and OpenFOAM would crash with
 "Type should be a mappedPatch".
 
-See `simd-ai/simd-agent-simulation:app/runner.py:fix_boundary_types`.
+See simd-ai/simd-agent-simulation:app/runner.py:fix_boundary_types.
 
 
 fvSchemes
 ---------
 
-Both fluid and solid regions get their own `system/<region>/fvSchemes`.
-Fluid regions include a mandatory `wallDist { method meshWave; }`
+Both fluid and solid regions get their own system/<region>/fvSchemes.
+Fluid regions include a mandatory wallDist { method meshWave; }
 block — required by OF v2406 for any region with wall-function
-turbulence. Solid regions only declare `laplacian(alpha,h)`.
+turbulence. Solid regions only declare laplacian(alpha,h).
 
 
 decompose / reconstruct
 -----------------------
 
-The sim-server calls `decomposePar -allRegions` and
-`reconstructPar -allRegions` for multi-region cases (not the bare
+The sim-server calls decomposePar -allRegions and
+reconstructPar -allRegions for multi-region cases (not the bare
 forms, which only see the top-level polyMesh).
 
 
 examples
 --------
 
-  - `examples/inner-outer-pipe/` — two-fluid heat exchanger,
-    `chtMultiRegionSimpleFoam`, separated inner and outer pipes.
-  - `examples/cylindrical-cht/` — concentric LN2 regasifier,
-    `chtMultiRegionSimpleFoam`. The walk-through in
-    `Documentation/examples/cylindrical-cht` covers the regasifier
+  - examples/inner-outer-pipe/ — two-fluid heat exchanger,
+    chtMultiRegionSimpleFoam, separated inner and outer pipes.
+  - examples/cylindrical-cht/ — concentric LN2 regasifier,
+    chtMultiRegionSimpleFoam. The walk-through in
+    Documentation/examples/cylindrical-cht covers the regasifier
     topology rule and what counter-flow heat transfer should look
     like.

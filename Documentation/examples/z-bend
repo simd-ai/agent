@@ -12,19 +12,19 @@ Single region, no heat transfer, kOmegaSST turbulence.
 what it teaches
 ---------------
 
-  - how a **very terse prompt** (3 short clauses) flows through the
+  - how a very terse prompt (3 short clauses) flows through the
     enrichment pipeline. The agent fills in the outlet (atmospheric),
     the fluid properties (water at room T), the deltaT (from
     Courant-aware mesh inspection), the iteration budget, and the
     initial conditions
-  - how `pimpleFoam` differs from `simpleFoam` — transient
-    PIMPLE pressure-velocity coupling, `nOuterCorrectors`,
-    `nNonOrthogonalCorrectors`, residualControl with sub-dicts
-  - how kOmegaSST gets its `0/k`, `0/omega`, `0/nut` generated for
-    an incompressible solver (no `alphat` here — that's only
+  - how pimpleFoam differs from simpleFoam — transient
+    PIMPLE pressure-velocity coupling, nOuterCorrectors,
+    nNonOrthogonalCorrectors, residualControl with sub-dicts
+  - how kOmegaSST gets its 0/k, 0/omega, 0/nut generated for
+    an incompressible solver (no alphat here — that's only
     needed for compressible RAS)
-  - how the validator auto-injects a `value uniform $internalField`
-    on `turbulentIntensityKineticEnergyInlet` BCs (mandatory in OF
+  - how the validator auto-injects a value uniform $internalField
+    on turbulentIntensityKineticEnergyInlet BCs (mandatory in OF
     2406, missing in older LLM output → solver aborts on iteration 0)
 
 
@@ -38,41 +38,41 @@ the prompt
 what the agent does
 -------------------
 
-  1. **Precheck**: detects the mesh is single-region, picks an
-     inlet patch via name heuristics, stamps `fixedValue (2.3 0 0)`
-     on `0/U`. No temperature mentioned → no thermal BCs.
+  1. Precheck: detects the mesh is single-region, picks an
+     inlet patch via name heuristics, stamps fixedValue (2.3 0 0)
+     on 0/U. No temperature mentioned → no thermal BCs.
 
-  2. **Lints**: detects transient (`for 4 seconds`), incompressible
+  2. Lints: detects transient (for 4 seconds), incompressible
      (water + room T + no mass-flow-rate or compressibility hint),
      turbulent (kOmegaSST named). Re = 2.3 × D / nu_water — well
      above 4000 for any reasonable pipe diameter, so the turbulent
      classification holds.
 
-  3. **Selects**: `pimpleFoam`. The selector's LLM gets the
+  3. Selects: pimpleFoam. The selector's LLM gets the
      incompressible + transient + turbulent classification and
      picks pimpleFoam unambiguously.
 
-  4. **Generates ~9 files**:
-     `system/{controlDict,fvSchemes,fvSolution}`,
-     `constant/{transportProperties,turbulenceProperties}`,
-     `0/{U,p,k,omega,nut}`.
+  4. Generates ~9 files:
+     system/{controlDict,fvSchemes,fvSolution},
+     constant/{transportProperties,turbulenceProperties},
+     0/{U,p,k,omega,nut}.
 
-  5. **Validates** (auto-fixes that fire for this case):
-       - `endTime = 4`, `deltaT` chosen from mesh-quality data
+  5. Validates (auto-fixes that fire for this case):
+       - endTime = 4, deltaT chosen from mesh-quality data
          (typically 0.001–0.01 depending on the smallest cell).
-       - `adjustTimeStep yes; maxCo 0.5` for transient stability.
-       - `nOuterCorrectors ≥ 2`, `nCorrectors ≥ 1`,
-         `nNonOrthogonalCorrectors ≥ 1`.
+       - adjustTimeStep yes; maxCo 0.5 for transient stability.
+       - nOuterCorrectors ≥ 2, nCorrectors ≥ 1,
+         nNonOrthogonalCorrectors ≥ 1.
        - PIMPLE residualControl rewritten as sub-dictionaries
          (plain scalars crash with "Residual data for p must be
          specified as a dictionary").
-       - `0/k` `internalField` and inlet value clamped to the
+       - 0/k internalField and inlet value clamped to the
          physically plausible range (k = 1.5 × (I × U)² where
          I ≈ 0.05 — for U = 2.3 m/s this gives k ≈ 0.04).
-       - `0/k` `turbulentIntensityKineticEnergyInlet` BC gets a
-         `value uniform $internalField` injected (OF 2406 strictness).
+       - 0/k turbulentIntensityKineticEnergyInlet BC gets a
+         value uniform $internalField injected (OF 2406 strictness).
 
-  6. **Submits**: sim-server runs `pimpleFoam`. Vortex shedding
+  6. Submits: sim-server runs pimpleFoam. Vortex shedding
      develops in the bends after the first second of simulated
      time.
 
@@ -85,8 +85,8 @@ to reproduce
 
 From the frontend (http://localhost:3000):
 
-  1. New project → upload `examples/z-bend/mesh/z-bend.msh`.
-  2. Paste `examples/z-bend/prompt.txt`.
+  1. New project → upload examples/z-bend/mesh/z-bend.msh.
+  2. Paste examples/z-bend/prompt.txt.
   3. Click Run.
 
 Or directly with OpenFOAM:

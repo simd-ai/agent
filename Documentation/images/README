@@ -8,13 +8,13 @@ and committed as PNG.
 Required files (the docs reference these — they should exist before
 the public release):
 
-  - `header-strip.png`        4 thumbnails side-by-side, ~900×220 px,
+  - header-strip.png        4 thumbnails side-by-side, ~900×220 px,
                               shown at the top of the README. Order:
                               u-shape, z-bend, inner-outer, cylindrical.
-  - `u-shape.png`             U-shape pipe velocity field, ~700 px wide.
-  - `z-bend.png`              Z-bend temperature + velocity.
-  - `inner-outer-pipe.png`    Inner/outer pipe temperature field.
-  - `cylindrical-cht.png`     Cylindrical CHT temperature field
+  - u-shape.png             U-shape pipe velocity field, ~700 px wide.
+  - z-bend.png              Z-bend temperature + velocity.
+  - inner-outer-pipe.png    Inner/outer pipe temperature field.
+  - cylindrical-cht.png     Cylindrical CHT temperature field
                               (the LN2 regasifier shot — counter-flow
                               gradient).
 
@@ -22,8 +22,8 @@ Recommended export settings:
 
   - PNG, transparent background where possible.
   - 2× device-pixel-ratio for HiDPI displays.
-  - Compressed via `pngquant` or `oxipng` before committing
+  - Compressed via pngquant or oxipng before committing
     (keeps the repo small).
 
-Diagrams (architecture, etc.) live alongside as `.svg` so they
+Diagrams (architecture, etc.) live alongside as .svg so they
 stay legible at any zoom.

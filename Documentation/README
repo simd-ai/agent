@@ -52,5 +52,5 @@ examples
   - examples/cylindrical-cht
 
 Each walkthrough shows the prompt, the generated case, and the
-expected result. The runnable cases live under `examples/` at the
+expected result. The runnable cases live under examples/ at the
 repo root.

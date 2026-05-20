@@ -4,50 +4,50 @@ multiphase (experimental)
 The agent supports five multiphase solvers via legacy monolithic
 prompt packs:
 
-  - `interFoam` — incompressible two-phase VOF (water + air sloshing,
+  - interFoam — incompressible two-phase VOF (water + air sloshing,
     free-surface flows, dam breaks).
-  - `interIsoFoam` — incompressible two-phase with isoAdvector
+  - interIsoFoam — incompressible two-phase with isoAdvector
     interface capture (sharper interface than the standard VOF).
-  - `compressibleInterFoam` — compressible two-phase VOF
+  - compressibleInterFoam — compressible two-phase VOF
     (boiling, condensation, cavitation, phase-change).
-  - `compressibleInterIsoFoam` — compressible isoAdvector variant.
-  - `compressibleMultiphaseInterFoam` — N-phase compressible VOF.
+  - compressibleInterIsoFoam — compressible isoAdvector variant.
+  - compressibleMultiphaseInterFoam — N-phase compressible VOF.
 
 
 status
 ------
 
 These solvers haven't been ported to the plugin package format yet.
-They still use the legacy monolithic `.md` files under
-`simd_agent/prompts/packs/simd/solvers/multiphase/` and the fallback
-branch in `build_required_files_list()`.
+They still use the legacy monolithic .md files under
+simd_agent/prompts/packs/simd/solvers/multiphase/ and the fallback
+branch in build_required_files_list().
 
 What that means for you:
 
-  - **They work** — the agent can pick them, generate cases for
+  - They work — the agent can pick them, generate cases for
     them, and self-heal them, with the same orchestrator as the
     single-region path.
-  - **The validators are thinner** — fewer auto-fixes for known
+  - The validators are thinner — fewer auto-fixes for known
     pitfalls (sigma block, phase pair sub-dicts, etc.).
-  - **The fluid registry is hardcoded** — switching liquids needs
-    edits in `genai_codegen.py:_eos_for_liquid()` rather than a
+  - The fluid registry is hardcoded — switching liquids needs
+    edits in genai_codegen.py:_eos_for_liquid() rather than a
     plugin attribute.
 
 
 when to use them
 ----------------
 
-  - **interFoam / interIsoFoam** — incompressible free-surface
+  - interFoam / interIsoFoam — incompressible free-surface
     problems. Water-air interfaces dominated by gravity. Standard
     benchmark cases (dam break, sloshing tank).
 
-  - **compressibleInterFoam** — anywhere phase change happens at
+  - compressibleInterFoam — anywhere phase change happens at
     speed: cryogenic regasifiers (LN2 → GN2), boiling channels,
-    cavitating propellers, evaporating sprays. The `chtMultiRegion`
+    cavitating propellers, evaporating sprays. The chtMultiRegion
     family can't capture latent heat or the liquid→vapor density
     drop; this one can.
 
-  - **compressibleMultiphaseInterFoam** — three or more phases
+  - compressibleMultiphaseInterFoam — three or more phases
     (e.g. liquid + vapor + non-condensable air). Heavier
     numerically, more knobs.
 
@@ -55,25 +55,25 @@ when to use them
 known pitfalls the validators enforce
 -------------------------------------
 
-A few captured in `simd_agent/run/genai_codegen.py`:
+A few captured in simd_agent/run/genai_codegen.py:
 
-  - `compressibleInterFoam` and friends need BOTH `0/p` AND
-    `0/p_rgh`. `0/p` is declared `MUST_READ`. The validator
+  - compressibleInterFoam and friends need BOTH 0/p AND
+    0/p_rgh. 0/p is declared MUST_READ. The validator
     synthesizes whichever is missing.
 
-  - `compressibleInterFoam`: `nOuterCorrectors ≥ 2` (PIMPLE not
+  - compressibleInterFoam: nOuterCorrectors ≥ 2 (PIMPLE not
     PISO). icoPolynomial ρ(T) has zero acoustic compressibility,
     so PISO mode leaves T-ρ-p-U coupling unresolved and Co blows
-    up. `momentumPredictor yes`, `nNonOrthogonalCorrectors ≥ 1`.
+    up. momentumPredictor yes, nNonOrthogonalCorrectors ≥ 1.
 
-  - `compressibleInterFoam`: `maxCo 0.5`, NOT 1.0 in `controlDict`.
+  - compressibleInterFoam: maxCo 0.5, NOT 1.0 in controlDict.
     At Co=1 the limiter reacts too late to prevent divergence.
 
   - Native liquidProperties pair (e.g. liquidNitrogen) MUST use
-    `sensibleInternalEnergy` (not `sensibleEnthalpy`). The latter
-    causes SIGFPE in `heRhoThermo` constructor. The validator
-    auto-corrects: `sensibleEnthalpy → sensibleInternalEnergy`,
-    `hConst → eConst`, `Cp → Cv` for the vapour side.
+    sensibleInternalEnergy (not sensibleEnthalpy). The latter
+    causes SIGFPE in heRhoThermo constructor. The validator
+    auto-corrects: sensibleEnthalpy → sensibleInternalEnergy,
+    hConst → eConst, Cp → Cv for the vapour side.
 
 
 thermophysical setup for compressible multiphase
@@ -81,33 +81,33 @@ thermophysical setup for compressible multiphase
 
 Three files instead of one:
 
-  - `constant/thermophysicalProperties` — base file with phases /
-    `pMin` / `sigma`.
-  - `constant/thermophysicalProperties.<liquid>` — per-phase
-    liquid file (native `liquidProperties`).
-  - `constant/thermophysicalProperties.<vapour>` — per-phase
+  - constant/thermophysicalProperties — base file with phases /
+    pMin / sigma.
+  - constant/thermophysicalProperties.<liquid> — per-phase
+    liquid file (native liquidProperties).
+  - constant/thermophysicalProperties.<vapour> — per-phase
     vapour file (perfectGas + eConst + Cv).
 
 Phase names are derived from the fluid name (LN2 →
-`liquidNitrogen` / `nitrogenVapour`, LH2 → `liquidHydrogen` /
-`hydrogenVapour`, LOX → `liquidOxygen` / `oxygenVapour`).
+liquidNitrogen / nitrogenVapour, LH2 → liquidHydrogen /
+hydrogenVapour, LOX → liquidOxygen / oxygenVapour).
 
 
 what's missing
 --------------
 
-  - **Plugin port.** These should be self-contained directories
-    under `simd_agent/solvers/multiphase/<name>/` mirroring the
+  - Plugin port. These should be self-contained directories
+    under simd_agent/solvers/multiphase/<name>/ mirroring the
     single-region plugins. PRs welcome — see
-    `adding-a-solver` for the contract.
+    adding-a-solver for the contract.
 
-  - **Phase-change detection in precheck.** When a user prompts a
+  - Phase-change detection in precheck. When a user prompts a
     regasifier ("LN2 inlet at 77 K, water at 290 K"), the precheck
-    should flag `phase_change_detected: true` and route to
-    `compressibleInterFoam` instead of `chtMultiRegionSimpleFoam`.
+    should flag phase_change_detected: true and route to
+    compressibleInterFoam instead of chtMultiRegionSimpleFoam.
     Today the agent picks the single-phase CHT solver and silently
     underestimates heat capacity.
 
-  - **Validation parity with single-region.** The new plugin-based
+  - Validation parity with single-region. The new plugin-based
     validators have ~25 auto-fix checks; the multiphase legacy
     path has ~6. Bringing the rest over is good first-issue work.

@@ -13,12 +13,12 @@ WORKDIR /app
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# pyproject.toml's ``readme = {file = "README", …}`` makes hatchling
-# read the file at metadata-generation time — even for `-e .`.  Copy
-# it (plus LICENSE for completeness) alongside pyproject.toml so the
-# editable install doesn't fail with "Readme file does not exist".
-# These two rarely change so the layer cache stays warm.
-COPY pyproject.toml README LICENSE ./
+# pyproject.toml's ``readme = "README.md"`` makes hatchling read the
+# file at metadata-generation time — even for `-e .`.  Copy it (plus
+# LICENSE for completeness) alongside pyproject.toml so the editable
+# install doesn't fail with "Readme file does not exist".  These two
+# rarely change so the layer cache stays warm.
+COPY pyproject.toml README.md LICENSE ./
 # Install deps first (cached layer — only rebuilds when pyproject.toml changes)
 RUN pip install --no-cache-dir -e .
 

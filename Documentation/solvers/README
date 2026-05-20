@@ -3,7 +3,7 @@ solvers
 
 The agent ships with plugin packages for the OpenFOAM solvers most
 people actually use. Each plugin is a self-contained directory under
-`simd_agent/solvers/<name>/` — the registry auto-discovers them.
+simd_agent/solvers/<name>/ — the registry auto-discovers them.
 
 
 what's supported
@@ -27,7 +27,7 @@ what's supported
 how the agent picks one
 -----------------------
 
-The `SolverSelector` (`simd_agent/run/solver_selector.py`) builds a
+The SolverSelector (simd_agent/run/solver_selector.py) builds a
 roster from the registry and asks the LLM to pick. The LLM gets:
 
   - the user's natural-language prompt
@@ -36,7 +36,7 @@ roster from the registry and asks the LLM to pick. The LLM gets:
   - the mesh shape (single-region vs multi-region)
   - a structured list of every solver's capabilities
 
-It returns `{solver, confidence, reason, flags, warnings}`. The
+It returns {solver, confidence, reason, flags, warnings}. The
 orchestrator stores the result for inspection.
 
 There's a deterministic safety net: when the mesh has multiple
@@ -55,7 +55,7 @@ how plugins fit together
       _multi_region.py      #   chtMultiRegion* + RegionSpec presets
       _multi_region_bcs.py  #   per-region BC builders
     simpleFoam/             # one self-contained directory per solver:
-      __init__.py           #     exports `solver_plugin = ...()`
+      init.py           #     exports solver_plugin = ...()
       solver.py             #     class attributes + matches() +
                             #     required_files() + validate()
       prompts/              #     per-file prompt docs
@@ -72,32 +72,32 @@ how plugins fit together
     ...
 
 Dropping a new directory in is the entire onboarding for a new
-solver. See `adding-a-solver`.
+solver. See adding-a-solver.
 
 
 what each plugin owns
 ---------------------
 
-  - **identity** — `name`, `algorithm`, `pressure_field`,
-    `is_transient`, `is_compressible`, `supports_energy`,
-    `needs_gravity`, `is_multiphase`. Class attributes; the
+  - identity — name, algorithm, pressure_field,
+    is_transient, is_compressible, supports_energy,
+    needs_gravity, is_multiphase. Class attributes; the
     registry uses these for classification queries
-    (`p_solvers()`, `energy_solvers()`, etc.).
+    (p_solvers(), energy_solvers(), etc.).
 
-  - **selection scoring** — `matches(config) → MatchResult`. The
+  - selection scoring — matches(config) → MatchResult. The
     selector uses this when the LLM is unavailable, and to filter
     the LLM's candidate roster.
 
-  - **the file manifest** — `required_files(config) → list[str]`.
+  - the file manifest — required_files(config) → list[str].
     Exact paths the LLM must produce. For multi-region solvers
-    this is just `["system/controlDict"]` — the rest is rendered
+    this is just ["system/controlDict"] — the rest is rendered
     deterministically.
 
-  - **per-file prompts** — `prompt_for_file(path)` reads from
-    `prompts/<system|constant|fields>/<X>.md`. Keeps the LLM's
+  - per-file prompts — prompt_for_file(path) reads from
+    prompts/<system|constant|fields>/<X>.md. Keeps the LLM's
     context tight, one file at a time.
 
-  - **validation** — `validate(files, config) → ValidationResult`.
+  - validation — validate(files, config) → ValidationResult.
     Solver-specific deterministic checks and auto-fixes. Universal
     helpers live on the base class
-    (`_fix_controldict_solver`, `_fix_constraint_patch_bcs`, etc.).
+    (_fix_controldict_solver, _fix_constraint_patch_bcs, etc.).

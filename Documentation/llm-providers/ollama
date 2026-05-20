@@ -27,7 +27,7 @@ setup
          curl http://localhost:11434/api/tags
          # {"models":[{"name":"gemma3:latest", ...}]}
 
-  4. In `.env`:
+  4. In .env:
 
          DEFAULT_PROVIDER=ollama
          OLLAMA_HOST=http://localhost:11434
@@ -61,21 +61,21 @@ prose.
 
 The smaller models cost you in self-healing retries — a case that
 takes 1 attempt with Gemini Pro may take 3–4 with gemma3 (4B).
-Set `MAX_RETRIES` higher when running local.
+Set MAX_RETRIES higher when running local.
 
 
 performance notes
 -----------------
 
-  - **First call after restart** loads the model into VRAM. Can
+  - First call after restart loads the model into VRAM. Can
     take 10–60 seconds depending on size. After that, calls are
     fast.
 
-  - **Parallel codegen** is the agent's normal mode — 5-10 file
+  - Parallel codegen is the agent's normal mode — 5-10 file
     calls in parallel. Ollama serialises these on a single GPU.
     Local runs are typically 2–4× slower than cloud as a result.
 
-  - **Streaming works** — the agent's `generate_stream()` path
+  - Streaming works — the agent's generate_stream() path
     flows through to Ollama's chat-stream endpoint. Tokens stream
     to the UI as the model produces them.
 
@@ -88,27 +88,27 @@ a GPU, server in your homelab):
 
     OLLAMA_HOST=http://192.168.1.100:11434
 
-The Ollama server binds to `127.0.0.1` by default. To accept
-remote connections set `OLLAMA_HOST=0.0.0.0` in Ollama's
+The Ollama server binds to 127.0.0.1 by default. To accept
+remote connections set OLLAMA_HOST=0.0.0.0 in Ollama's
 environment.
 
 
 troubleshooting
 ---------------
 
-  - **`ImportError: ollama provider requires the 'ollama' package`**
-    — the agent's `pip install -e ".[dev]"` should pull it. If it
-    didn't: `pip install 'ollama>=0.4.0'`.
+  - ImportError: ollama provider requires the 'ollama' package
+    — the agent's pip install -e ".[dev]" should pull it. If it
+    didn't: pip install 'ollama>=0.4.0'.
 
-  - **`Connection refused` on first request** — Ollama isn't
-    running. `ollama serve` (or restart the desktop app).
+  - Connection refused on first request — Ollama isn't
+    running. ollama serve (or restart the desktop app).
 
-  - **`model not found`** — you haven't pulled it. `ollama pull
-    <tag>`.
+  - model not found — you haven't pulled it. ollama pull
+    <tag>.
 
-  - **Generation is silent for minutes** — the model is loading.
-    Watch `ollama ps` to see active models.
+  - Generation is silent for minutes — the model is loading.
+    Watch ollama ps to see active models.
 
-  - **All cases fail validation** — small models often miss
+  - All cases fail validation — small models often miss
     OpenFOAM-specific keywords. Move up a size, or accept higher
-    `MAX_RETRIES` and let the self-healing loop fix it.
+    MAX_RETRIES and let the self-healing loop fix it.
