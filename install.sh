@@ -67,6 +67,10 @@ hint()    { printf "    ${CYAN}→${NC} %s\n" "$*"; }
 
 _ARROW_INDEX=0
 _ARROW_RESULT=""
+# Callers set _ARROW_DEFAULT=N before invoking arrow_choice to pre-select
+# option N (0-based).  It auto-resets to 0 after each call so subsequent
+# prompts default to "first option" again unless explicitly overridden.
+_ARROW_DEFAULT=0
 
 arrow_choice() {
   # arrow_choice <prompt> <option1> [<option2> ...]
@@ -74,7 +78,14 @@ arrow_choice() {
   shift
   local options=("$@")
   local count=${#options[@]}
-  local selected=0
+  local selected=${_ARROW_DEFAULT:-0}
+  # Clamp the pre-selected index — a stale value pointing past the
+  # current option list would render off-screen.
+  if [ "$selected" -lt 0 ] || [ "$selected" -ge "$count" ]; then
+    selected=0
+  fi
+  # Auto-reset so the next arrow_choice gets a clean default.
+  _ARROW_DEFAULT=0
   local key key2
 
   printf "${BOLD}%s${NC}\n" "$prompt"
@@ -155,10 +166,17 @@ ask() {
 }
 
 ask_path() {
-  # ask_path <prompt> <var> — keeps asking until the file exists
-  local prompt="$1" var="$2" path
+  # ask_path <prompt> <var> [<default>] — keeps asking until the file exists.
+  # If a default is given and the user presses Enter, the default is used
+  # (provided that file actually exists; otherwise we ask again).
+  local prompt="$1" var="$2" default="${3:-}" path
   while true; do
-    read -rp "$(printf "${BOLD}%s${NC}: " "$prompt")" path
+    if [ -n "$default" ]; then
+      read -rp "$(printf "${BOLD}%s${NC} [%s]: " "$prompt" "$default")" path
+      [ -z "$path" ] && path="$default"
+    else
+      read -rp "$(printf "${BOLD}%s${NC}: " "$prompt")" path
+    fi
     path="${path/#\~/$HOME}"
     if [ -f "$path" ]; then
       eval "$var=\"$path\""
@@ -210,12 +228,48 @@ ENV_FILE="$AGENT_DIR/.env"
 cd "$AGENT_DIR"
 
 
+# ── load any pre-existing .env so re-runs preserve choices ──────
+# When the user re-runs install.sh, every prompt should default to
+# whatever they picked last time — not the fresh-install defaults.
+# Sourcing the prior .env into the shell sets DATABASE_URL,
+# DEFAULT_PROVIDER, SIMULATION_SERVER_URL, STORAGE_BACKEND, etc. as
+# env vars; the prompts later in the script consult them to compute
+# arrow defaults and ``ask`` fallbacks.
+PREFILLED=0
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+  PREFILLED=1
+fi
+
+# Snapshot prior values into ``PREV_*`` so later assignments inside the
+# wizard (eg ``STORAGE_BACKEND="local"`` resetting before the prompt)
+# don't clobber what the user picked last time.  Every prompt computes
+# its default from the matching ``PREV_*`` variable below.
+PREV_DATABASE_URL="${DATABASE_URL:-}"
+PREV_DEFAULT_PROVIDER="${DEFAULT_PROVIDER:-}"
+PREV_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+PREV_VERTEX_PROJECT="${VERTEX_PROJECT:-}"
+PREV_GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS:-}"
+PREV_OLLAMA_HOST="${OLLAMA_HOST:-}"
+PREV_SIM_SERVER_URL="${SIMULATION_SERVER_URL:-}"
+PREV_STORAGE_BACKEND="${STORAGE_BACKEND:-}"
+PREV_STORAGE_BUCKET="${STORAGE_BUCKET:-}"
+PREV_NEON_AUTH_URL="${NEON_AUTH_BASE_URL:-}"
+
+
 # ══════════════════════════════════════════════════════════════
 # 1. Welcome
 # ══════════════════════════════════════════════════════════════
 echo
 printf "${BOLD}simd-agent installer${NC}\n"
-printf "${DIM}↑/↓ to move, Enter to confirm.${NC}\n"
+if [ "$PREFILLED" -eq 1 ]; then
+  printf "${DIM}↑/↓ to move, Enter to confirm.  prior .env detected — your previous choices are pre-selected.${NC}\n"
+else
+  printf "${DIM}↑/↓ to move, Enter to confirm.${NC}\n"
+fi
 echo
 
 
@@ -239,6 +293,11 @@ esac
 # ══════════════════════════════════════════════════════════════
 header "LLM provider"
 
+case "$PREV_DEFAULT_PROVIDER" in
+  vertex) _ARROW_DEFAULT=1 ;;
+  ollama) _ARROW_DEFAULT=2 ;;
+  gemini|*) _ARROW_DEFAULT=0 ;;
+esac
 arrow_choice "which LLM provider?" \
   "Gemini  — Google AI Studio (easiest, has a daily cap)" \
   "Vertex  — GCP Vertex AI (no daily cap, needs a service-account JSON)" \
@@ -252,8 +311,11 @@ OLLAMA_HOST=""
 case "$_ARROW_INDEX" in
   0)
     LLM_PROVIDER="gemini"
+    # Reuse the prior key as the default; an empty default still
+    # loops until the user enters something non-empty.
     while [ -z "$GEMINI_API_KEY" ]; do
-      ask "Gemini API key (https://aistudio.google.com/apikey)" "" GEMINI_API_KEY
+      ask "Gemini API key (https://aistudio.google.com/apikey)" \
+          "$PREV_GEMINI_API_KEY" GEMINI_API_KEY
       [ -z "$GEMINI_API_KEY" ] && err "a Gemini API key is required."
     done
     ok "Gemini configured"
@@ -261,7 +323,8 @@ case "$_ARROW_INDEX" in
   1)
     LLM_PROVIDER="vertex"
     ask_path "path to GCP service-account JSON (e.g. ~/.gcp/key.json)" \
-             GOOGLE_APPLICATION_CREDENTIALS
+             GOOGLE_APPLICATION_CREDENTIALS \
+             "$PREV_GOOGLE_APPLICATION_CREDENTIALS"
     # The project_id is inside the JSON — extract it via python.
     VERTEX_PROJECT="$(python3 -c "
 import json, sys
@@ -278,7 +341,7 @@ except Exception as e:
     ;;
   2)
     LLM_PROVIDER="ollama"
-    ask "Ollama host URL" "http://localhost:11434" OLLAMA_HOST
+    ask "Ollama host URL" "${PREV_OLLAMA_HOST:-http://localhost:11434}" OLLAMA_HOST
     ok "Ollama configured: $OLLAMA_HOST"
     ;;
 esac
@@ -292,7 +355,7 @@ header "simulation runner"
 echo "  the OpenFOAM runner is a separate service (simd-ai/simulation_server)."
 echo "  enter the URL where it's reachable from here."
 echo
-ask "simulation runner URL" "http://localhost:9000" SIM_SERVER_URL
+ask "simulation runner URL" "${PREV_SIM_SERVER_URL:-http://localhost:9000}" SIM_SERVER_URL
 
 
 # ══════════════════════════════════════════════════════════════
@@ -300,6 +363,7 @@ ask "simulation runner URL" "http://localhost:9000" SIM_SERVER_URL
 # ══════════════════════════════════════════════════════════════
 header "object storage"
 
+[ "$PREV_STORAGE_BACKEND" = "gcs" ] && _ARROW_DEFAULT=1 || _ARROW_DEFAULT=0
 arrow_choice "where do meshes, VTPs, and case ZIPs live?" \
   "Local filesystem (default — no setup needed)" \
   "Google Cloud Storage (requires a bucket)"
@@ -309,11 +373,12 @@ STORAGE_BUCKET=""
 
 if [ "$_ARROW_INDEX" -eq 1 ]; then
   STORAGE_BACKEND="gcs"
-  ask "GCS bucket name" "" STORAGE_BUCKET
+  ask "GCS bucket name" "$PREV_STORAGE_BUCKET" STORAGE_BUCKET
 
   # Reuse the SA JSON from the Vertex step if present.
   if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
-    ask_path "path to GCS service-account JSON" GOOGLE_APPLICATION_CREDENTIALS
+    ask_path "path to GCS service-account JSON" GOOGLE_APPLICATION_CREDENTIALS \
+             "$PREV_GOOGLE_APPLICATION_CREDENTIALS"
   else
     info "reusing the SA JSON from the LLM provider step"
   fi
@@ -328,13 +393,14 @@ fi
 # ══════════════════════════════════════════════════════════════
 header "authentication"
 
+[ -n "$PREV_NEON_AUTH_URL" ] && _ARROW_DEFAULT=1 || _ARROW_DEFAULT=0
 arrow_choice "auth mode" \
   "Open      — no authentication (single local user, default)" \
   "Neon Auth — multi-user, requires a Neon project"
 
 NEON_AUTH_URL=""
 if [ "$_ARROW_INDEX" -eq 1 ]; then
-  ask "Neon Auth base URL" "" NEON_AUTH_URL
+  ask "Neon Auth base URL" "$PREV_NEON_AUTH_URL" NEON_AUTH_URL
   ok "Neon Auth configured"
 else
   ok "authentication disabled (single-user mode)"
@@ -346,7 +412,33 @@ fi
 # ══════════════════════════════════════════════════════════════
 header "database"
 
+# Classify the previous DATABASE_URL so we can re-select the same option.
+# The mapping is intentionally lossy — eg an unknown postgres URL maps
+# to "external" (docker) or "local" (bare metal), which is the right
+# fallback for any free-form connection string.
+classify_db_url() {
+  local url="$1" mode="$2"
+  case "$url" in
+    sqlite*) echo 0 ;;
+    *)
+      if [ "$mode" = "docker" ]; then
+        case "$url" in
+          *@postgres:*)         echo 1 ;;  # bundled
+          *)                    echo 2 ;;  # external
+        esac
+      else
+        case "$url" in
+          *@localhost:5432/simd) echo 1 ;; # container we manage
+          *.neon.tech*)          echo 2 ;; # Neon
+          *)                     echo 3 ;; # local install / custom
+        esac
+      fi
+      ;;
+  esac
+}
+
 if [ "$DEPLOY_MODE" = "docker" ]; then
+  _ARROW_DEFAULT=$(classify_db_url "$PREV_DATABASE_URL" docker)
   arrow_choice "database" \
     "SQLite   — single file, zero setup (recommended for local installs)" \
     "Postgres — bundled container ships with the stack" \
@@ -365,12 +457,14 @@ if [ "$DEPLOY_MODE" = "docker" ]; then
       ok "using bundled Postgres container"
       ;;
     2)
-      ask "PostgreSQL connection URL (postgresql://user:pass@host/db)" "" DATABASE_URL
+      ask "PostgreSQL connection URL (postgresql://user:pass@host/db)" \
+          "$PREV_DATABASE_URL" DATABASE_URL
       DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
       ok "external database configured"
       ;;
   esac
 else
+  _ARROW_DEFAULT=$(classify_db_url "$PREV_DATABASE_URL" bare-metal)
   arrow_choice "database" \
     "SQLite — single file at ~/.simd/simd.db (recommended, zero setup)" \
     "Postgres — run a container now (we'll do docker run for you)" \
@@ -409,13 +503,14 @@ else
       ;;
     2)  # Neon
       ask "Neon connection URL (postgresql://user:pass@ep-xxx.neon.tech/db)" \
-          "" DATABASE_URL
+          "$PREV_DATABASE_URL" DATABASE_URL
       DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
       ok "Neon database configured"
       ;;
     3)  # Local Postgres (already running)
       ask "PostgreSQL connection URL" \
-          "postgresql+asyncpg://simd:simd@localhost:5432/simd" DATABASE_URL
+          "${PREV_DATABASE_URL:-postgresql+asyncpg://simd:simd@localhost:5432/simd}" \
+          DATABASE_URL
       DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
       ok "using local Postgres at $DATABASE_URL"
       ;;
