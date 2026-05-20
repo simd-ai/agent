@@ -88,6 +88,27 @@ class PostgresRepository(BaseRepository):
                 out[k] = v
         return out
 
+    def _deserialize(self, row: dict[str, Any] | None) -> dict[str, Any] | None:
+        """JSON-decode columns listed in ``json_columns`` on SQLite reads.
+
+        Postgres+asyncpg returns JSONB columns as Python dicts/lists
+        automatically.  SQLite stores the same data as TEXT and returns
+        bare strings — callers expect dicts, so decode here once at
+        the boundary.  No-op on Postgres; idempotent on already-decoded
+        values so it's safe even if a column comes back pre-parsed.
+        """
+        if row is None or not self.json_columns or not is_sqlite():
+            return row
+        out = dict(row)
+        for col in self.json_columns:
+            v = out.get(col)
+            if isinstance(v, str):
+                try:
+                    out[col] = json.loads(v)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        return out
+
     async def get_by_id(self, id: UUID) -> dict[str, Any] | None:
         async with get_session() as session:
             result = await session.execute(
@@ -95,7 +116,7 @@ class PostgresRepository(BaseRepository):
                 {"id": id},
             )
             row = result.mappings().one_or_none()
-            return dict(row) if row else None
+            return self._deserialize(dict(row)) if row else None
 
     async def list(
         self,
@@ -121,7 +142,7 @@ class PostgresRepository(BaseRepository):
                 text(f"SELECT {self._select_cols} FROM {self.table} {where} ORDER BY {order_by} {limit_clause}"),
                 params,
             )
-            return [dict(row) for row in result.mappings().all()]
+            return [self._deserialize(dict(row)) for row in result.mappings().all()]
 
     async def create(self, data: dict[str, Any]) -> dict[str, Any]:
         serialized = self._serialize(data)
@@ -140,7 +161,7 @@ class PostgresRepository(BaseRepository):
                 text(f"INSERT INTO {self.table} ({cols}) VALUES ({placeholders}) RETURNING {self._select_cols}"),
                 serialized,
             )
-            return dict(result.mappings().one())
+            return self._deserialize(dict(result.mappings().one()))
 
     async def update(self, id: UUID, data: dict[str, Any]) -> dict[str, Any] | None:
         if not data:
@@ -156,7 +177,7 @@ class PostgresRepository(BaseRepository):
                 serialized,
             )
             row = result.mappings().one_or_none()
-            return dict(row) if row else None
+            return self._deserialize(dict(row)) if row else None
 
     async def delete(self, id: UUID) -> bool:
         async with get_session() as session:
@@ -195,13 +216,13 @@ class PostgresRepository(BaseRepository):
                 """),
                 serialized,
             )
-            return dict(result.mappings().one())
+            return self._deserialize(dict(result.mappings().one()))
 
     async def execute_raw(self, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Escape hatch for complex queries that don't fit the standard patterns."""
         async with get_session() as session:
             result = await session.execute(text(query), params or {})
-            return [dict(row) for row in result.mappings().all()]
+            return [self._deserialize(dict(row)) for row in result.mappings().all()]
 
     async def execute_raw_one(self, query: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """Execute a raw query expecting zero or one result."""

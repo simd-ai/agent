@@ -20,6 +20,23 @@ from simd_agent.models import (
 )
 
 
+def _maybe_json_decode(value: Any) -> Any:
+    """Decode a JSON-text column into Python if needed.
+
+    Postgres+asyncpg auto-decodes JSONB columns to dict/list at the
+    driver level.  SQLite stores the same data as TEXT and returns
+    bare strings, so callers reading those columns have to decode
+    themselves.  This helper is a no-op when the value is already
+    decoded, so call sites can use it unconditionally.
+    """
+    if value is None or not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return value
+
+
 class EventStore:
     """Handles persistence of runs and events to Postgres."""
     
@@ -343,10 +360,10 @@ class EventStore:
                 provider=row.get("provider") or "unknown",
                 prompt_pack=row.get("prompt_pack") or "simd",
                 user_requirements=row.get("user_requirements") or "",
-                simulation_config=row.get("simulation_config") or {},
-                validated_config=row.get("validated_config"),
+                simulation_config=_maybe_json_decode(row.get("simulation_config")) or {},
+                validated_config=_maybe_json_decode(row.get("validated_config")),
                 attempts=row.get("attempts") or 0,
-                result=row.get("result"),
+                result=_maybe_json_decode(row.get("result")),
             )
     
     async def get_events(self, run_id: UUID) -> list[EventRow]:
@@ -374,7 +391,7 @@ class EventStore:
                     level=EventLevel(row["level"]),
                     type=row["type"],
                     message=row["message"],
-                    payload=row["payload"] or {},
+                    payload=_maybe_json_decode(row["payload"]) or {},
                 )
                 for row in rows
             ]
@@ -407,7 +424,7 @@ class EventStore:
                     level=EventLevel(row["level"]),
                     type=row["type"],
                     message=row["message"],
-                    payload=row["payload"] or {},
+                    payload=_maybe_json_decode(row["payload"]) or {},
                 )
                 for row in rows
             ]

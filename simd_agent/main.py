@@ -820,9 +820,15 @@ async def get_run_summary(run_id: str, request: Request) -> dict[str, Any]:
         f"{base}/api/runs/{run_id}/vtk-results" if sim_run_id else None
     )
 
-    started_at = run.started_at.isoformat() if run.started_at else None
+    # ``RunRow`` doesn't declare ``started_at`` / ``completed_at``; only
+    # ``created_at`` is on the model.  Use getattr-with-fallback for both
+    # so accessing an undeclared field doesn't AttributeError, then call
+    # ``.isoformat()`` only if the value is a real datetime.
+    _started = getattr(run, "started_at", None) or run.created_at
+    _completed = getattr(run, "completed_at", None)
+    started_at = _started.isoformat() if hasattr(_started, "isoformat") else _started
     completed_at = (
-        run.completed_at.isoformat() if getattr(run, "completed_at", None) else None
+        _completed.isoformat() if hasattr(_completed, "isoformat") else _completed
     )
 
     return {

@@ -315,13 +315,17 @@ def normalize_solver(raw: dict[str, Any] | str | None, top_level: dict[str, Any]
     if not isinstance(solver_type, str) or not solver_type:
         solver_type = "simpleFoam"
     
+    # ``data.get(key, default)`` only falls back when ``key`` is missing —
+    # an explicit ``None`` value (which the CLI sends for unset solver
+    # fields) bypasses the default and would make ``int(None)`` raise.
+    # Use ``or`` to coalesce both missing-and-null to the default.
     return SolverV1(
         type=solver_type,
-        max_iterations=int(data.get("max_iterations", 1000)),
-        convergence_criteria=float(data.get("convergence_criteria", 1e-6)),
+        max_iterations=int(data.get("max_iterations") or 1000),
+        convergence_criteria=float(data.get("convergence_criteria") or 1e-6),
         end_time=data.get("end_time"),
         delta_t=data.get("delta_t"),
-        write_interval=int(data.get("write_interval", 100)),
+        write_interval=int(data.get("write_interval") or 100),
     )
 
 
