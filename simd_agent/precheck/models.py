@@ -14,29 +14,37 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class MeshPatch(BaseModel):
     name: str
-    type: str  # "wall" | "patch" | "empty" | "symmetry" …
+    # The OpenFOAM patch type ("wall" | "patch" | "empty" | "symmetry"
+    # …).  The frontend supplies this; the CLI doesn't (it only has the
+    # raw .msh and OF infers the type later).  Default to "patch" so
+    # the looser CLI shape doesn't trip strict validation.
+    type: str = "patch"
     n_cells: int = Field(alias="nCells", default=0)
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
 
 class CheckMeshInfo(BaseModel):
-    cells: int
-    faces: int
-    points: int
+    cells: int = 0
+    faces: int = 0
+    points: int = 0
     bounding_box: dict[str, list[float]] | None = Field(alias="boundingBox", default=None)
     characteristic_length: float | None = Field(alias="characteristicLength", default=None)
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
 
 class MeshInfo(BaseModel):
     mesh_id: str = Field(alias="meshId")
-    file_name: str = Field(alias="fileName")
-    patches: list[MeshPatch]
-    check_mesh: CheckMeshInfo = Field(alias="checkMesh")
+    # ``file_name`` and ``check_mesh`` are nice-to-haves: the frontend
+    # ships them after running ``checkMesh``, but the CLI submits raw
+    # meshes that haven't been checked yet.  Default both so the same
+    # request shape works from either caller.
+    file_name: str = Field(alias="fileName", default="")
+    patches: list[MeshPatch] = Field(default_factory=list)
+    check_mesh: CheckMeshInfo = Field(alias="checkMesh", default_factory=CheckMeshInfo)
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
 
 class PrecheckRequest(BaseModel):
