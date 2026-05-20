@@ -590,104 +590,30 @@ else
 
   header "setup complete"
 
-  arrow_choice "what next?" \
-    "Start the agent in the background now (and optionally run an example)" \
-    "Show me the two-terminal commands — I'll start things myself"
+  cat <<EOF
 
-  if [ "$_ARROW_INDEX" -eq 0 ]; then
-    # ── start uvicorn in the background ──────────────────────
-    PID_FILE="$AGENT_DIR/.uvicorn.pid"
-    LOG_FILE="$AGENT_DIR/uvicorn.log"
-
-    # If a prior uvicorn is alive, kill it — we just wrote a fresh
-    # .env and the old process is still holding the previous env
-    # vars in memory (DATABASE_URL, LLM provider, …).  Reusing it
-    # would leave the user staring at "ConnectionRefused" against
-    # whatever database the old config pointed at.
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-      OLD_PID=$(cat "$PID_FILE")
-      info "stopping previous uvicorn (PID $OLD_PID) so the new .env takes effect …"
-      kill "$OLD_PID" 2>/dev/null || true
-      # Give it a moment to release port 8000 before we restart.
-      for _ in $(seq 1 10); do
-        kill -0 "$OLD_PID" 2>/dev/null || break
-        sleep 0.3
-      done
-      # If it's stubborn, force it.
-      kill -9 "$OLD_PID" 2>/dev/null || true
-    fi
-    info "starting uvicorn in the background …"
-    # Detach from the script's stdin/stdout so it survives after install.sh exits.
-    nohup "$AGENT_DIR/.venv/bin/uvicorn" simd_agent.main:app --port 8000 \
-      > "$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
-    ok "uvicorn started (PID $(cat "$PID_FILE")), logs at uvicorn.log"
-
-    info "waiting for the agent to come up …"
-    for i in $(seq 1 30); do
-      if curl -sf http://localhost:8000/health >/dev/null 2>&1; then
-        ok "agent ready at http://localhost:8000"
-        break
-      fi
-      [ "$i" -eq 30 ] && fail "agent didn't respond within 30s.  check uvicorn.log"
-      sleep 1
-    done
-
-    echo
-    arrow_choice "run an example now?" \
-      "u-shape-pipe        (compressible inverted-U duct)" \
-      "z-bend              (transient turbulent water flow)" \
-      "inner-outer-pipe    (2D LN2/water regasifier — multi-region CHT)" \
-      "cylindrical-cht     (natural convection — Boussinesq)" \
-      "Skip — I'll run simd commands myself"
-
-    case "$_ARROW_INDEX" in
-      0) EX="u-shape-pipe" ;;
-      1) EX="z-bend" ;;
-      2) EX="inner-outer-pipe" ;;
-      3) EX="cylindrical-cht" ;;
-      4) EX="" ;;
-    esac
-
-    if [ -n "$EX" ]; then
-      echo
-      simd run "examples/$EX/prompt.txt" "examples/$EX/mesh/$EX.msh" || \
-        warn "simd run exited non-zero — see the logs above"
-    fi
-
-    cat <<EOF
-
-  the agent keeps running in the background.
-
-    stop it:           kill \$(cat "$PID_FILE")
-    tail its logs:     tail -f "$LOG_FILE"
-    check status:      simd status
-    run more examples: simd run <prompt.txt> <mesh.msh>
-
-EOF
-  else
-    # ── print the manual commands ────────────────────────────
-    cat <<EOF
-
-  next steps:
+  next steps — two terminals:
 
     # terminal 1 — start the agent (keeps running)
+    cd $AGENT_DIR
     source .venv/bin/activate
     uvicorn simd_agent.main:app --port 8000
 
-    # terminal 2 — run an example
+    # terminal 2 — run an example (pick one)
+    cd $AGENT_DIR
     source .venv/bin/activate
-    simd run examples/u-shape-pipe/prompt.txt \\
-             examples/u-shape-pipe/mesh/u-shape-pipe.msh
+    simd run examples/u-shape-pipe/prompt.txt     examples/u-shape-pipe/mesh/u-shape-pipe.msh
+    simd run examples/z-bend/prompt.txt           examples/z-bend/mesh/z-bend.msh
+    simd run examples/inner-outer-pipe/prompt.txt examples/inner-outer-pipe/mesh/inner-outer-pipe.msh
+    simd run examples/cylindrical-cht/prompt.txt  examples/cylindrical-cht/mesh/cylindrical-cht.msh
 
   to see what's wired up:
     simd status
 
-  to deactivate the venv:
+  to deactivate the venv when you're done:
     deactivate
 
 EOF
-  fi
 fi
 
 
