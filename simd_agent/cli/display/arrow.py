@@ -1,14 +1,22 @@
-"""Arrow-key menu for interactive CLI prompts.
+"""Arrow-key menu — thin wrapper around ``questionary``.
 
-Mirrors the bash implementation in ``install.sh`` — ↑/↓ to move,
-Enter to confirm, ``q`` or Ctrl-C to cancel, ``1``–``9`` for
-direct hotkeys, vim's ``j``/``k`` also work.  No external deps;
-uses ``termios`` for raw stdin and ANSI escapes for cursor
-control.
+Earlier we hand-rolled this with termios + ANSI escapes and ran into
+the classic raw-mode bug where ``\\n`` no longer translates to
+``\\r\\n``, so redraws drifted to the right on every keystroke.
+``questionary`` (built on ``prompt_toolkit``) handles all the terminal
+state correctly across macOS / Linux / various $TERM values, so we
+delegate to it and keep the same ``arrow_choice(prompt, options) -> int``
+signature the call sites already use.
 
-The visual style (bold cyan caret + bold selected text + dim
-help hint) deliberately matches the bash wizard so the two
-flows feel like one tool.
+The visual style we ask for:
+
+  ? prompt
+    option a
+  ❯ option b
+    option c
+
+Non-TTY stdin (CI pipes, scripted runs) falls back to a numbered
+prompt — same behavior as before.
 """
 
 from __future__ import annotations
@@ -25,82 +33,44 @@ __all__ = ["arrow_choice"]
 def arrow_choice(prompt: str, options: Sequence[str]) -> int:
     """Show an arrow-key menu, return the 0-based index of the choice.
 
-    Raises ``KeyboardInterrupt`` if the user cancels (``q`` or Ctrl-C).
-    Falls back to plain ``input()`` numbered selection on non-TTY
-    stdin so the function still works in pipes / CI.
+    Raises ``KeyboardInterrupt`` when the user cancels (Ctrl-C, or
+    Esc / answering ``None``).  Falls back to a plain numbered prompt
+    on non-TTY stdin so the same call site works in scripts and CI.
     """
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return _numbered_fallback(prompt, options)
 
-    # Import here so non-TTY paths don't require termios (Windows
-    # users see the fallback instead of an ImportError).
-    import termios
-    import tty
+    # Import lazily — keeps non-TTY callers (and unit tests) from
+    # paying the prompt_toolkit startup cost.
+    import questionary
+    from questionary import Style
 
-    n = len(options)
-    selected = 0
+    style = Style([
+        ("qmark",       "fg:cyan bold"),
+        ("question",    "bold"),
+        ("pointer",     "fg:cyan bold"),
+        ("highlighted", "fg:cyan bold"),
+        ("selected",    "fg:cyan bold"),
+        ("instruction", "italic"),
+    ])
 
-    console.print(f"[bold]{prompt}[/]")
-    console.print("[dim]  (↑/↓ to move, Enter to select, q to quit)[/]")
+    choices = [
+        questionary.Choice(title=opt, value=i)
+        for i, opt in enumerate(options)
+    ]
+    answer = questionary.select(
+        prompt,
+        choices=choices,
+        use_indicator=True,
+        instruction="(↑/↓ to move, Enter to select)",
+        qmark="?",
+        style=style,
+    ).ask()
 
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-
-    try:
-        sys.stdout.write("\x1b[?25l")  # hide cursor
-        sys.stdout.flush()
-
-        _draw(options, selected)
-        tty.setraw(fd)
-
-        while True:
-            ch = sys.stdin.read(1)
-
-            if ch == "\x1b":
-                # ESC sequence — could be arrow key or just ESC alone.
-                # Read two more chars; if they don't form an arrow,
-                # ignore (e.g. lone ESC).
-                rest = sys.stdin.read(2)
-                if rest == "[A":
-                    selected = (selected - 1) % n
-                elif rest == "[B":
-                    selected = (selected + 1) % n
-                # other escape sequences: ignore
-            elif ch in ("\r", "\n"):
-                break
-            elif ch == "k":
-                selected = (selected - 1) % n
-            elif ch == "j":
-                selected = (selected + 1) % n
-            elif ch.isdigit() and 1 <= int(ch) <= n:
-                selected = int(ch) - 1
-                break
-            elif ch in ("q", "\x03"):  # q or Ctrl-C
-                raise KeyboardInterrupt()
-            else:
-                continue  # don't redraw on no-op keys
-
-            # Move cursor back to the top of the menu and redraw.
-            sys.stdout.write(f"\x1b[{n}A")
-            sys.stdout.flush()
-            _draw(options, selected)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        sys.stdout.write("\x1b[?25h")  # show cursor
-        sys.stdout.flush()
-
-    return selected
-
-
-def _draw(options: Sequence[str], selected: int) -> None:
-    for i, opt in enumerate(options):
-        # \x1b[2K clears the current line so longer-then-shorter
-        # strings don't leave trailing garbage on re-draw.
-        sys.stdout.write("\x1b[2K")
-        if i == selected:
-            console.print(f"  [bold cyan]❯[/] [bold]{opt}[/]")
-        else:
-            console.print(f"    {opt}")
+    # ``ask()`` returns None when the user cancels (Ctrl-C / Esc).
+    if answer is None:
+        raise KeyboardInterrupt()
+    return answer
 
 
 def _numbered_fallback(prompt: str, options: Sequence[str]) -> int:
