@@ -49,40 +49,41 @@ agent, and the frontend.
 quick start
 -----------
 
-    git clone https://github.com/simd-ai/simd-agent
-    cd simd-agent
+    git clone https://github.com/simd-ai/agent
+    cd agent
     ./install.sh
 
-`install.sh` generates `.env`, prompts for your Gemini key (or accepts
-`--vertex` / `--ollama`), pulls the published images from GHCR, and
-brings up Postgres + OpenFOAM + the agent + the frontend. When it
-finishes, open http://localhost:3000.
-
-If you'd rather do it by hand:
-
-    cp .env.example .env       # edit GEMINI_API_KEY, save
-    docker compose -f docker/docker-compose.yml up -d
-
-Bare-metal installation (Python venv, system OpenFOAM, external
-Postgres) is in Documentation/installation.md.
+``install.sh`` is an interactive wizard.  Pick **Docker mode** if
+you'd rather run everything in containers (postgres + agent come up
+via ``docker compose``), or **bare-metal mode** if you'd rather use
+a Python venv on this machine.  Either way it asks for your LLM
+key, the simulation runner URL, and where to store results — then
+writes ``.env`` and either starts the stack (Docker) or runs
+``simd init`` to configure the CLI (bare-metal).
 
 
 CLI
 ---
 
-A ``simd`` command-line client ships in this repo. Install it with
-``pip install -e .`` and run:
+A ``simd`` command-line client ships in this repo.  In bare-metal
+mode, ``install.sh`` sets it up automatically.  Once it finishes,
+two commands:
 
-    simd init                                # interactive setup
+    # terminal 1 — start the agent
+    source .venv/bin/activate
+    uvicorn simd_agent.main:app --port 8000
+
+    # terminal 2 — run an example
+    source .venv/bin/activate
     simd run examples/u-shape-pipe/prompt.txt \
              examples/u-shape-pipe/mesh/u-shape-pipe.msh
 
 ``simd init`` asks where each component should run (bundled docker,
 bare-metal local, or remote) and writes the config; ``simd run``
-auto-starts the backend when needed, then walks you through mesh
-upload, precheck, interactive patch review, and the five-stage
-progress display.  No login, no account, no tracking.  Same backend
-as the frontend.  Full reference: Documentation/cli.md.
+auto-starts the backend when needed, walks you through mesh upload,
+precheck, interactive patch review, and the five-stage progress
+display.  No login, no account, no tracking.  Same backend as the
+frontend.  Full reference: Documentation/cli.md.
 
 
 how it works

@@ -1,103 +1,177 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════
-# SIMD Agent — Interactive Installer
+# simd-agent — interactive installer
 # ══════════════════════════════════════════════════════════════
-# Sets up the full SIMD Agent stack:
-#   - Backend  (simd-ai/agent)
-#   - Frontend (simd-ai/ui)
-#   - Runner   (OpenFOAM simulation server)
-#   - Postgres
+# Two deployment modes:
 #
-# Supports two deployment modes:
-#   1. Docker  — docker compose up (recommended)
-#   2. Bare metal — Python venv + Node.js + local Postgres
+#   1) Docker      — postgres + agent in containers via
+#                    docker compose.  Easiest if you already
+#                    have Docker.  Frontend and OpenFOAM runner
+#                    are separate repos; install them later if
+#                    you want them.
+#
+#   2) Bare metal  — Python venv + pip install -e . + simd init.
+#                    Bring your own Postgres (or run one in a
+#                    container).  Point at a remote runner.
+#
+# Re-run safely — every step is idempotent.
 # ══════════════════════════════════════════════════════════════
 
 set -euo pipefail
 
-# ── Colors ───────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
 
-info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
-success() { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-error()   { echo -e "${RED}[ERROR]${NC} $*"; }
-header()  { echo -e "\n${BOLD}${CYAN}── $* ──${NC}\n"; }
+# ── output helpers ──────────────────────────────────────────────
+if [ -t 1 ]; then
+  BOLD=$'\033[1m'; NC=$'\033[0m'
+  GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; RED=$'\033[0;31m'
+  CYAN=$'\033[0;36m'; BLUE=$'\033[0;34m'
+else
+  BOLD=""; NC=""; GREEN=""; YELLOW=""; RED=""; CYAN=""; BLUE=""
+fi
 
-# ── Resolve paths ────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AGENT_DIR="$SCRIPT_DIR"
-UI_DIR="$AGENT_DIR/../ui"
-SIM_SERVER_DIR="$AGENT_DIR/../simulation_server"
-ENV_FILE="$AGENT_DIR/.env"
+info()    { printf "${BLUE}[INFO]${NC}  %s\n" "$*"; }
+ok()      { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
+warn()    { printf "${YELLOW}[WARN]${NC}  %s\n" "$*"; }
+err()     { printf "${RED}[ERROR]${NC} %s\n" "$*" >&2; }
+fail()    { err "$*"; exit 1; }
+header()  { printf "\n${BOLD}${CYAN}── %s ──${NC}\n\n" "$*"; }
+hint()    { printf "    ${CYAN}→${NC} %s\n" "$*"; }
 
-# ══════════════════════════════════════════════════════════════
-# Helper: prompt with default
-# ══════════════════════════════════════════════════════════════
+
+# ── prompt helpers ──────────────────────────────────────────────
 ask() {
-  local prompt="$1" default="$2" var="$3"
+  # ask <prompt> <default> <var>
+  local prompt="$1" default="$2" var="$3" input
   if [ -n "$default" ]; then
-    read -rp "$(echo -e "${BOLD}$prompt${NC} [$default]: ")" input
+    read -rp "$(printf "${BOLD}%s${NC} [%s]: " "$prompt" "$default")" input
     eval "$var=\"${input:-$default}\""
   else
-    read -rp "$(echo -e "${BOLD}$prompt${NC}: ")" input
+    read -rp "$(printf "${BOLD}%s${NC}: " "$prompt")" input
     eval "$var=\"$input\""
   fi
 }
 
 ask_yes_no() {
-  local prompt="$1" default="$2"
-  local yn
-  read -rp "$(echo -e "${BOLD}$prompt${NC} [${default}]: ")" yn
-  yn="${yn:-$default}"
-  [[ "$yn" =~ ^[Yy] ]]
+  # ask_yes_no <prompt> <default Y/N>
+  local prompt="$1" default="${2:-Y}" answer
+  read -rp "$(printf "${BOLD}%s${NC} [%s/%s]: " "$prompt" \
+              "$( [ "$default" = "Y" ] && echo "Y" || echo "y")" \
+              "$( [ "$default" = "Y" ] && echo "n" || echo "N")")" answer
+  answer="${answer:-$default}"
+  [[ "$answer" =~ ^[Yy]$ ]]
 }
+
+ask_choice() {
+  # ask_choice <prompt> <regex> <default> <var>
+  local prompt="$1" pattern="$2" default="$3" var="$4" input
+  while true; do
+    read -rp "$(printf "${BOLD}%s${NC} [%s]: " "$prompt" "$default")" input
+    input="${input:-$default}"
+    if [[ "$input" =~ $pattern ]]; then
+      eval "$var=\"$input\""
+      return
+    fi
+    err "invalid choice: $input"
+  done
+}
+
+
+# ── locate ourselves ────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AGENT_DIR="$SCRIPT_DIR"
+ENV_FILE="$AGENT_DIR/.env"
+cd "$AGENT_DIR"
+
 
 # ══════════════════════════════════════════════════════════════
 # 1. Welcome
 # ══════════════════════════════════════════════════════════════
-echo ""
-echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${CYAN}║          SIMD Agent — Installation Wizard           ║${NC}"
-echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
-echo ""
-echo "This script will set up the SIMD Agent stack."
-echo "You'll be asked a few questions to configure your deployment."
-echo ""
+echo
+printf "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗${NC}\n"
+printf "${BOLD}${CYAN}║          simd-agent — installation wizard           ║${NC}\n"
+printf "${BOLD}${CYAN}╚══════════════════════════════════════════════════════╝${NC}\n"
+echo
+echo "  this script will set up the simd-agent stack."
+echo "  you'll be asked a few questions to configure your deployment."
+echo
+
 
 # ══════════════════════════════════════════════════════════════
-# 2. Gather configuration
+# 2. Deployment mode (Docker or Bare metal)
 # ══════════════════════════════════════════════════════════════
-header "LLM Provider"
+header "deployment mode"
+
+echo "  1) Docker     — postgres + agent in containers (recommended"
+echo "                  if you already have Docker installed)"
+echo "  2) Bare metal — Python venv on this machine, you run uvicorn"
+echo
+ask_choice "choose deployment mode" "^[12]$" "1" DEPLOY_CHOICE
+
+if [ "$DEPLOY_CHOICE" = "1" ]; then
+  DEPLOY_MODE="docker"
+  ok "Docker deployment selected"
+else
+  DEPLOY_MODE="bare-metal"
+  ok "bare-metal deployment selected"
+fi
+
+
+# ══════════════════════════════════════════════════════════════
+# 3. Configuration (asked in both modes)
+# ══════════════════════════════════════════════════════════════
+header "LLM provider"
+
+echo "  1) Gemini  (Google AI Studio — easiest, has a daily cap)"
+echo "  2) Vertex  (GCP Vertex AI — no daily cap, needs SA JSON)"
+echo "  3) Ollama  (local — runs models on this machine)"
+echo
+ask_choice "choose LLM provider" "^[123]$" "1" LLM_CHOICE
 
 GEMINI_API_KEY=""
-while [ -z "$GEMINI_API_KEY" ]; do
-  ask "Gemini API key (get one at https://aistudio.google.com/apikey)" "" GEMINI_API_KEY
-  if [ -z "$GEMINI_API_KEY" ]; then
-    error "A Gemini API key is required."
-  fi
-done
-success "API key set"
+VERTEX_PROJECT=""
+GOOGLE_APPLICATION_CREDENTIALS=""
+OLLAMA_HOST=""
 
-# ── Storage ──────────────────────────────────────────────────
-header "Object Storage"
+if [ "$LLM_CHOICE" = "1" ]; then
+  LLM_PROVIDER="gemini"
+  while [ -z "$GEMINI_API_KEY" ]; do
+    ask "Gemini API key (get one at https://aistudio.google.com/apikey)" "" GEMINI_API_KEY
+    [ -z "$GEMINI_API_KEY" ] && err "a Gemini API key is required."
+  done
+  ok "Gemini configured"
+elif [ "$LLM_CHOICE" = "2" ]; then
+  LLM_PROVIDER="vertex"
+  ask "GCP project ID" "" VERTEX_PROJECT
+  ask "path to service-account JSON" "" GOOGLE_APPLICATION_CREDENTIALS
+  [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ] || fail "file not found: $GOOGLE_APPLICATION_CREDENTIALS"
+  ok "Vertex configured: $VERTEX_PROJECT"
+else
+  LLM_PROVIDER="ollama"
+  ask "Ollama host URL" "http://localhost:11434" OLLAMA_HOST
+  ok "Ollama configured: $OLLAMA_HOST"
+fi
 
-echo "Meshes, simulation results, and case files are stored in object storage."
-echo ""
-echo "  1) Local filesystem (default — no setup needed)"
-echo "  2) Google Cloud Storage (requires a GCS bucket + service account)"
-echo ""
 
-STORAGE_CHOICE=""
-while [[ ! "$STORAGE_CHOICE" =~ ^[12]$ ]]; do
-  ask "Choose storage backend" "1" STORAGE_CHOICE
-done
+header "simulation runner"
+
+echo "  the OpenFOAM runner is a separate service (simd-ai/simulation_server)."
+echo "  options:"
+echo
+echo "    a) point at an existing runner (e.g. a server you already have)"
+echo "    b) install + run it yourself later (we'll skip for now)"
+echo
+ask "simulation runner URL (e.g. http://localhost:9000)" \
+    "http://localhost:9000" SIM_SERVER_URL
+
+
+header "object storage"
+
+echo "  meshes, simulation results, and case files are stored here."
+echo
+echo "  1) local filesystem (default — no setup needed)"
+echo "  2) Google Cloud Storage (requires a bucket + SA JSON)"
+echo
+ask_choice "choose storage backend" "^[12]$" "1" STORAGE_CHOICE
 
 STORAGE_BACKEND="local"
 STORAGE_BUCKET=""
@@ -106,374 +180,256 @@ GCS_KEY_PATH=""
 if [ "$STORAGE_CHOICE" = "2" ]; then
   STORAGE_BACKEND="gcs"
   ask "GCS bucket name" "" STORAGE_BUCKET
-  ask "Path to GCS service account JSON key" "" GCS_KEY_PATH
-
-  if [ ! -f "$GCS_KEY_PATH" ]; then
-    error "File not found: $GCS_KEY_PATH"
-    exit 1
+  if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+    ask "path to GCS service-account JSON" "" GCS_KEY_PATH
+    [ -f "$GCS_KEY_PATH" ] || fail "file not found: $GCS_KEY_PATH"
+    GOOGLE_APPLICATION_CREDENTIALS="$GCS_KEY_PATH"
+  else
+    info "reusing GCS credentials from the LLM provider step"
   fi
-  success "GCS configured: bucket=$STORAGE_BUCKET"
+  ok "GCS configured: $STORAGE_BUCKET"
 else
-  success "Using local filesystem storage"
+  ok "using local filesystem storage"
 fi
 
-# ── Authentication ───────────────────────────────────────────
-header "Authentication"
 
-echo "By default, SIMD Agent runs without authentication (single local user)."
-echo "You can enable Neon Auth for multi-user support."
-echo ""
-echo "  1) Local (no authentication — default)"
-echo "  2) Neon Auth (requires a Neon project)"
-echo ""
+header "authentication"
 
-AUTH_CHOICE=""
-while [[ ! "$AUTH_CHOICE" =~ ^[12]$ ]]; do
-  ask "Choose authentication mode" "1" AUTH_CHOICE
-done
+echo "  by default, simd-agent runs without authentication (single local user)."
+echo "  enable Neon Auth only if you want multi-user support."
+echo
+echo "  1) Open  (no authentication — default)"
+echo "  2) Neon Auth  (requires a Neon project)"
+echo
+ask_choice "choose auth mode" "^[12]$" "1" AUTH_CHOICE
 
-AUTH_DISABLED="true"
 NEON_AUTH_URL=""
-
 if [ "$AUTH_CHOICE" = "2" ]; then
-  AUTH_DISABLED="false"
-  ask "Neon Auth base URL (e.g. https://ep-xxx.neonauth.us-east-1.aws.neon.tech)" "" NEON_AUTH_URL
-  success "Neon Auth configured"
+  ask "Neon Auth base URL" "" NEON_AUTH_URL
+  ok "Neon Auth configured"
 else
-  success "Authentication disabled (single-user mode)"
+  ok "authentication disabled (single-user mode)"
 fi
 
-# ── Database ─────────────────────────────────────────────────
-header "Database"
 
-echo "SIMD Agent uses PostgreSQL for run history and events."
-echo ""
-echo "  1) Bundled Postgres (Docker only — a Postgres container is included)"
-echo "  2) External Postgres (provide your own connection string)"
-echo ""
+header "database"
 
-DB_CHOICE=""
-while [[ ! "$DB_CHOICE" =~ ^[12]$ ]]; do
-  ask "Choose database" "1" DB_CHOICE
-done
+if [ "$DEPLOY_MODE" = "docker" ]; then
+  echo "  1) bundled Postgres  (a postgres container ships with the stack)"
+  echo "  2) external Postgres (Neon, RDS, your own host)"
+  echo
+  ask_choice "choose database" "^[12]$" "1" DB_CHOICE
 
-DATABASE_URL="postgresql://simd:simd@postgres:5432/simd"
-DATABASE_URL_SYNC=""
-
-if [ "$DB_CHOICE" = "2" ]; then
-  ask "PostgreSQL connection URL (postgresql://user:pass@host:5432/dbname)" "" DATABASE_URL
-  success "External database configured"
+  if [ "$DB_CHOICE" = "1" ]; then
+    DATABASE_URL="postgresql+asyncpg://simd:simd@postgres:5432/simd"
+    ok "using bundled Postgres container"
+  else
+    ask "PostgreSQL connection URL (postgresql://user:pass@host/db)" "" DATABASE_URL
+    DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
+    ok "external database configured"
+  fi
 else
-  success "Using bundled Postgres container"
+  echo "  bare-metal mode needs you to have Postgres reachable from this machine."
+  echo "  options:"
+  echo "    a) Neon (managed) — paste your connection string"
+  echo "    b) Local Postgres (brew, apt)"
+  echo "    c) Postgres in a container:"
+  hint "docker run -d --name simd-pg \\"
+  hint "  -e POSTGRES_USER=simd -e POSTGRES_PASSWORD=simd \\"
+  hint "  -e POSTGRES_DB=simd -p 5432:5432 postgres:16-alpine"
+  echo
+  ask "PostgreSQL connection URL" \
+      "postgresql+asyncpg://simd:simd@localhost:5432/simd" DATABASE_URL
+  DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
+  ok "database URL set"
 fi
 
-# ── Deployment ───────────────────────────────────────────────
-header "Deployment Mode"
-
-echo "  1) Docker (recommended — everything runs in containers)"
-echo "  2) Bare metal (Python venv + Node.js on your machine)"
-echo ""
-
-DEPLOY_CHOICE=""
-while [[ ! "$DEPLOY_CHOICE" =~ ^[12]$ ]]; do
-  ask "Choose deployment mode" "1" DEPLOY_CHOICE
-done
-
-if [ "$DEPLOY_CHOICE" = "1" ]; then
-  DEPLOY_MODE="docker"
-  success "Docker deployment selected"
-else
-  DEPLOY_MODE="bare-metal"
-  success "Bare metal deployment selected"
-fi
 
 # ══════════════════════════════════════════════════════════════
-# 3. Clone frontend repo if not present
+# 4. Write .env
 # ══════════════════════════════════════════════════════════════
-header "Frontend (simd-ai/ui)"
-
-if [ -d "$UI_DIR" ]; then
-  info "Frontend repo already exists at $UI_DIR"
-else
-  info "Cloning simd-ai/ui into $UI_DIR ..."
-  git clone https://github.com/simd-ai/ui.git "$UI_DIR"
-  success "Frontend cloned"
-fi
-
-# ══════════════════════════════════════════════════════════════
-# 4. Generate .env
-# ══════════════════════════════════════════════════════════════
-header "Generating .env"
+header "writing .env"
 
 if [ -f "$ENV_FILE" ]; then
   warn ".env already exists — backing up to .env.bak"
   cp "$ENV_FILE" "$ENV_FILE.bak"
 fi
 
-# Build the async DATABASE_URL for the agent (asyncpg)
-AGENT_DATABASE_URL="$DATABASE_URL"
-if [ "$DB_CHOICE" = "1" ]; then
-  # Bundled Postgres: agent uses asyncpg driver inside Docker network
-  AGENT_DATABASE_URL="postgresql+asyncpg://simd:simd@postgres:5432/simd"
-  # Frontend (Next.js) uses sync driver
-  DATABASE_URL_SYNC="postgresql://simd:simd@postgres:5432/simd"
-elif [[ "$DATABASE_URL" == postgresql://* ]]; then
-  # External: convert to asyncpg for the agent
-  AGENT_DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
-  DATABASE_URL_SYNC="$DATABASE_URL"
-else
-  DATABASE_URL_SYNC="$DATABASE_URL"
-fi
-
-# Simulation server URL
-if [ "$DEPLOY_MODE" = "docker" ]; then
-  SIM_SERVER_URL="http://runner:8000"
-else
-  SIM_SERVER_URL="http://localhost:8001"
-fi
-
-cat > "$ENV_FILE" << ENVEOF
-# ══════════════════════════════════════════════════════════════
-# SIMD Agent — Generated by install.sh
-# ══════════════════════════════════════════════════════════════
-
-# ── Database ─────────────────────────────────────────────────
-DATABASE_URL=$AGENT_DATABASE_URL
-
-# ── LLM Provider ────────────────────────────────────────────
-GEMINI_API_KEY=$GEMINI_API_KEY
-
-# ── Simulation Server ───────────────────────────────────────
-SIMULATION_SERVER_URL=$SIM_SERVER_URL
-
-# ── Object Storage ──────────────────────────────────────────
-STORAGE_BACKEND=$STORAGE_BACKEND
-ENVEOF
-
-if [ "$STORAGE_BACKEND" = "local" ]; then
-  if [ "$DEPLOY_MODE" = "docker" ]; then
-    echo "STORAGE_LOCAL_DIR=/app/storage" >> "$ENV_FILE"
+{
+  echo "# ─── written by install.sh ────────────────────────────────"
+  echo "# Edit by hand or re-run install.sh to regenerate."
+  echo
+  echo "# ── Database ─────────────────────────────────────────────"
+  echo "DATABASE_URL=$DATABASE_URL"
+  echo
+  echo "# ── Simulation runner ────────────────────────────────────"
+  echo "SIMULATION_SERVER_URL=$SIM_SERVER_URL"
+  echo
+  echo "# ── LLM provider ─────────────────────────────────────────"
+  echo "DEFAULT_PROVIDER=$LLM_PROVIDER"
+  case "$LLM_PROVIDER" in
+    gemini) echo "GEMINI_API_KEY=$GEMINI_API_KEY" ;;
+    vertex)
+      echo "VERTEX_PROJECT=$VERTEX_PROJECT"
+      echo "VERTEX_LOCATION=us-central1"
+      echo "GOOGLE_APPLICATION_CREDENTIALS=$GOOGLE_APPLICATION_CREDENTIALS"
+      ;;
+    ollama) echo "OLLAMA_HOST=$OLLAMA_HOST" ;;
+  esac
+  echo
+  echo "# ── Storage ──────────────────────────────────────────────"
+  echo "STORAGE_BACKEND=$STORAGE_BACKEND"
+  if [ "$STORAGE_BACKEND" = "local" ]; then
+    if [ "$DEPLOY_MODE" = "docker" ]; then
+      echo "STORAGE_LOCAL_DIR=/app/storage"
+    else
+      echo "STORAGE_LOCAL_DIR=$AGENT_DIR/storage"
+    fi
   else
-    echo "STORAGE_LOCAL_DIR=$AGENT_DIR/storage" >> "$ENV_FILE"
+    echo "STORAGE_BUCKET=$STORAGE_BUCKET"
+    [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && \
+      echo "GOOGLE_APPLICATION_CREDENTIALS=$GOOGLE_APPLICATION_CREDENTIALS"
   fi
-else
-  cat >> "$ENV_FILE" << GCSEOF
-STORAGE_BUCKET=$STORAGE_BUCKET
-GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs-key.json
-GCSEOF
-fi
+  echo
+  echo "# ── Auth ─────────────────────────────────────────────────"
+  [ -n "$NEON_AUTH_URL" ] && echo "NEON_AUTH_BASE_URL=$NEON_AUTH_URL"
+  echo
+  echo "# ── Self-healing ─────────────────────────────────────────"
+  echo "MAX_RETRIES=7"
+} > "$ENV_FILE"
 
-cat >> "$ENV_FILE" << ENVEOF2
+chmod 600 "$ENV_FILE"
+ok ".env written to $ENV_FILE"
 
-# ── Progress Data ───────────────────────────────────────────
-PROGRESS_DATA_DIR=/tmp/simd_progress
-
-# ── Authentication ──────────────────────────────────────────
-ENVEOF2
-
-if [ "$AUTH_DISABLED" = "true" ]; then
-  echo "# Authentication disabled (single-user mode)" >> "$ENV_FILE"
-else
-  echo "NEON_AUTH_BASE_URL=$NEON_AUTH_URL" >> "$ENV_FILE"
-fi
-
-cat >> "$ENV_FILE" << ENVEOF3
-
-# ── Frontend ────────────────────────────────────────────────
-NEXT_PUBLIC_AGENT_URL=http://localhost:8000
-NEXT_PUBLIC_AGENT_WS_URL=ws://localhost:8000
-NEXT_PUBLIC_AUTH_DISABLED=$AUTH_DISABLED
-
-# ── Logging ─────────────────────────────────────────────────
-LOG_LEVEL=INFO
-MAX_RETRIES=3
-ENVEOF3
-
-success ".env generated at $ENV_FILE"
 
 # ══════════════════════════════════════════════════════════════
-# 5A. Docker Deployment
+# 5A. Docker deployment
 # ══════════════════════════════════════════════════════════════
 if [ "$DEPLOY_MODE" = "docker" ]; then
-  header "Docker Deployment"
+  header "Docker deployment"
 
-  # Check Docker is available
-  if ! command -v docker &> /dev/null; then
-    error "Docker is not installed. Please install Docker Desktop or Docker Engine."
-    error "  https://docs.docker.com/get-docker/"
-    exit 1
-  fi
+  command -v docker >/dev/null || fail \
+    "Docker isn't installed — get it at https://docs.docker.com/get-docker/"
+  docker info >/dev/null 2>&1 || fail \
+    "the Docker daemon isn't running — start Docker Desktop / your daemon"
+  ok "Docker is available"
 
-  if ! docker info &> /dev/null; then
-    error "Docker daemon is not running. Please start Docker and try again."
-    exit 1
-  fi
-
-  success "Docker is available"
-
-  # Handle GCS key mount
   COMPOSE_CMD="docker compose -f docker/docker-compose.yml"
 
   if [ "$STORAGE_BACKEND" = "gcs" ]; then
-    # Create a compose override for GCS key mount
-    cat > "$AGENT_DIR/docker/docker-compose.gcs.yml" << GCSYML
+    cat > "$AGENT_DIR/docker/docker-compose.gcs.yml" <<GCSYML
 services:
   agent:
     volumes:
-      - $GCS_KEY_PATH:/secrets/gcs-key.json:ro
+      - $GOOGLE_APPLICATION_CREDENTIALS:/secrets/gcs-key.json:ro
 GCSYML
     COMPOSE_CMD="$COMPOSE_CMD -f docker/docker-compose.gcs.yml"
   fi
 
-  info "Building and starting containers..."
-  echo ""
-  echo -e "  ${CYAN}$COMPOSE_CMD up -d --build${NC}"
-  echo ""
+  echo
+  warn "the GHCR images don't exist yet for this OSS release."
+  warn "to start the stack, uncomment the \`build:\` blocks in"
+  warn "docker/docker-compose.yml so docker compose builds locally."
+  echo
 
-  if ask_yes_no "Start the stack now?" "Y"; then
-    cd "$AGENT_DIR"
-    $COMPOSE_CMD up -d --build
-
-    echo ""
-    success "SIMD Agent is running!"
-    echo ""
-    echo -e "  ${BOLD}Frontend:${NC}  http://localhost:3000"
-    echo -e "  ${BOLD}Backend:${NC}   http://localhost:8000"
-    echo -e "  ${BOLD}Runner:${NC}    http://localhost:8001"
-    echo -e "  ${BOLD}Postgres:${NC}  localhost:5432"
-    echo ""
-    echo -e "  ${CYAN}View logs:${NC}     $COMPOSE_CMD logs -f"
-    echo -e "  ${CYAN}Stop:${NC}          $COMPOSE_CMD down"
-    echo -e "  ${CYAN}Restart:${NC}       $COMPOSE_CMD restart"
-    echo ""
+  if ask_yes_no "start the stack now?" "Y"; then
+    info "running:  $COMPOSE_CMD up -d"
+    $COMPOSE_CMD up -d
+    echo
+    ok "stack started.  endpoints:"
+    hint "Backend:    http://localhost:8000"
+    hint "Postgres:   localhost:5432"
+    echo
+    hint "view logs:  $COMPOSE_CMD logs -f"
+    hint "stop:       $COMPOSE_CMD down"
   else
-    echo ""
-    info "To start later, run:"
-    echo -e "  ${CYAN}cd $AGENT_DIR && $COMPOSE_CMD up -d --build${NC}"
-    echo ""
+    echo
+    info "to start later, run:"
+    hint "$COMPOSE_CMD up -d"
   fi
 
 # ══════════════════════════════════════════════════════════════
-# 5B. Bare Metal Deployment
+# 5B. Bare-metal deployment
 # ══════════════════════════════════════════════════════════════
 else
-  header "Bare Metal Setup"
+  header "bare-metal setup"
 
-  # ── Check prerequisites ────────────────────────────────────
-  MISSING=()
-
-  if ! command -v python3 &> /dev/null; then
-    MISSING+=("python3 (3.11+)")
+  # ── Python check ─────────────────────────────────────────────
+  command -v python3 >/dev/null || fail "python3 not found.  install Python 3.11+."
+  PY_VER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+  PY_MAJOR="$(echo "$PY_VER" | cut -d. -f1)"
+  PY_MINOR="$(echo "$PY_VER" | cut -d. -f2)"
+  if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
+    fail "Python $PY_VER found, but 3.11+ is required."
   fi
+  ok "Python $PY_VER"
 
-  if ! command -v node &> /dev/null; then
-    MISSING+=("node (20+)")
+  # ── venv + install ───────────────────────────────────────────
+  if [ -d ".venv" ]; then
+    ok ".venv already exists — reusing"
+  else
+    python3 -m venv .venv
+    ok "created .venv/"
   fi
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
 
-  if ! command -v npm &> /dev/null; then
-    MISSING+=("npm")
-  fi
+  info "installing simd-agent and the CLI …"
+  pip install --upgrade pip --quiet
+  pip install -e . --quiet
+  command -v simd >/dev/null || fail \
+    "the 'simd' command isn't on PATH after install — pip install -e . may have failed silently."
+  ok "installed  $(simd --version)"
 
-  if [ ${#MISSING[@]} -gt 0 ]; then
-    error "Missing prerequisites:"
-    for dep in "${MISSING[@]}"; do
-      echo -e "  ${RED}-${NC} $dep"
-    done
-    exit 1
-  fi
-
-  success "Python $(python3 --version 2>&1 | awk '{print $2}'), Node $(node --version)"
-
-  # Update .env for bare-metal paths
-  sed -i.bak "s|PROGRESS_DATA_DIR=/tmp/simd_progress|PROGRESS_DATA_DIR=$AGENT_DIR/progress_data|g" "$ENV_FILE"
-  rm -f "$ENV_FILE.bak"
-
+  # ── storage dir ─────────────────────────────────────────────
   if [ "$STORAGE_BACKEND" = "local" ]; then
     mkdir -p "$AGENT_DIR/storage"
-  fi
-  mkdir -p "$AGENT_DIR/progress_data"
-
-  # ── Backend (Python venv) ──────────────────────────────────
-  header "Backend Setup"
-
-  info "Creating Python virtual environment..."
-  cd "$AGENT_DIR"
-
-  if [ ! -d "venv" ]; then
-    python3 -m venv venv
-  fi
-  source venv/bin/activate
-  success "Virtual environment ready"
-
-  info "Installing backend dependencies..."
-  pip install -e ".[dev]" --quiet
-  success "Backend dependencies installed"
-
-  # ── Frontend (npm) ─────────────────────────────────────────
-  header "Frontend Setup"
-
-  cd "$UI_DIR"
-  info "Installing frontend dependencies..."
-  npm ci --silent
-  success "Frontend dependencies installed"
-
-  # ── Database setup ─────────────────────────────────────────
-  if [ "$DB_CHOICE" = "1" ]; then
-    warn "You selected bundled Postgres, but bare metal mode requires you to run Postgres yourself."
-    echo ""
-    echo "  Option A: Install Postgres locally"
-    echo "    brew install postgresql@16   # macOS"
-    echo "    sudo apt install postgresql  # Ubuntu/Debian"
-    echo ""
-    echo "  Option B: Run just Postgres in Docker"
-    echo -e "    ${CYAN}docker run -d --name simd-postgres \\"
-    echo "      -e POSTGRES_USER=simd \\"
-    echo "      -e POSTGRES_PASSWORD=simd \\"
-    echo "      -e POSTGRES_DB=simd \\"
-    echo -e "      -p 5432:5432 postgres:16-alpine${NC}"
-    echo ""
-
-    # Update DATABASE_URL for localhost
-    sed -i.bak "s|postgresql+asyncpg://simd:simd@postgres:5432/simd|postgresql+asyncpg://simd:simd@localhost:5432/simd|g" "$ENV_FILE"
-    rm -f "$ENV_FILE.bak"
+    mkdir -p "$AGENT_DIR/progress_data"
+    ok "storage directories ready"
   fi
 
-  # ── GCS key path (bare metal) ──────────────────────────────
-  if [ "$STORAGE_BACKEND" = "gcs" ]; then
-    sed -i.bak "s|GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcs-key.json|GOOGLE_APPLICATION_CREDENTIALS=$GCS_KEY_PATH|g" "$ENV_FILE"
-    rm -f "$ENV_FILE.bak"
+  # ── simd init ───────────────────────────────────────────────
+  header "CLI configuration"
+
+  if [ -f "$HOME/.config/simd/config.toml" ]; then
+    ok "~/.config/simd/config.toml already exists — skipping wizard"
+    hint "re-run \`simd init\` later to reconfigure"
+  else
+    info "running the simd init wizard …"
+    echo
+    simd init || warn "simd init cancelled — you can re-run it later"
   fi
 
-  # ── Print start commands ───────────────────────────────────
-  header "Setup Complete"
+  # ── final instructions ──────────────────────────────────────
+  header "setup complete"
 
-  echo -e "${GREEN}SIMD Agent is ready!${NC} Start each service in a separate terminal:"
-  echo ""
-  echo -e "  ${BOLD}1. Postgres${NC} (if using Docker for just the DB):"
-  echo -e "     ${CYAN}docker run -d --name simd-postgres \\"
-  echo "       -e POSTGRES_USER=simd -e POSTGRES_PASSWORD=simd -e POSTGRES_DB=simd \\"
-  echo -e "       -p 5432:5432 postgres:16-alpine${NC}"
-  echo ""
-  echo -e "  ${BOLD}2. Backend${NC}:"
-  echo -e "     ${CYAN}cd $AGENT_DIR${NC}"
-  echo -e "     ${CYAN}source venv/bin/activate${NC}"
-  echo -e "     ${CYAN}uvicorn simd_agent.main:app --reload --port 8000${NC}"
-  echo ""
-  echo -e "  ${BOLD}3. Frontend${NC}:"
-  echo -e "     ${CYAN}cd $UI_DIR${NC}"
-  echo -e "     ${CYAN}npm run dev${NC}"
-  echo ""
-  echo -e "  ${BOLD}4. OpenFOAM Runner${NC} (optional — only if running simulations):"
-  echo -e "     ${CYAN}cd $SIM_SERVER_DIR${NC}"
-  echo -e "     ${CYAN}python3 -m venv venv && source venv/bin/activate${NC}"
-  echo -e "     ${CYAN}pip install -r requirements.txt${NC}"
-  echo -e "     ${CYAN}uvicorn app.main:app --port 8001${NC}"
-  echo ""
-  echo -e "  ${BOLD}Open in browser:${NC} http://localhost:3000"
-  echo ""
+  cat <<EOF
+
+  next steps:
+
+    # terminal 1 — start the agent (keeps running)
+    source .venv/bin/activate
+    uvicorn simd_agent.main:app --port 8000
+
+    # terminal 2 — run an example
+    source .venv/bin/activate
+    simd run examples/u-shape-pipe/prompt.txt \\
+             examples/u-shape-pipe/mesh/u-shape-pipe.msh
+
+  to see what's wired up:
+    simd status
+
+  to deactivate the venv:
+    deactivate
+
+EOF
 fi
 
-echo -e "${BOLD}${CYAN}════════════════════════════════════════════════════════${NC}"
-echo -e "${BOLD}${CYAN}  Installation complete! Enjoy SIMD Agent.             ${NC}"
-echo -e "${BOLD}${CYAN}════════════════════════════════════════════════════════${NC}"
-echo ""
+
+# ══════════════════════════════════════════════════════════════
+# 6. Done
+# ══════════════════════════════════════════════════════════════
+printf "${BOLD}${CYAN}════════════════════════════════════════════════════════${NC}\n"
+printf "${BOLD}${CYAN}  installation complete.                                ${NC}\n"
+printf "${BOLD}${CYAN}════════════════════════════════════════════════════════${NC}\n"
+echo
