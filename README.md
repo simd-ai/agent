@@ -78,6 +78,13 @@ simulation runner URL, and where to store results — then writes
 ``.env``.  In Docker mode the stack starts automatically; in
 bare-metal mode the wizard prints the ``uvicorn`` command to run.
 
+<details>
+<summary>What the wizard looks like</summary>
+
+<img src="Documentation/images/install-wizard.png" width="700" alt="install.sh wizard — deployment mode, LLM provider, simulation runner, object storage, authentication, database, .env write, bare-metal setup">
+
+</details>
+
 Once the agent is up at ``http://localhost:8000``, drive it through
 the WebSocket / HTTP API (see ``Documentation/api/``) or run the
 frontend at ``http://localhost:3000``.
