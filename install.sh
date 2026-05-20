@@ -10,9 +10,13 @@
 #                    are separate repos; install them later if
 #                    you want them.
 #
-#   2) Bare metal  — Python venv + pip install -e . + simd init.
-#                    Bring your own Postgres (or run one in a
-#                    container).  Point at a remote runner.
+#   2) Bare metal  — Python venv + pip install -e .  Bring your
+#                    own Postgres (or run one in a container).
+#                    Point at a remote runner.
+#
+# Either path writes both .env (for the agent) and
+# ~/.config/simd/config.toml (for the CLI) — no separate
+# `simd init` step needed after install.sh.
 #
 # Menu choices use arrow keys (↑ ↓ Enter).  Free-text inputs
 # (URLs, API keys, file paths) are typed normally.
@@ -162,6 +166,40 @@ ask_path() {
     fi
     err "file not found: $path"
   done
+}
+
+
+# ── CLI config writer ──────────────────────────────────────────
+#
+# Write ~/.config/simd/config.toml directly from the wizard's
+# answers.  Replaces the old approach of calling `simd init` at
+# the end of install.sh (which asked all the same questions again).
+# `simd init` remains a standalone command for users who install
+# just the CLI (e.g. future `pip install simd-agent` without
+# running install.sh).
+
+write_cli_config() {
+  # write_cli_config <agent_url> <agent_mode> <runner_url> <runner_mode>
+  local agent_url="$1" agent_mode="$2" runner_url="$3" runner_mode="$4"
+
+  local cfg_dir="$HOME/.config/simd"
+  local cfg_file="$cfg_dir/config.toml"
+  mkdir -p "$cfg_dir"
+
+  if [ -f "$cfg_file" ]; then
+    cp "$cfg_file" "$cfg_file.bak"
+    warn "$cfg_file already existed — backed up to config.toml.bak"
+  fi
+
+  cat > "$cfg_file" <<TOML
+# Written by install.sh.  Edit by hand or re-run install.sh.
+agent_url = "$agent_url"
+agent_mode = "$agent_mode"
+runner_url = "$runner_url"
+runner_mode = "$runner_mode"
+TOML
+  chmod 600 "$cfg_file" 2>/dev/null || true
+  ok "CLI config written to $cfg_file"
 }
 
 
@@ -444,6 +482,12 @@ GCSYML
     hint "$COMPOSE_CMD up -d"
   fi
 
+  # CLI config — the agent is in a container exposed on localhost:8000.
+  # Runner mode is "remote" since SIM_SERVER_URL points outside the stack
+  # (the bundled compose file doesn't yet ship a runner image).
+  write_cli_config "http://localhost:8000" "local-docker" \
+                   "$SIM_SERVER_URL" "remote"
+
 # ══════════════════════════════════════════════════════════════
 # 9B. Bare-metal deployment
 # ══════════════════════════════════════════════════════════════
@@ -483,14 +527,19 @@ else
 
   header "CLI configuration"
 
-  if [ -f "$HOME/.config/simd/config.toml" ]; then
-    ok "~/.config/simd/config.toml already exists — skipping wizard"
-    hint "re-run \`simd init\` later to reconfigure"
-  else
-    info "running the simd init wizard …"
-    echo
-    simd init || warn "simd init cancelled — you can re-run it later"
-  fi
+  # The CLI needs the agent + runner URLs we already collected.  We
+  # write them directly — no need to re-ask via `simd init`.
+  #
+  # For bare-metal mode the agent runs locally via `uvicorn …
+  # --port 8000`.  The runner_mode is "remote" when SIM_SERVER_URL
+  # doesn't point at localhost; "local-bare-metal" when it does.
+  AGENT_URL_FOR_CLI="http://localhost:8000"
+  case "$SIM_SERVER_URL" in
+    http://localhost:*|http://127.0.0.1:*) RUNNER_MODE_FOR_CLI="local-bare-metal" ;;
+    *)                                     RUNNER_MODE_FOR_CLI="remote" ;;
+  esac
+  write_cli_config "$AGENT_URL_FOR_CLI" "local-bare-metal" \
+                   "$SIM_SERVER_URL" "$RUNNER_MODE_FOR_CLI"
 
   header "setup complete"
 
