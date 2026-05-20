@@ -195,16 +195,27 @@ class EventStore:
         preserved so this does not clobber anything the orchestrator has
         already written.
         """
+        from simd_agent.db import is_sqlite
+
+        if is_sqlite():
+            sql = """
+                UPDATE runs
+                SET result = json_patch(
+                    COALESCE(result, '{}'),
+                    json_object('sim_run_id', :sim_run_id)
+                )
+                WHERE id = :id
+            """
+        else:
+            sql = """
+                UPDATE runs
+                SET result = COALESCE(result, '{}'::jsonb)
+                             || jsonb_build_object('sim_run_id', :sim_run_id)
+                WHERE id = :id
+            """
         async with get_session() as session:
             await session.execute(
-                text(
-                    """
-                    UPDATE runs
-                    SET result = COALESCE(result, '{}'::jsonb)
-                                 || jsonb_build_object('sim_run_id', :sim_run_id)
-                    WHERE id = :id
-                    """
-                ),
+                text(sql),
                 {"id": run_id, "sim_run_id": sim_run_id},
             )
 
@@ -226,16 +237,28 @@ class EventStore:
         frontend's ``restore-run.ts`` reads back from ``result.convergence``.
         """
         import json as _json
+        from simd_agent.db import is_sqlite
+
+        if is_sqlite():
+            # On SQLite ``:conv`` is plain text; json() parses it to JSON.
+            sql = """
+                UPDATE runs
+                SET result = json_patch(
+                    COALESCE(result, '{}'),
+                    json_object('convergence', json(:conv))
+                )
+                WHERE id = :id
+            """
+        else:
+            sql = """
+                UPDATE runs
+                SET result = COALESCE(result, '{}'::jsonb)
+                             || jsonb_build_object('convergence', CAST(:conv AS jsonb))
+                WHERE id = :id
+            """
         async with get_session() as session:
             await session.execute(
-                text(
-                    """
-                    UPDATE runs
-                    SET result = COALESCE(result, '{}'::jsonb)
-                                 || jsonb_build_object('convergence', CAST(:conv AS jsonb))
-                    WHERE id = :id
-                    """
-                ),
+                text(sql),
                 {"id": run_id, "conv": _json.dumps(convergence)},
             )
 

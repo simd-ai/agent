@@ -20,8 +20,14 @@
 
 services:
   # ── Postgres ─────────────────────────────────────────────────
+  # Only started when the ``postgres`` profile is active.  The default
+  # database is SQLite (a single file under ~/.simd/), so a fresh
+  # install needs no Postgres service — bring it up with
+  # ``docker compose --profile postgres up -d`` if you've chosen the
+  # bundled-Postgres path in install.sh.
   postgres:
     image: postgres:16-alpine
+    profiles: ["postgres"]
     environment:
       POSTGRES_USER: simd
       POSTGRES_PASSWORD: simd
@@ -45,18 +51,23 @@ services:
     #   dockerfile: docker/agent.Dockerfile
     env_file: ../.env
     environment:
-      DATABASE_URL: postgresql+asyncpg://simd:simd@postgres:5432/simd
+      # DATABASE_URL is read from ../.env (written by install.sh).
+      # Default falls back to a bind-mounted SQLite file so the
+      # stack still boots if .env is missing.
+      DATABASE_URL: ${DATABASE_URL:-sqlite+aiosqlite:////data/simd.db}
       SIMULATION_SERVER_URL: http://runner:9000
     ports:
       - "8000:8000"
     volumes:
       - agent-storage:/app/storage
       - agent-progress:/tmp/simd_progress
+      # SQLite default — bind the host's ~/.simd/ into the container
+      # so the DB file survives container restarts and is readable
+      # by the host-side CLI.  Harmless when DATABASE_URL points
+      # at Postgres (the dir is just unused).
+      - ${HOME}/.simd:/data
       # Mount a service-account JSON if using Vertex or GCS:
       # - ./gcp-sa.json:/secrets/sa-key.json:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
     restart: unless-stopped
 
   # ── Frontend (Next.js) ───────────────────────────────────────
@@ -68,7 +79,11 @@ services:
     #   context: ../../simd-agent-ui
     env_file: ../.env
     environment:
-      DATABASE_URL: postgresql://simd:simd@postgres:5432/simd
+      # The frontend keeps its own DATABASE_URL because Drizzle still
+      # speaks Postgres directly.  When the backend is on SQLite, the
+      # frontend can't share that DB — run the frontend separately
+      # against a Postgres instance, or skip starting it.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://simd:simd@postgres:5432/simd}
       NEXT_PUBLIC_AGENT_URL: http://localhost:8000
       NEXT_PUBLIC_AGENT_WS_URL: ws://localhost:8000
       NEXT_PUBLIC_AUTH_DISABLED: "true"

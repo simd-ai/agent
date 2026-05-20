@@ -5,11 +5,22 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, PostgresDsn
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Resolve .env relative to the repo root (one level up from this file's package dir)
 _ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _default_sqlite_url() -> str:
+    """Where to put the default SQLite database file.
+
+    ``~/.simd/simd.db`` keeps the DB next to the rest of the per-user
+    state (config, cached creds) the CLI / install.sh already writes
+    under that directory.  ``init_db()`` creates the parent dir
+    on first run.
+    """
+    return f"sqlite+aiosqlite:///{Path.home() / '.simd' / 'simd.db'}"
 
 class Settings(BaseSettings):
     """Application configuration from environment variables."""
@@ -21,16 +32,22 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Database
-    database_url: PostgresDsn = Field(
-        ...,
-        description="Neon Postgres connection URL",
+    # Database — defaults to SQLite under ``~/.simd/simd.db`` so a fresh
+    # OSS install needs no Postgres service running.  Set ``DATABASE_URL``
+    # to a ``postgresql://`` connection string to opt into Postgres
+    # (recommended for multi-worker / production deployments).
+    database_url: str = Field(
+        default_factory=_default_sqlite_url,
+        description="Database connection URL — sqlite+aiosqlite:///… (default) "
+                    "or postgresql+asyncpg://… for production.",
     )
 
     # Simulation Server (OpenFOAM runner — configurable endpoint)
     simulation_server_url: str = Field(
+        default="http://localhost:9000",
         description="Base URL for the SIMD Simulation Runner server (OpenFOAM). "
-                    "Must be set via SIMULATION_SERVER_URL in .env.",
+                    "Defaults to the docker-compose runner; override via "
+                    "SIMULATION_SERVER_URL.",
     )
 
     # LLM Provider — the registry reads these to configure the active provider.

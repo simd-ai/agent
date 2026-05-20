@@ -11,12 +11,12 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from simd_agent.db import get_session
+from simd_agent.db import get_session, is_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,13 @@ class PostgresRepository(BaseRepository):
 
     @property
     def _select_cols(self) -> str:
-        return ", ".join(self.columns)
+        cols = ", ".join(self.columns)
+        # Postgres-only ``column::text`` casts are no-ops on SQLite (the
+        # underlying column is already TEXT) and would raise a syntax
+        # error.  Strip them so the same ``columns`` list works on both.
+        if is_sqlite():
+            cols = cols.replace("::text", "")
+        return cols
 
     def _serialize(self, data: dict[str, Any]) -> dict[str, Any]:
         """Serialize JSON columns before writing."""
@@ -119,6 +125,13 @@ class PostgresRepository(BaseRepository):
 
     async def create(self, data: dict[str, Any]) -> dict[str, Any]:
         serialized = self._serialize(data)
+        # SQLite has no ``DEFAULT gen_random_uuid()`` so the app must
+        # provide ``id`` explicitly.  Generating it here keeps callers
+        # backend-agnostic; Postgres ignores the supplied id only when
+        # it duplicates an existing row, which is the same behavior
+        # callers already expect.
+        if self.pk == "id" and "id" not in serialized:
+            serialized["id"] = uuid4()
         cols = ", ".join(serialized.keys())
         placeholders = ", ".join(f":{k}" for k in serialized.keys())
 
@@ -160,6 +173,8 @@ class PostgresRepository(BaseRepository):
         update_keys: list[str] | None = None,
     ) -> dict[str, Any]:
         serialized = self._serialize(data)
+        if self.pk == "id" and "id" not in serialized and "id" not in conflict_keys:
+            serialized["id"] = uuid4()
         cols = ", ".join(serialized.keys())
         placeholders = ", ".join(f":{k}" for k in serialized.keys())
         conflict = ", ".join(conflict_keys)

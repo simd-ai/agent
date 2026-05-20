@@ -12,7 +12,7 @@ from sqlalchemy import text
 
 from simd_agent.chat.models import ChatRequest, DataNeeds
 from simd_agent.chat.tools import SimulationSnapshot
-from simd_agent.db import get_session
+from simd_agent.db import get_session, portable_sql as _strip_pg_casts
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ async def upsert_simulation_config(
     try:
         async with get_session() as session:
             await session.execute(
-                text("""
+                text(_strip_pg_casts("""
                     INSERT INTO simulation_config
                         (simulation_id, cfd_physics, cfd_solver, cfd_fluid,
                          cfd_turbulence, cfd_derived, cfd_regions)
@@ -71,7 +71,7 @@ async def upsert_simulation_config(
                         cfd_turbulence = EXCLUDED.cfd_turbulence,
                         cfd_derived    = EXCLUDED.cfd_derived,
                         cfd_regions    = EXCLUDED.cfd_regions
-                """),
+                """)),
                 {
                     "sid":       simulation_id,
                     "physics":   json.dumps(physics),

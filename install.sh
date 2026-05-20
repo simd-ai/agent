@@ -347,27 +347,43 @@ fi
 header "database"
 
 if [ "$DEPLOY_MODE" = "docker" ]; then
-  arrow_choice "Postgres" \
-    "bundled  — a postgres container ships with the stack" \
-    "external — Neon, RDS, or your own host (paste the URL)"
-
-  if [ "$_ARROW_INDEX" -eq 0 ]; then
-    DATABASE_URL="postgresql+asyncpg://simd:simd@postgres:5432/simd"
-    ok "using bundled Postgres container"
-  else
-    ask "PostgreSQL connection URL (postgresql://user:pass@host/db)" "" DATABASE_URL
-    DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
-    ok "external database configured"
-  fi
-else
-  arrow_choice "where's Postgres?" \
-    "Run it in a container now (we'll do docker run for you)" \
-    "Neon (managed) — I'll paste the connection string" \
-    "Local install (brew/apt) — already running on this machine" \
-    "Custom URL — I'll paste a connection string"
+  arrow_choice "database" \
+    "SQLite   — single file, zero setup (recommended for local installs)" \
+    "Postgres — bundled container ships with the stack" \
+    "Postgres — external (Neon, RDS, …)"
 
   case "$_ARROW_INDEX" in
-    0)  # Container — provision it right now
+    0)
+      # Bind-mount ~/.simd/ into the container so the SQLite file
+      # survives container restarts and is visible to the host CLI.
+      mkdir -p "$HOME/.simd"
+      DATABASE_URL="sqlite+aiosqlite:////data/simd.db"
+      ok "using SQLite at ~/.simd/simd.db (mounted into the container)"
+      ;;
+    1)
+      DATABASE_URL="postgresql+asyncpg://simd:simd@postgres:5432/simd"
+      ok "using bundled Postgres container"
+      ;;
+    2)
+      ask "PostgreSQL connection URL (postgresql://user:pass@host/db)" "" DATABASE_URL
+      DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
+      ok "external database configured"
+      ;;
+  esac
+else
+  arrow_choice "database" \
+    "SQLite — single file at ~/.simd/simd.db (recommended, zero setup)" \
+    "Postgres — run a container now (we'll do docker run for you)" \
+    "Postgres — Neon (managed), paste the connection string" \
+    "Postgres — local install, already running on this machine"
+
+  case "$_ARROW_INDEX" in
+    0)  # SQLite — no service to start
+      mkdir -p "$HOME/.simd"
+      DATABASE_URL="sqlite+aiosqlite:///$HOME/.simd/simd.db"
+      ok "using SQLite at ~/.simd/simd.db"
+      ;;
+    1)  # Postgres container
       command -v docker >/dev/null || fail \
         "Docker isn't installed.  install Docker or pick another option."
       docker info >/dev/null 2>&1 || fail \
@@ -391,22 +407,17 @@ else
       DATABASE_URL="postgresql+asyncpg://simd:simd@localhost:5432/simd"
       ok "Postgres container ready at $DATABASE_URL"
       ;;
-    1)  # Neon
+    2)  # Neon
       ask "Neon connection URL (postgresql://user:pass@ep-xxx.neon.tech/db)" \
           "" DATABASE_URL
       DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
       ok "Neon database configured"
       ;;
-    2)  # Local install (already running)
+    3)  # Local Postgres (already running)
       ask "PostgreSQL connection URL" \
           "postgresql+asyncpg://simd:simd@localhost:5432/simd" DATABASE_URL
       DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
       ok "using local Postgres at $DATABASE_URL"
-      ;;
-    3)  # Custom
-      ask "PostgreSQL connection URL" "" DATABASE_URL
-      DATABASE_URL="${DATABASE_URL/postgresql:\/\//postgresql+asyncpg:\/\/}"
-      ok "database URL set"
       ;;
   esac
 fi

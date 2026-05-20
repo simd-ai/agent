@@ -8,10 +8,23 @@ Uses Neon Postgres with the asyncpg driver.  Key settings:
 """
 
 import asyncio
+import sqlite3
+import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from sqlalchemy import MetaData, text
+
+
+# Bind ``uuid.UUID`` instances to their canonical string form when the
+# active backend is SQLite.  The codebase carries UUIDs as ``UUID`` objects
+# through every layer (run_id, event_id, simulation_id …); Python's
+# stock sqlite3 driver — which aiosqlite wraps — raises
+# ``ProgrammingError: Error binding parameter`` if it sees a UUID directly.
+# Registering once at import time means all aiosqlite connections in this
+# process get the conversion for free, without sprinkling ``str(...)``
+# casts through every call site.
+sqlite3.register_adapter(uuid.UUID, str)
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -40,15 +53,32 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 def get_database_url() -> str:
     """Get async database URL from settings.
 
-    Converts standard postgres URLs to asyncpg format and handles
-    Neon-specific parameters that asyncpg doesn't support.
+    Two dialects supported:
+
+      * **sqlite** (default) — ``sqlite+aiosqlite:///path/to/file.db``.
+        Zero setup, no service, one file on disk.  Right for local
+        installs, demos, and development.
+      * **postgres** — ``postgresql+asyncpg://user:pass@host/db``.
+        For production deployments with multiple workers or shared
+        state.  Also auto-handles the ``sslmode=`` → ``ssl=`` rewrite
+        that Neon needs.
     """
     from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
     settings = get_settings()
     url = str(settings.database_url)
 
-    # Convert postgres:// to postgresql+asyncpg://
+    # SQLite — leave it alone except to ensure the +aiosqlite driver
+    # is in the scheme.  Both `sqlite:///` and `sqlite+aiosqlite:///`
+    # are accepted in settings.
+    if url.startswith("sqlite:"):
+        if url.startswith("sqlite:///"):
+            url = url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
+        elif url.startswith("sqlite://"):
+            url = url.replace("sqlite://", "sqlite+aiosqlite://", 1)
+        return url
+
+    # Postgres — normalise the scheme to the asyncpg driver.
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql+asyncpg://", 1)
     elif url.startswith("postgresql://"):
@@ -99,15 +129,56 @@ def get_engine() -> AsyncEngine:
     """Get or create the async database engine."""
     global _engine
     if _engine is None:
-        _engine = create_async_engine(
-            get_database_url(),
-            echo=False,
-            pool_pre_ping=True,    # handles Neon cold-start disconnects
-            pool_size=5,           # small — Neon pooler handles the rest
-            max_overflow=5,
-            pool_recycle=300,      # recycle before Neon's idle timeout
-        )
+        url = get_database_url()
+        if is_sqlite_url(url):
+            # SQLite — single-file DB.  WAL mode for better concurrency.
+            # Connection-pooling options (pool_size etc.) don't apply.
+            _engine = create_async_engine(url, echo=False)
+        else:
+            _engine = create_async_engine(
+                url,
+                echo=False,
+                pool_pre_ping=True,    # handles Neon cold-start disconnects
+                pool_size=5,           # small — Neon pooler handles the rest
+                max_overflow=5,
+                pool_recycle=300,      # recycle before Neon's idle timeout
+            )
     return _engine
+
+
+def is_sqlite() -> bool:
+    """True when the active database is SQLite."""
+    return is_sqlite_url(get_database_url())
+
+
+def is_sqlite_url(url: str) -> bool:
+    return url.startswith("sqlite")
+
+
+def portable_sql(sql: str) -> str:
+    """Translate Postgres-only SQL fragments for SQLite.
+
+    Centralised so call sites can author one query string that runs on
+    both backends.  Currently rewrites:
+
+      * ``:param::jsonb`` / ``:param::text`` → ``:param``
+      * ``CAST(:param AS jsonb)`` → ``:param``
+      * ``::jsonb`` / ``::text`` (suffix casts on columns or literals) → stripped
+      * ``NOW()`` → ``CURRENT_TIMESTAMP``
+
+    No-op when the active backend is Postgres.
+    """
+    if not is_sqlite():
+        return sql
+    import re
+
+    sql = re.sub(r"(:[A-Za-z_][A-Za-z0-9_]*)::(jsonb|text)", r"\1", sql)
+    sql = re.sub(r"CAST\(\s*(:[A-Za-z_][A-Za-z0-9_]*)\s+AS\s+jsonb\s*\)",
+                 r"\1", sql, flags=re.IGNORECASE)
+    sql = sql.replace("::jsonb", "")
+    sql = sql.replace("::text", "")
+    sql = re.sub(r"\bNOW\(\)", "CURRENT_TIMESTAMP", sql)
+    return sql
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
@@ -134,6 +205,43 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
+
+
+def _pg_to_sqlite(sql: str) -> str:
+    """Translate Postgres DDL fragments into SQLite-compatible equivalents.
+
+    The schema is authored in Postgres syntax so the production deploy
+    keeps full type fidelity (TIMESTAMPTZ, JSONB, gen_random_uuid()…).
+    On SQLite we substitute equivalents that have the same semantics
+    when queried through the application: UUIDs become TEXT (the app
+    provides ``uuid4().hex``), JSONB becomes TEXT (we already JSON-dump
+    via ``_serialize``), TIMESTAMPTZ becomes TEXT (ISO strings).
+
+    Regex-based so it can stay a single source of truth for the schema.
+    """
+    import re
+
+    repl: list[tuple[str, str]] = [
+        # UUID with default — drop the default; app provides uuid4().hex
+        (r"UUID\s+PRIMARY\s+KEY\s+DEFAULT\s+gen_random_uuid\(\)", "TEXT PRIMARY KEY"),
+        (r"UUID\s+PRIMARY\s+KEY",                                  "TEXT PRIMARY KEY"),
+        (r"\bUUID\b",                                              "TEXT"),
+        # Timestamps
+        (r"TIMESTAMPTZ\s+NOT\s+NULL\s+DEFAULT\s+NOW\(\)",          "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+        (r"\bTIMESTAMPTZ\b",                                       "TEXT"),
+        # JSON
+        (r"\bJSONB\b",                                             "TEXT"),
+        # Booleans — SQLite has no boolean type, store as 0/1 integers
+        (r"BOOLEAN\s+NOT\s+NULL\s+DEFAULT\s+FALSE",                "INTEGER NOT NULL DEFAULT 0"),
+        (r"BOOLEAN\s+NOT\s+NULL\s+DEFAULT\s+TRUE",                 "INTEGER NOT NULL DEFAULT 1"),
+        (r"\bBOOLEAN\b",                                           "INTEGER"),
+        # Numeric sizes
+        (r"\bSMALLINT\b",                                          "INTEGER"),
+        (r"VARCHAR\(\s*\d+\s*\)",                                  "TEXT"),
+    ]
+    for pat, sub in repl:
+        sql = re.sub(pat, sub, sql, flags=re.IGNORECASE)
+    return sql
 
 
 async def _ensure_columns(conn) -> None:
@@ -232,9 +340,32 @@ async def init_db() -> None:
       - lint_reports:      validation results (many per simulation)
     """
     engine = get_engine()
+    sqlite = is_sqlite()
+
+    if sqlite:
+        # Create the parent directory of the SQLite file (eg ~/.simd/) so
+        # the first connection doesn't fail with "unable to open database
+        # file".  Idempotent — does nothing if the dir already exists.
+        from pathlib import Path
+        url = get_database_url()
+        # sqlite+aiosqlite:///path → after ``///`` is the absolute path
+        if "///" in url:
+            db_path = Path(url.split("///", 1)[1])
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+
     async with engine.begin() as conn:
+        if sqlite:
+            # WAL gives readers concurrency with writers; default journal
+            # mode would serialize everything which kills throughput when
+            # the event stream and HTTP handlers race.
+            await conn.execute(text("PRAGMA journal_mode=WAL"))
+            await conn.execute(text("PRAGMA foreign_keys=ON"))
+
+        async def ddl(sql: str) -> None:
+            await conn.execute(text(_pg_to_sqlite(sql) if sqlite else sql))
+
         # ── Users ────────────────────────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS users (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 email TEXT NOT NULL UNIQUE,
@@ -243,10 +374,10 @@ async def init_db() -> None:
                 subscription_status TEXT NOT NULL DEFAULT 'free',
                 subscription_current_period_end TIMESTAMPTZ
             )
-        """))
+        """)
 
         # ── Simulations ──────────────────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS simulations (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -261,10 +392,10 @@ async def init_db() -> None:
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-        """))
+        """)
 
         # ── Simulation Config (1:1) ─────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS simulation_config (
                 simulation_id UUID PRIMARY KEY REFERENCES simulations(id) ON DELETE CASCADE,
                 case_spec JSONB,
@@ -279,18 +410,23 @@ async def init_db() -> None:
                 -- RegionSpec contract.
                 cfd_regions JSONB
             )
-        """))
+        """)
         # Migration: existing DBs created before cfd_regions landed need
         # the column added.  ``IF NOT EXISTS`` is idempotent — safe to
         # re-run on every startup.  No data loss; the new column defaults
         # to NULL which the reader treats as "single-region case".
-        await conn.execute(text("""
-            ALTER TABLE simulation_config
-              ADD COLUMN IF NOT EXISTS cfd_regions JSONB
-        """))
+        #
+        # SQLite has no ADD COLUMN IF NOT EXISTS — but on SQLite the
+        # CREATE TABLE above already includes ``cfd_regions``, so the
+        # migration is a no-op there.
+        if not sqlite:
+            await ddl("""
+                ALTER TABLE simulation_config
+                  ADD COLUMN IF NOT EXISTS cfd_regions JSONB
+            """)
 
         # ── Mesh Info (1:1) ──────────────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS mesh_info (
                 simulation_id UUID PRIMARY KEY REFERENCES simulations(id) ON DELETE CASCADE,
                 mesh_id TEXT NOT NULL,
@@ -300,10 +436,10 @@ async def init_db() -> None:
                 viewer_artifacts JSONB,
                 check_mesh JSONB
             )
-        """))
+        """)
 
         # ── Patch Configs (many per simulation) ──────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS patch_configs (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 simulation_id UUID NOT NULL REFERENCES simulations(id) ON DELETE CASCADE,
@@ -315,10 +451,10 @@ async def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'needs_config',
                 UNIQUE (simulation_id, patch_name)
             )
-        """))
+        """)
 
         # ── Runs ─────────────────────────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS runs (
                 id UUID PRIMARY KEY,
                 simulation_id UUID REFERENCES simulations(id) ON DELETE CASCADE,
@@ -345,10 +481,10 @@ async def init_db() -> None:
                 completed_at TIMESTAMPTZ,
                 result JSONB
             )
-        """))
+        """)
 
         # ── Events ───────────────────────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS events (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -359,10 +495,10 @@ async def init_db() -> None:
                 message TEXT NOT NULL,
                 payload JSONB NOT NULL DEFAULT '{}'
             )
-        """))
+        """)
 
         # ── Sim Progress (convergence data per run) ──────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS sim_progress (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 run_id UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -375,10 +511,10 @@ async def init_db() -> None:
                 execution JSONB,
                 field_ranges JSONB
             )
-        """))
+        """)
 
         # ── Chat Messages ────────────────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 simulation_id UUID NOT NULL REFERENCES simulations(id) ON DELETE CASCADE,
@@ -388,10 +524,10 @@ async def init_db() -> None:
                 artifacts JSONB,
                 timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-        """))
+        """)
 
         # ── Precheck History (1:1) ───────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS precheck_history (
                 simulation_id UUID PRIMARY KEY REFERENCES simulations(id) ON DELETE CASCADE,
                 submitted_prompt TEXT,
@@ -403,10 +539,10 @@ async def init_db() -> None:
                 suggested_config JSONB,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-        """))
+        """)
 
         # ── Lint Reports ─────────────────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS lint_reports (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 simulation_id UUID NOT NULL REFERENCES simulations(id) ON DELETE CASCADE,
@@ -415,10 +551,10 @@ async def init_db() -> None:
                 issues JSONB,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-        """))
+        """)
 
         # ── Simulation Reports ────────────────────────────────────────────
-        await conn.execute(text("""
+        await ddl("""
             CREATE TABLE IF NOT EXISTS simulation_reports (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 simulation_id UUID NOT NULL REFERENCES simulations(id) ON DELETE CASCADE,
@@ -428,11 +564,15 @@ async def init_db() -> None:
                 storage_key TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
-        """))
+        """)
 
         # ── Migrations: add columns that may be missing on older tables ──
         # (CREATE TABLE IF NOT EXISTS won't alter an existing table)
-        await _ensure_columns(conn)
+        # Skipped on SQLite — fresh single-file DBs always have the
+        # full schema from the CREATE TABLE statements above, and
+        # SQLite doesn't support ADD COLUMN IF NOT EXISTS.
+        if not sqlite:
+            await _ensure_columns(conn)
 
         # ── Indexes ──────────────────────────────────────────────────────
         await conn.execute(text(

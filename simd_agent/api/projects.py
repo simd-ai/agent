@@ -13,7 +13,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from simd_agent.db import get_session
+from simd_agent.db import get_session, portable_sql
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -53,12 +53,12 @@ async def create_project(body: ProjectCreate) -> ProjectOut:
     """Create a new project."""
     async with get_session() as session:
         result = await session.execute(
-            text("""
+            text(portable_sql("""
                 INSERT INTO projects (name, description, owner_id, metadata)
                 VALUES (:name, :description, :owner_id, :metadata)
                 RETURNING id, name, description, owner_id, metadata,
                           created_at::text, updated_at::text
-            """),
+            """)),
             {
                 "name": body.name,
                 "description": body.description,
@@ -76,21 +76,21 @@ async def list_projects(owner_id: str | None = None) -> list[ProjectOut]:
     async with get_session() as session:
         if owner_id:
             result = await session.execute(
-                text("""
+                text(portable_sql("""
                     SELECT id, name, description, owner_id, metadata,
                            created_at::text, updated_at::text
                     FROM projects WHERE owner_id = :owner_id
                     ORDER BY updated_at DESC
-                """),
+                """)),
                 {"owner_id": owner_id},
             )
         else:
             result = await session.execute(
-                text("""
+                text(portable_sql("""
                     SELECT id, name, description, owner_id, metadata,
                            created_at::text, updated_at::text
                     FROM projects ORDER BY updated_at DESC
-                """),
+                """)),
             )
         return [ProjectOut(**row) for row in result.mappings().all()]
 
@@ -100,11 +100,11 @@ async def get_project(project_id: UUID) -> ProjectOut:
     """Get a single project by ID."""
     async with get_session() as session:
         result = await session.execute(
-            text("""
+            text(portable_sql("""
                 SELECT id, name, description, owner_id, metadata,
                        created_at::text, updated_at::text
                 FROM projects WHERE id = :id
-            """),
+            """)),
             {"id": project_id},
         )
         row = result.mappings().one_or_none()
@@ -126,12 +126,12 @@ async def update_project(project_id: UUID, body: ProjectUpdate) -> ProjectOut:
 
     async with get_session() as session:
         result = await session.execute(
-            text(f"""
+            text(portable_sql(f"""
                 UPDATE projects SET {set_clauses}, updated_at = NOW()
                 WHERE id = :id
                 RETURNING id, name, description, owner_id, metadata,
                           created_at::text, updated_at::text
-            """),
+            """)),
             updates,
         )
         row = result.mappings().one_or_none()
