@@ -126,4 +126,4 @@ needed.
 License
 -------
 
-Apache 2.0 — see LICENSE.
+AGPL v3 — see LICENSE.

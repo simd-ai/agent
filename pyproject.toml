@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "FastAPI service for orchestrating CFD workflows via WebSockets"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "Apache-2.0"}
+license = {text = "AGPL-3.0-or-later"}
 authors = [
     {name = "SIMD Team"}
 ]
