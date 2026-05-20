@@ -40,8 +40,36 @@ def arrow_choice(prompt: str, options: Sequence[str]) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return _numbered_fallback(prompt, options)
 
-    # Import lazily — keeps non-TTY callers (and unit tests) from
-    # paying the prompt_toolkit startup cost.
+    # ``questionary.ask()`` internally calls ``asyncio.run()`` which
+    # fails when we're already inside a running event loop (the case
+    # here — ``simd run`` is async at the top level).  Run questionary
+    # on a worker thread so it gets its own loop; the calling thread
+    # blocks on ``join()`` so this is still synchronous from the
+    # caller's POV.
+    import threading
+
+    result: list[object] = [None]
+    exc: list[BaseException | None] = [None]
+
+    def _run() -> None:
+        try:
+            result[0] = _ask_questionary(prompt, options)
+        except BaseException as e:  # noqa: BLE001 — propagate to main thread
+            exc[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join()
+
+    if exc[0] is not None:
+        raise exc[0]
+    answer = result[0]
+    if answer is None:
+        raise KeyboardInterrupt()
+    return int(answer)  # type: ignore[arg-type]
+
+
+def _ask_questionary(prompt: str, options: Sequence[str]) -> int | None:
     import questionary
     from questionary import Style
 
@@ -58,7 +86,7 @@ def arrow_choice(prompt: str, options: Sequence[str]) -> int:
         questionary.Choice(title=opt, value=i)
         for i, opt in enumerate(options)
     ]
-    answer = questionary.select(
+    return questionary.select(
         prompt,
         choices=choices,
         use_indicator=True,
@@ -66,11 +94,6 @@ def arrow_choice(prompt: str, options: Sequence[str]) -> int:
         qmark="?",
         style=style,
     ).ask()
-
-    # ``ask()`` returns None when the user cancels (Ctrl-C / Esc).
-    if answer is None:
-        raise KeyboardInterrupt()
-    return answer
 
 
 def _numbered_fallback(prompt: str, options: Sequence[str]) -> int:
