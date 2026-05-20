@@ -36,19 +36,22 @@ paragraph of intent plus a geometry.
 
 ### Physics
 
-  - compressible and incompressible flow
-  - laminar and turbulent regimes
-  - conjugate heat transfer between solids and fluids
-  - multiphase flows (experimental)
+| Capability | Status |
+|---|---|
+| [Compressible & incompressible flow](Documentation/solvers/single-region) | stable |
+| Laminar & turbulent regimes (k-ε, k-ω SST, k-ω, Spalart-Allmaras) | stable |
+| [Conjugate heat transfer (solid-fluid)](Documentation/solvers/multi-region-cht) | stable |
+| [Multiphase flows](Documentation/solvers/multiphase) | experimental |
 
-See Documentation/solvers for the full list of supported solvers and turbulence models.
-
+See [Documentation/solvers](Documentation/solvers) for the full list of supported solvers.
 
 ### Infrastructure
 
-  - LLM: Google Gemini, Vertex AI, Ollama (local)
-  - storage: local filesystem or Google Cloud Storage
-  - auth: Neon Auth, or none (open mode)
+| Integration | Options |
+|---|---|
+| LLM provider | [Gemini](Documentation/llm-providers/gemini) · [Vertex AI](Documentation/llm-providers/vertex) · [Ollama](Documentation/llm-providers/ollama) (local) |
+| Object storage | local filesystem · Google Cloud Storage |
+| Authentication | Neon Auth · open (no auth) |
 
 
 What you need
