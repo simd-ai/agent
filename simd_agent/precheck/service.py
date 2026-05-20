@@ -26,7 +26,7 @@ from simd_agent.precheck.models import (
     Interpretation, ConfidenceScores,
     # constants
     FLUID_PRESETS, CRYOGENIC_KEYWORDS,
-    PRECHECK_MODEL, CONVERSATION_MODEL, CONVERSATION_TOKEN_LIMIT,
+    CONVERSATION_TOKEN_LIMIT,
     # tool schemas
     BOUNDARY_PLAN_TOOL_SCHEMA, PATCH_SPEC_TOOL_SCHEMA,
     READY_TOOL_SCHEMA,
@@ -68,6 +68,16 @@ class PrecheckService:
     @property
     def types(self):
         return self._provider.types
+
+    @property
+    def model(self) -> str:
+        """Lighter / faster model — chat and summarization."""
+        return self._provider.models["default"]
+
+    @property
+    def super_model(self) -> str:
+        """Heavier / higher-capacity model — planner, patch agents, review."""
+        return self._provider.models["super"]
 
     # ── Conversation system prompt ──────────────────────────────────────────
 
@@ -202,7 +212,7 @@ re-run the analysis, change the simulation setup, or start a new simulation.
 
             # ── Pass 3: Merge ─────────────────────────────────────────────────
             yield {"type": "merge_start"}
-            result = self._merge_patch_specs_into_response(
+            result = await self._merge_patch_specs_into_response(
                 request=request,
                 boundary_plan=planner_result,
                 patch_specs=patch_specs,
@@ -258,7 +268,7 @@ re-run the analysis, change the simulation setup, or start a new simulation.
         self, request: PrecheckRequest
     ) -> AsyncIterator[dict[str, Any]]:
         prompt = self._build_boundary_planner_prompt(request)
-        print(f"[Precheck/planner] prompt={len(prompt)} chars → {PRECHECK_MODEL}", flush=True)
+        print(f"[Precheck/planner] prompt={len(prompt)} chars → {self.super_model}", flush=True)
 
         config = self.types.GenerateContentConfig(
             thinking_config=self.types.ThinkingConfig(include_thoughts=True),
@@ -277,7 +287,7 @@ re-run the analysis, change the simulation setup, or start a new simulation.
                 func_call_args: dict[str, Any] | None = None
 
                 stream = await self.client.aio.models.generate_content_stream(
-                    model=PRECHECK_MODEL,
+                    model=self.super_model,
                     contents=prompt,
                     config=config,
                 )
@@ -546,7 +556,7 @@ re-run the analysis, change the simulation setup, or start a new simulation.
             for attempt in range(_MAX_LLM_RETRIES):
                 try:
                     stream = await self.client.aio.models.generate_content_stream(
-                        model=PRECHECK_MODEL,
+                        model=self.super_model,
                         contents=prompt,
                         config=patch_config,
                     )
@@ -897,7 +907,7 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
 
     # ── Pass 3: Merge ─────────────────────────────────────────────────────────
 
-    def _merge_patch_specs_into_response(
+    async def _merge_patch_specs_into_response(
         self,
         request: PrecheckRequest,
         boundary_plan: dict[str, Any],
@@ -1093,15 +1103,62 @@ Return ONLY data matching the PatchSpec schema via submit_patch_spec.
             _has_gravity = False
         else:
             _has_gravity = any(w in prompt_lower for w in _GRAVITY_KEYWORDS)
-        if has_heat and _has_gravity:
-            openfoam_solver = "buoyantPimpleFoam" if is_transient else "buoyantSimpleFoam"
-        elif is_compressible:
-            # Compressible solvers only for cryogenic / gas / explicit compressible flow
-            openfoam_solver = "rhoPimpleFoam" if is_transient else "rhoSimpleFoam"
-        elif not is_transient:
-            openfoam_solver = "simpleFoam"
-        else:
-            openfoam_solver = "pimpleFoam"
+        # ── LLM-fuzzy extraction of explicit user solver name ───────────────
+        # At precheck time there are no validated physics flags yet — only
+        # the user's natural-language input.  Feeding empty/all-False flags
+        # to the physics-based selector is contra-productive (it biases the
+        # LLM toward the wrong family).  Instead we run JUST the user-intent
+        # extractor: a single-purpose LLM call that returns a canonical
+        # solver name iff the user literally named one (typos tolerated).
+        #
+        # We pass the user's FULL conversation (all user turns from history
+        # + the current message), not just request.prompt.  Why: the chat
+        # frontend often hands us a short LLM-generated "ready signal"
+        # summary as request.prompt — which can truncate the user's
+        # original solver name (e.g. "...using buoyantBoussinesq" with the
+        # "SimpleFoam" suffix lost).  The original full prompt with the
+        # explicit solver name lives in request.history.
+        #
+        # If the extractor returns null (no explicit name found anywhere),
+        # we fall through to the prompt-derived keyword fallback below.
+        _user_turns = [
+            (m.get("content") or "").strip()
+            for m in (request.history or [])
+            if (m.get("role") == "user") and m.get("content")
+        ]
+        if request.prompt:
+            _user_turns.append(request.prompt.strip())
+        _full_user_text = "\n\n".join(t for t in _user_turns if t)
+
+        openfoam_solver: str | None = None
+        try:
+            from simd_agent.run.solver_selector import SolverSelector
+            _selector = SolverSelector()
+            openfoam_solver = await _selector.extract_user_solver_from_prompt(
+                _full_user_text,
+            )
+            if openfoam_solver:
+                print(f"[PRECHECK] User-named solver honored → '{openfoam_solver}'")
+            else:
+                print("[PRECHECK] No explicit solver named; using keyword fallback")
+        except Exception as exc:
+            print(f"[PRECHECK] User-intent extraction failed ({exc}); "
+                  f"using keyword fallback")
+
+        # Keyword fallback — fires when the user did not name a solver or
+        # the extractor failed.  Uses the has_heat / has_gravity /
+        # is_transient / is_compressible flags extracted from the prompt
+        # earlier in this function.
+        if openfoam_solver is None:
+            if has_heat and _has_gravity:
+                openfoam_solver = "buoyantPimpleFoam" if is_transient else "buoyantSimpleFoam"
+            elif is_compressible:
+                openfoam_solver = "rhoPimpleFoam" if is_transient else "rhoSimpleFoam"
+            elif not is_transient:
+                openfoam_solver = "simpleFoam"
+            else:
+                openfoam_solver = "pimpleFoam"
+            print(f"[PRECHECK] Keyword fallback → '{openfoam_solver}'")
 
         # ── Solver-identity invariant (safety net) ───────────────────────────
         # rhoSimpleFoam / rhoPimpleFoam / buoyantSimpleFoam / buoyantPimpleFoam
@@ -1795,7 +1852,7 @@ One paragraph recap, then a markdown table with ONLY the columns below (no extra
             "title": "Physics review",
             "description": "Reviewing boundary conditions, turbulence parameters, and fluid properties...",
         }
-        print(f"[Precheck] → review (model={PRECHECK_MODEL})...", flush=True)
+        print(f"[Precheck] → review (model={self.super_model})...", flush=True)
 
         review_config = self.types.GenerateContentConfig(
             thinking_config=self.types.ThinkingConfig(include_thoughts=True),
@@ -1804,7 +1861,7 @@ One paragraph recap, then a markdown table with ONLY the columns below (no extra
             for attempt in range(_MAX_LLM_RETRIES):
                 try:
                     stream = await self.client.aio.models.generate_content_stream(
-                        model=PRECHECK_MODEL,
+                        model=self.super_model,
                         contents=review_prompt,
                         config=review_config,
                     )
@@ -2141,7 +2198,7 @@ One paragraph recap, then a markdown table with ONLY the columns below (no extra
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream a conversational response (no full analysis).
 
-        Uses the lighter CONVERSATION_MODEL and the signal_ready_to_analyze
+        Uses the provider's lighter default model and the signal_ready_to_analyze
         tool.  When the LLM determines the user has provided enough info,
         it calls that tool and we emit a ``ready_to_analyze`` event.
         """
@@ -2222,7 +2279,7 @@ One paragraph recap, then a markdown table with ONLY the columns below (no extra
             for attempt in range(_MAX_LLM_RETRIES):
                 try:
                     stream = await self.client.aio.models.generate_content_stream(
-                        model=CONVERSATION_MODEL,
+                        model=self.model,
                         contents=contents,
                         config=config,
                     )
@@ -2317,7 +2374,7 @@ One paragraph recap, then a markdown table with ONLY the columns below (no extra
 
         try:
             response = await self.client.aio.models.generate_content(
-                model=CONVERSATION_MODEL,
+                model=self.model,
                 contents=prompt,
                 config=self.types.GenerateContentConfig(
                     max_output_tokens=2048,

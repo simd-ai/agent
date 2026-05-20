@@ -149,13 +149,24 @@ def equation_solver_block(
         )
 
     if plugin.supports_energy and plugin.energy_var in eq_fields:
+        # PIMPLE compressible energy stiffness:
+        # the pressure corrector changes phi every outer iteration, which
+        # resets the h/e equation's initial residual to ~1.  With
+        # relTol = 0.1 the solver exits after a single iteration
+        # (1e-3 < 0.1·1.0) leaving the energy field unconverged.  After a
+        # handful of outer corrector cycles T drifts, ρ from the EOS
+        # saturates against rhoMin/rhoMax, the p-equation matrix becomes
+        # ill-conditioned, and PBiCG's sumProd() hits a NaN → SIGFPE 136.
+        # SIMPLE doesn't have this failure mode (single solve per iter),
+        # so relTol = 0.1 is fine there for outer relaxation.
+        h_rel_tol = "0.1" if is_simple else "0"
         eq_block += (
             f"\n    {plugin.energy_var}\n"
             "    {\n"
             "        solver          PBiCG;\n"
             "        preconditioner  DILU;\n"
             "        tolerance       1e-06;\n"
-            "        relTol          0.1;\n"
+            f"        relTol          {h_rel_tol};\n"
             "    }\n"
         )
 

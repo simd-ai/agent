@@ -29,10 +29,12 @@ class LLMProvider(ABC):
     # ── lifecycle ────────────────────────────────────────────────
 
     @abstractmethod
-    def configure(self, api_key: str, **kwargs: Any) -> None:
-        """Initialise the provider with an API key and optional overrides.
+    def configure(self, **kwargs: Any) -> None:
+        """Initialise the provider with credentials and optional overrides.
 
-        Called once by the registry after reading settings.
+        Called once by the registry after reading settings.  Each provider
+        defines its own required kwargs (e.g. ``api_key=`` for Gemini,
+        ``project=``/``location=`` for Vertex, ``host=`` for Ollama).
         """
 
     @property

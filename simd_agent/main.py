@@ -570,19 +570,27 @@ async def websocket_run(websocket: WebSocket):
             await websocket.close(code=1003)
             return
 
-        # Enforce run limit for free-tier users
+        # Enforce per-project run limit for free-tier users
         if request.op in ("CFD_CODEGEN_RUN", "CFD_RESUBMIT") and request.metadata.user_id:
             try:
-                usage = await user_service.get_usage(UUID(request.metadata.user_id))
+                sim_uuid = (
+                    UUID(request.metadata.project_id)
+                    if request.metadata.project_id else None
+                )
+                usage = await user_service.get_usage(
+                    UUID(request.metadata.user_id),
+                    simulation_id=sim_uuid,
+                )
                 if not usage.can_start_run:
                     from simd_agent.telemetry import get_telemetry, UsageLimitHit
                     get_telemetry().capture(
                         UsageLimitHit(limit_type="run", current_count=usage.run_count),
                         user_id=request.metadata.user_id,
                     )
+                    scope_note = "per project" if sim_uuid else "total"
                     await websocket.send_json({
                         "type": "error",
-                        "error": f"Free plan allows up to {usage.limits.max_runs} simulation runs. "
+                        "error": f"Free plan allows up to {usage.limits.max_runs} simulation runs {scope_note}. "
                                  "Upgrade to Pro for unlimited runs.",
                         "code": "RUN_LIMIT_REACHED",
                     })
@@ -670,16 +678,32 @@ async def websocket_run(websocket: WebSocket):
     except Exception as e:
         cancelled.set()
         logger.exception(f"[WS] Unhandled error - run {run_id}: {e}")
-        if event_bus:
-            try:
-                await event_bus.emit_run_failed(f"Internal error: {e}")
-                await event_bus.emit_final(status="failed", error=str(e))
-            except Exception:
-                pass
+        # Respect a terminal state already written by the /stop or /cancel
+        # endpoint — they finalize the DB before the orchestrator's
+        # OrchestrationError bubbles up here, and overwriting with FAILED
+        # would strand the resume button (the /continue check expects STOPPED).
+        existing_status: RunStatus | None = None
         try:
-            await store.finalize_run(run_id=run_id, status=RunStatus.FAILED, result={"error": str(e)})
+            existing = await store.get_run(run_id)
+            existing_status = existing.status if existing else None
         except Exception:
             pass
+        if existing_status in _TERMINAL_STATUSES:
+            logger.info(
+                f"[WS] Run {run_id} already finalized as {existing_status.value}; "
+                f"not overwriting with FAILED"
+            )
+        else:
+            if event_bus:
+                try:
+                    await event_bus.emit_run_failed(f"Internal error: {e}")
+                    await event_bus.emit_final(status="failed", error=str(e))
+                except Exception:
+                    pass
+            try:
+                await store.finalize_run(run_id=run_id, status=RunStatus.FAILED, result={"error": str(e)})
+            except Exception:
+                pass
 
     finally:
         _active_orchestrators.pop(run_id, None)
@@ -827,16 +851,113 @@ async def stop_run(run_id: str) -> dict[str, Any]:
     if orchestrator is not None:
         orchestrator._stop_requested.set()
         logger.info(f"[STOP] Run {run_id} stop requested via REST endpoint")
+        # Emit an immediate ACK over the WebSocket so the frontend flips to
+        # "Stopping…" right away.  Without this the user sees no feedback
+        # until the sim server has finished reconstruction (10–30 s of
+        # apparent silence while residuals keep streaming).
+        sim_run_id = orchestrator._sim_run_id or (run.result or {}).get("sim_run_id")
+        try:
+            if orchestrator.event_bus is not None:
+                await orchestrator.event_bus.emit_sim_stopping(
+                    sim_run_id=sim_run_id, accepted=True,
+                    reason="Stop received — terminating solver…",
+                )
+        except Exception as _ee:
+            logger.warning(f"[STOP] Failed to emit sim_run_stopping ACK: {_ee}")
+
+        # Drive the sim server directly — relying solely on the orchestrator
+        # to pick up _stop_requested fails if it is outside the event-stream
+        # loop (codegen, validation, between retries, reconstruction).
+        if sim_run_id:
+            sim_client = SimulationServerClient()
+            try:
+                await sim_client.stop_run(sim_run_id)
+            except Exception as _ee:
+                logger.warning(f"[STOP] sim_server.stop_run failed for {sim_run_id}: {_ee}")
+
+        # Persist STOPPED so /continue can find the run in the correct state
+        # even if the orchestrator never reaches a check point (pre-submit
+        # stops are escalated to cancel by _check_cancelled, but the DB
+        # still needs the STOPPED transition for the resume button to work).
+        try:
+            await store.update_run_status(run_uuid, RunStatus.STOPPED)
+        except Exception as _ee:
+            logger.warning(f"[STOP] Failed to persist STOPPED status: {_ee}")
+
+        return {"run_id": run_id, "stopped": True, "sim_run_id": sim_run_id}
+
+    # No active orchestrator on this worker.  This happens after a page
+    # reload (the user is now on /ws/watch instead of /ws/run) or when a
+    # different uvicorn worker holds the orchestrator.  Drive the sim
+    # runner DIRECTLY using the persisted sim_run_id, then stream the
+    # reconstruction events back to any /ws/watch subscribers so the
+    # frontend sees the final results just like the happy path.
+    sim_run_id = (run.result or {}).get("sim_run_id")
+    watch_bus = get_watch_bus()
+
+    if not sim_run_id:
+        # Truly no idea what to do — mark the run stopped in DB and tell
+        # the frontend.  Without sim_run_id we cannot reach the runner.
+        await store.finalize_run(
+            run_id=run_uuid,
+            status=RunStatus.STOPPED,
+            result={"info": "Stopped by user (no sim_run_id recorded)"},
+        )
+        # Push a synthetic run_stopped to any watchers so a stuck button
+        # gets unstuck immediately.
+        from datetime import datetime
+        from simd_agent.models import AgentEvent, EventLevel
+        seq = (await store.get_last_seq(run_uuid)) + 1
+        ae = AgentEvent(
+            run_id=run_uuid, seq=seq, ts=datetime.utcnow(),
+            level=EventLevel.INFO, type="run_stopped",
+            message="Stopped by user", payload={},
+        )
+        try:
+            await store.append_event(ae)
+        except Exception:
+            pass
+        watch_bus.publish_nowait(str(run_uuid), ae.to_ws_message())
+        logger.info(f"[STOP] Run {run_id} marked stopped (no sim_run_id)")
         return {"run_id": run_id, "stopped": True}
 
-    # No active orchestrator — fall back to marking stopped in DB
-    await store.finalize_run(
-        run_id=run_uuid,
-        status=RunStatus.STOPPED,
-        result={"info": "Stopped by user"},
+    # Push an immediate ACK to watchers so the UI flips to "Stopping…"
+    # regardless of how long the sim runner takes to reconstruct.
+    from datetime import datetime
+    from simd_agent.models import AgentEvent, EventLevel
+    seq = (await store.get_last_seq(run_uuid)) + 1
+    ack = AgentEvent(
+        run_id=run_uuid, seq=seq, ts=datetime.utcnow(),
+        level=EventLevel.INFO, type="sim_run_stopping",
+        message="Stop received — terminating solver…",
+        payload={"sim_run_id": sim_run_id, "accepted": True},
     )
-    logger.info(f"[STOP] Run {run_id} marked stopped (no active orchestrator)")
-    return {"run_id": run_id, "stopped": True}
+    try:
+        await store.append_event(ack)
+    except Exception:
+        pass
+    watch_bus.publish_nowait(str(run_uuid), ack.to_ws_message())
+
+    # Drive the sim runner.  Errors are non-fatal — even if the runner
+    # never received our stop POST, the background streamer will still
+    # finalize the run on its own once the solver process exits and the
+    # runner emits artifacts_ready (sim runner side does reconstruction
+    # autonomously based on its stopped_runs flag).
+    sim_client = SimulationServerClient()
+    try:
+        await sim_client.stop_run(sim_run_id)
+    except Exception as _ee:
+        logger.warning(f"[STOP] sim_server.stop_run failed for {sim_run_id}: {_ee}")
+
+    # Spawn a background task to relay reconstruct + artifacts_ready to
+    # /ws/watch subscribers and finalize the run in the DB.  Uses the
+    # same plumbing as continue (_stream_continued_run) — see main.py.
+    asyncio.create_task(
+        _stream_stop_to_completion(run_uuid, sim_run_id, store)
+    )
+
+    logger.info(f"[STOP] Run {run_id} stop driven externally (sim_run_id={sim_run_id})")
+    return {"run_id": run_id, "stopped": True, "sim_run_id": sim_run_id}
 
 
 @app.post("/api/runs/{run_id}/continue")
@@ -1112,6 +1233,132 @@ async def _stream_continued_run(
             pass
 
 
+async def _stream_stop_to_completion(
+    run_id: UUID,
+    sim_run_id: str,
+    store: EventStore,
+) -> None:
+    """Background task: relay sim-runner reconstruction events to /ws/watch
+    subscribers after a stop request was issued from a worker that does NOT
+    own the orchestrator (page reload, multi-worker deployment).
+
+    The sim runner kills the solver and ALWAYS proceeds to reconstruct +
+    finalize on its own (see ``agent-simulation/app/runner.py:1163``), so
+    even if this task fails halfway we still get partial results saved on
+    disk.  The job of this task is purely to ferry the events back to the
+    frontend so the UI does not look frozen on "Stopping…" forever.
+    """
+    from datetime import datetime
+    from simd_agent.models import AgentEvent, EventLevel
+
+    watch_bus = get_watch_bus()
+    sim_client = SimulationServerClient()
+    seq = (await store.get_last_seq(run_id)) + 1
+
+    _MAP = {
+        "run_started": "sim_run_started",
+        "run_log": "sim_run_log",
+        "run_stopping": "sim_run_stopping",
+        "run_stopped": "sim_run_stopped",
+        "run_succeeded": "sim_run_succeeded",
+        "run_failed": "sim_run_failed",
+        "artifacts_ready": "sim_artifacts_ready",
+    }
+    _SKIP = {"decompose_started", "decompose_complete", "decompose_failed",
+             "decompose_log", "reconstruct_log", "run_log"}
+
+    final_status = RunStatus.STOPPED
+    summary = "Simulation stopped by user — partial results available"
+
+    try:
+        async for event in sim_client.stream_events(sim_run_id):
+            if event.type in _SKIP:
+                continue
+            mapped = _MAP.get(event.type, event.type)
+            ae = AgentEvent(
+                run_id=run_id, seq=seq, ts=datetime.utcnow(),
+                level=EventLevel.INFO, type=mapped,
+                message=event.message, payload=event.payload,
+            )
+            seq += 1
+            try:
+                # Persist terminal-ish events so a fresh /ws/watch
+                # reconnect can catch up; skip high-frequency progress.
+                if event.type not in ("run_progress", "run_progress_batch"):
+                    await store.append_event(ae)
+            except Exception:
+                pass
+            watch_bus.publish_nowait(str(run_id), ae.to_ws_message())
+
+            if event.type == "artifacts_ready":
+                break
+            if event.type == "run_failed":
+                final_status = RunStatus.FAILED
+                summary = event.message or "Simulation failed during stop"
+                break
+
+        # Final + terminal run_stopped if we didn't already see one
+        run_event_type = (
+            "run_stopped" if final_status == RunStatus.STOPPED else "run_failed"
+        )
+        ae = AgentEvent(
+            run_id=run_id, seq=seq, ts=datetime.utcnow(),
+            level=EventLevel.INFO, type=run_event_type,
+            message=summary, payload={},
+        )
+        seq += 1
+        try:
+            await store.append_event(ae)
+        except Exception:
+            pass
+        watch_bus.publish_nowait(str(run_id), ae.to_ws_message())
+
+        final_ae = AgentEvent(
+            run_id=run_id, seq=seq, ts=datetime.utcnow(),
+            level=EventLevel.INFO, type="final",
+            message=summary,
+            payload={
+                "run_id": str(run_id),
+                "status": final_status.value,
+                "validated_config": None,
+                "artifacts": [],
+                "iterations": 0,
+                "retries": 0,
+                "summary": summary,
+                "case_type": None,
+                "solver": None,
+                "error": None,
+            },
+        )
+        seq += 1
+        try:
+            await store.append_event(final_ae)
+        except Exception:
+            pass
+        watch_bus.publish_nowait(str(run_id), final_ae.to_ws_message())
+
+        await store.finalize_run(
+            run_id=run_id,
+            status=final_status,
+            result={"sim_run_id": sim_run_id, "summary": summary},
+        )
+        logger.info("[STOP-RELAY] Run %s finalized as %s", run_id, final_status.value)
+
+    except Exception as e:
+        logger.error("[STOP-RELAY] Stream error for run %s: %s", run_id, e)
+        # The sim runner reconstructs autonomously, so we still finalize as
+        # STOPPED in the DB even if event relay failed — the user can
+        # refresh and the run will be in the right state.
+        try:
+            await store.finalize_run(
+                run_id=run_id,
+                status=RunStatus.STOPPED,
+                result={"sim_run_id": sim_run_id, "info": "Stop relay disconnected"},
+            )
+        except Exception:
+            pass
+
+
 # ── Reconnectable watch WebSocket ─────────────────────────────────────────────
 
 _TERMINAL_STATUSES = {
@@ -1249,6 +1496,29 @@ async def websocket_watch(websocket: WebSocket, run_id: str, last_seq: int = 0):
 # Per-run download locks prevent concurrent coroutines from double-downloading.
 _vtk_download_locks: dict[str, asyncio.Lock] = {}
 
+# Per-run progress bus — the cache-fill pushes user-facing status updates here
+# and the SSE endpoint /api/runs/{run_id}/vtk-progress drains them.  Each run
+# has a single broadcast queue per subscriber so the frontend can attach late
+# (e.g. on a page reload mid-fill) and still receive the current state.
+_vtk_progress_subscribers: dict[str, list[asyncio.Queue]] = {}
+_vtk_progress_last: dict[str, dict] = {}
+
+
+def _vtk_progress_emit(run_id: str, payload: dict) -> None:
+    """Broadcast a progress update for ``run_id`` to every SSE subscriber.
+
+    Also stashes the latest payload so a subscriber that attaches AFTER the
+    update was emitted immediately receives the current state — avoids a
+    blank "Loading…" screen if the network call completes before the
+    EventSource handshake.
+    """
+    _vtk_progress_last[run_id] = payload
+    for q in _vtk_progress_subscribers.get(run_id, []):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass
+
 
 def _vtk_key(run_id: str, filename: str) -> str:
     """Build the storage key for a VTK result file."""
@@ -1259,6 +1529,173 @@ def _get_download_lock(run_id: str) -> asyncio.Lock:
     if run_id not in _vtk_download_locks:
         _vtk_download_locks[run_id] = asyncio.Lock()
     return _vtk_download_locks[run_id]
+
+
+def _peek_vtp_sync(label: str, vtp_bytes: bytes) -> dict:
+    """Parse VTP bytes and return a compact summary of what's inside.
+
+    Used purely for diagnostics — the "white mesh" symptom in the UI
+    means either the sim server returned a VTP with no field arrays,
+    or our merge logic dropped them.  Calling this on the bytes after
+    every download / merge tells us exactly where the data vanishes.
+    """
+    import tempfile
+    import numpy as np
+    import pyvista as pv
+
+    if not vtp_bytes:
+        return {"label": label, "empty": True}
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".vtp", delete=False) as tf:
+            tf.write(vtp_bytes)
+            tf.flush()
+            poly = pv.read(tf.name)
+    except Exception as e:
+        return {"label": label, "error": str(e), "bytes": len(vtp_bytes)}
+
+    def _arr_summary(container) -> dict:
+        out = {}
+        for name in container.keys():
+            arr = np.asarray(container[name])
+            nc = int(arr.shape[1]) if arr.ndim > 1 else 1
+            if arr.size == 0:
+                out[name] = {"components": nc, "tuples": 0}
+                continue
+            if nc > 1:
+                mag = np.linalg.norm(arr, axis=1)
+                rng = [float(mag.min()), float(mag.max())]
+            else:
+                rng = [float(arr.min()), float(arr.max())]
+            out[name] = {
+                "components": nc,
+                "tuples": int(arr.shape[0]),
+                "range": rng,
+                "sample": arr.flatten()[:8].tolist(),
+            }
+        return out
+
+    return {
+        "label": label,
+        "bytes": len(vtp_bytes),
+        "n_points": int(poly.n_points),
+        "n_cells":  int(poly.n_cells),
+        "point_arrays": _arr_summary(poly.point_data),
+        "cell_arrays":  _arr_summary(poly.cell_data),
+    }
+
+
+def _merge_region_vtps_sync(
+    region_vtps: list[tuple[str, bytes]],
+) -> tuple[bytes, list[dict]]:
+    """Combine per-region surface VTPs into a single VTP for the back-compat viewer.
+
+    CHT cases ship one VTP per region per timestep; the sim server's
+    ``/vtk/surface.vtp`` is single-region only.  Returning just the first
+    region produces a flat slab in the UI (the empty-direction face of a
+    2D case) with no field data — the "white rectangle" symptom.  Merging
+    all regions yields the full geometry, with fluid fields (U, p, T, k,
+    omega, nut) on the fluid regions and T on the solids.
+
+    ``vtkAppendPolyData`` (via :func:`pyvista.PolyData.append_polydata`)
+    zero-pads arrays missing from a region, so the merged dataset carries
+    the union of all field names.  Field ranges are recomputed globally
+    across the combined geometry so the colormap auto-scales sensibly.
+
+    Returns:
+        merged_vtp_bytes: combined VTP as raw XML bytes
+        fields: per-field metadata in the shape the frontend expects
+                ({name, num_components, range, location}).
+    """
+    import tempfile
+    import numpy as np
+    import pyvista as pv
+
+    if not region_vtps:
+        return b"", []
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        polys: list[pv.PolyData] = []
+        for region_name, b in region_vtps:
+            tmp = Path(tmpdir) / f"{region_name}.vtp"
+            tmp.write_bytes(b)
+            polys.append(pv.read(str(tmp)))
+
+        if len(polys) == 1:
+            merged = polys[0]
+        else:
+            # vtkAppendPolyData drops any array not present on every input,
+            # so a fluid-only field (U, p, k, …) would vanish if we just
+            # appended.  Pre-pad each region's PolyData with zero arrays
+            # for the union of all array names, then append.
+            def _components(arr) -> int:
+                return int(arr.shape[1]) if arr.ndim > 1 else 1
+
+            point_template: dict[str, tuple[int, np.dtype]] = {}
+            cell_template:  dict[str, tuple[int, np.dtype]] = {}
+            for poly in polys:
+                for name in poly.point_data.keys():
+                    arr = np.asarray(poly.point_data[name])
+                    point_template.setdefault(name, (_components(arr), arr.dtype))
+                for name in poly.cell_data.keys():
+                    arr = np.asarray(poly.cell_data[name])
+                    cell_template.setdefault(name, (_components(arr), arr.dtype))
+
+            for poly in polys:
+                for name, (nc, dtype) in point_template.items():
+                    if name in poly.point_data:
+                        continue
+                    shape = (poly.n_points, nc) if nc > 1 else (poly.n_points,)
+                    poly.point_data[name] = np.zeros(shape, dtype=dtype)
+                for name, (nc, dtype) in cell_template.items():
+                    if name in poly.cell_data:
+                        continue
+                    shape = (poly.n_cells, nc) if nc > 1 else (poly.n_cells,)
+                    poly.cell_data[name] = np.zeros(shape, dtype=dtype)
+
+            merged = polys[0].copy()
+            for p in polys[1:]:
+                merged = merged.append_polydata(p)
+
+        # foamToVTK's extract_surface produces the same physical field on
+        # both point_data and cell_data (e.g. ``T`` lives in both).  The
+        # frontend keys its picker by name, so emitting both creates
+        # duplicate keys (React warning) AND confuses the user with
+        # apparent "twice the same property".  Dedupe here, preferring
+        # point data — that's what vtk.js maps best for surface rendering.
+        fields: list[dict] = []
+        seen: set[str] = set()
+        for location_name, container in (
+            ("point", merged.point_data),
+            ("cell",  merged.cell_data),
+        ):
+            for name in list(container.keys()):
+                if name in seen:
+                    continue
+                # foamToVTK emits some bookkeeping arrays (vtkValidPointMask,
+                # vtkGhostType, …) and the per-vector magnitude helper.  None
+                # of these should appear in the field picker.
+                if name.endswith("_magnitude") or name.startswith("vtk"):
+                    continue
+                arr = np.asarray(container[name])
+                num_comp = int(arr.shape[1]) if arr.ndim > 1 else 1
+                if arr.size == 0:
+                    continue
+                if num_comp > 1:
+                    mag = np.linalg.norm(arr, axis=1)
+                    rng = [float(mag.min()), float(mag.max())]
+                else:
+                    rng = [float(arr.min()), float(arr.max())]
+                fields.append({
+                    "name": name,
+                    "num_components": num_comp,
+                    "range": rng,
+                    "location": location_name,
+                })
+                seen.add(name)
+
+        out_path = Path(tmpdir) / "merged.vtp"
+        merged.save(str(out_path))
+        return out_path.read_bytes(), fields
 
 
 async def _resolve_sim_run_id(run_id: str) -> str:
@@ -1337,6 +1774,11 @@ async def _ensure_vtk_cached(run_id: str) -> dict:
         sim_run_id = await _resolve_sim_run_id(run_id)
         settings = get_settings()
 
+        _vtk_progress_emit(run_id, {
+            "phase": "fetch_index",
+            "message": "Fetching simulation result index from the runner…",
+        })
+
         sim = SimulationServerClient(base_url=settings.simulation_server_url)
         try:
             # ── 1. Try precomputed index (newer sim servers) ──────────────────
@@ -1346,14 +1788,22 @@ async def _ensure_vtk_cached(run_id: str) -> dict:
                 sim_index = await sim.get_precomputed_index(sim_run_id)
                 if sim_index is not None:
                     raw_timesteps = sim_index.get("timesteps", [])
+                    raw_regions   = sim_index.get("regions") or {}
+                    # One-line summary; the full per-region breakdown
+                    # goes to DEBUG.
                     logger.info(
-                        f"[VTK] Sim server returned {len(raw_timesteps)} timesteps "
-                        f"(as-received order): "
-                        + ", ".join(
-                            f"{ts.get('time')} → {ts.get('filename')}"
-                            for ts in raw_timesteps
-                        )
+                        "[VTK] sim-server index: fields=%s timesteps=%d regions=%s",
+                        [f.get("name") for f in sim_index.get("fields", [])],
+                        len(raw_timesteps),
+                        list(raw_regions.keys()) or "NONE (single-region)",
                     )
+                    for rname, rblock in raw_regions.items():
+                        logger.debug(
+                            "[VTK][DEBUG]   region %s: fields=%s timesteps=%s",
+                            rname,
+                            [f.get("name") for f in rblock.get("fields", [])],
+                            [ts.get("time") for ts in rblock.get("timesteps", [])],
+                        )
             except SimulationServerError as idx_err:
                 logger.warning(
                     f"[VTK] Precomputed index unavailable ({idx_err}), "
@@ -1365,8 +1815,29 @@ async def _ensure_vtk_cached(run_id: str) -> dict:
             if sim_index is None:
                 logger.info(f"[VTK] Using fallback /vtk-results endpoint (no precomputed index)")
                 vtk_meta = await sim.get_vtk_results(sim_run_id)
-                logger.info(f"[VTK] Fallback vtk_meta keys: {list(vtk_meta.keys())} time={vtk_meta.get('time')}")
+                logger.info(
+                    "[VTK] fallback vtk_meta: keys=%s time=%s fields=%s",
+                    list(vtk_meta.keys()), vtk_meta.get("time"),
+                    [f.get("name") for f in vtk_meta.get("fields", [])],
+                )
+                if not vtk_meta.get("fields"):
+                    logger.warning(
+                        "[VTK] ⚠ sim server returned NO fields for run %s "
+                        "— the white-mesh symptom comes from here. Check sim "
+                        "server logs for foamToVTK / reconstruction issues.",
+                        sim_run_id,
+                    )
+                    logger.debug("[VTK][DEBUG] Full vtk_meta: %s", vtk_meta)
                 surface_bytes = await sim.download_surface_vtp(sim_run_id)
+                vtp_peek = await asyncio.to_thread(_peek_vtp_sync, "fallback surface.vtp", surface_bytes)
+                logger.info(
+                    "[VTK] fallback surface.vtp: %d bytes, %d pts, %d cells, point=%s cell=%s",
+                    vtp_peek.get("bytes", 0),
+                    vtp_peek.get("n_points", 0), vtp_peek.get("n_cells", 0),
+                    list((vtp_peek.get("point_arrays") or {}).keys()),
+                    list((vtp_peek.get("cell_arrays")  or {}).keys()),
+                )
+                logger.debug("[VTK][DEBUG] fallback VTP full peek: %s", vtp_peek)
                 await storage.upload(_vtk_key(run_id, "surface.vtp"), surface_bytes, "application/xml")
                 sim_time = float(vtk_meta.get("time") or 0.0)
                 time_str = str(sim_time)
@@ -1390,99 +1861,465 @@ async def _ensure_vtk_cached(run_id: str) -> dict:
                 logger.info(f"[VTK] Cached (fallback) surface.vtp for run {run_id} t={sim_time}")
                 return local_index
 
-            # Try to download surface.vtp; sim servers using the precomputed index
-            # may not expose /vtk/surface.vtp — fall back to the last timestep VTP.
+            # Detect multi-region BEFORE pulling surface.vtp — the sim
+            # server's /vtk/surface.vtp is single-region only, so for CHT
+            # cases we skip it and synthesise a merged surface from the
+            # per-region last-timestep VTPs further down.
+            sim_regions = sim_index.get("regions") or {}
+            is_multi_region = bool(sim_regions)
+
+            # Single-region: download the merged surface.vtp from the sim
+            # server.  Some sim servers using the precomputed index don't
+            # expose /vtk/surface.vtp — that's fine, the fallback at the
+            # end of this function copies the last timestep into place.
             surface_bytes: bytes | None = None
-            try:
-                surface_bytes = await sim.download_surface_vtp(sim_run_id)
-                await storage.upload(_vtk_key(run_id, "surface.vtp"), surface_bytes, "application/xml")
-                logger.info(f"[VTK] surface.vtp downloaded for {run_id}")
-            except SimulationServerError as surf_err:
-                logger.warning(
-                    f"[VTK] surface.vtp unavailable ({surf_err}); "
-                    "will copy last timestep VTP as surface.vtp after download"
-                )
+            if not is_multi_region:
+                try:
+                    surface_bytes = await sim.download_surface_vtp(sim_run_id)
+                    await storage.upload(_vtk_key(run_id, "surface.vtp"), surface_bytes, "application/xml")
+                    logger.info(f"[VTK] surface.vtp downloaded for {run_id}")
+                except SimulationServerError as surf_err:
+                    logger.warning(
+                        f"[VTK] surface.vtp unavailable ({surf_err}); "
+                        "will copy last timestep VTP as surface.vtp after download"
+                    )
 
             # ── 3. Download each timestep VTP (parallel) ────────────────────
-            raw_ts_list = sim_index.get("timesteps", [])
-            logger.info(
-                f"[VTK] About to download {len(raw_ts_list)} timesteps in parallel: "
-                + str([ts.get("time") for ts in raw_ts_list])
-            )
+            #
+            # Multi-region note: the sim server's index.json includes a
+            # ``regions`` block when the case is CHT:
+            #
+            #     {
+            #       "fields":    [...],     # back-compat = first region's
+            #       "timesteps": [...],     # back-compat = first region's
+            #       "regions": {
+            #         "innerFluid": {"fields": [...], "timesteps": [...]},
+            #         "outerFluid": {...},
+            #         "wall":       {...}
+            #       }
+            #     }
+            #
+            # We download each region's VTPs under
+            # ``timesteps/<region>/`` (preserved for future per-region UI)
+            # AND merge them per timestep into a combined VTP at the
+            # single-region path ``timesteps/<filename>.vtp``.  The
+            # back-compat surface.vtp / timesteps endpoints then return
+            # the merged dataset, which carries every region's geometry
+            # and the union of all field arrays.
 
             async def _download_one_ts(
-                i: int, ts: dict
+                i: int, total: int, ts: dict, region: str | None,
             ) -> tuple[int, float, str, bytes, list[dict]]:
                 sim_filename: str = ts["filename"]
                 time_float = float(ts["time"])
                 step_fields: list[dict] = ts.get("fields", [])
                 normalized_filename = f"t_{str(time_float).replace('.', '_')}.vtp"
+                storage_subpath = (
+                    f"timesteps/{region}/{normalized_filename}" if region
+                    else f"timesteps/{normalized_filename}"
+                )
                 logger.info(
-                    f"[VTK] [{i+1}/{len(raw_ts_list)}] "
-                    f"Downloading sim={sim_filename!r} time={time_float}"
+                    f"[VTK] [{i+1}/{total}] "
+                    f"{'region=' + region + ' ' if region else ''}"
+                    f"sim={sim_filename!r} time={time_float}"
                 )
                 vtp_bytes = await sim.download_precomputed_vtp(
-                    sim_run_id, sim_filename
+                    sim_run_id, sim_filename, region=region,
                 )
+                # Peek into the downloaded bytes — the index claims certain
+                # fields exist, but they only matter if they actually appear
+                # in the VTP itself.  Full dump goes to DEBUG; INFO gets a
+                # one-line summary so the terminal stays readable when 60+
+                # VTPs land in one go (3 regions × 20 timesteps).
+                vtp_peek = await asyncio.to_thread(
+                    _peek_vtp_sync,
+                    f"{region or 'single'}/t={time_float}",
+                    vtp_bytes,
+                )
+                point_arrs = list((vtp_peek.get("point_arrays") or {}).keys())
+                cell_arrs  = list((vtp_peek.get("cell_arrays")  or {}).keys())
+                logger.info(
+                    "[VTK] downloaded %s: %d bytes, %d pts, %d cells, point=%s cell=%s",
+                    vtp_peek.get("label"), vtp_peek.get("bytes", 0),
+                    vtp_peek.get("n_points", 0), vtp_peek.get("n_cells", 0),
+                    point_arrs, cell_arrs,
+                )
+                logger.debug("[VTK][DEBUG] downloaded VTP full peek: %s", vtp_peek)
                 await storage.upload(
-                    _vtk_key(run_id, f"timesteps/{normalized_filename}"),
+                    _vtk_key(run_id, storage_subpath),
                     vtp_bytes, "application/xml",
                 )
                 return i, time_float, normalized_filename, vtp_bytes, step_fields
 
-            ts_results = await asyncio.gather(
-                *[_download_one_ts(i, ts) for i, ts in enumerate(raw_ts_list)]
-            )
-            # Sort by original index to preserve order
-            ts_results_sorted = sorted(ts_results, key=lambda r: r[0])
-            local_timesteps: list[dict] = []
+            local_regions: dict[str, dict] = {}
             last_vtp_bytes: bytes | None = None
-            for _, time_float, normalized_filename, vtp_bytes, step_fields in ts_results_sorted:
-                last_vtp_bytes = vtp_bytes
-                entry: dict = {
-                    "time": time_float,
-                    "filename": normalized_filename,
-                    "vtp_url": f"/api/runs/{run_id}/vtk-timestep/{time_float}/surface.vtp",
-                }
-                if step_fields:
-                    entry["fields"] = step_fields
-                local_timesteps.append(entry)
-            logger.info(
-                f"[VTK] Saved {len(local_timesteps)} timesteps: "
-                + str([ts["time"] for ts in local_timesteps])
-            )
+            total_timesteps = 0
 
-            # If surface.vtp was unavailable, use the last (highest-time) timestep
+            if is_multi_region:
+                # Run all region downloads concurrently — fan out across
+                # all regions at once for the lowest possible end-to-end
+                # latency on the post-run cache fill.
+                tasks: list = []
+                task_keys: list[tuple[str, int]] = []
+                for region_name, region_block in sim_regions.items():
+                    region_ts_list = region_block.get("timesteps", []) or []
+                    for i, ts in enumerate(region_ts_list):
+                        tasks.append(_download_one_ts(
+                            i, len(region_ts_list), ts, region_name,
+                        ))
+                        task_keys.append((region_name, i))
+
+                _vtk_progress_emit(run_id, {
+                    "phase": "download",
+                    "total": len(tasks),
+                    "done":  0,
+                    "message": f"Downloading {len(tasks)} VTPs from "
+                               f"{len(sim_regions)} regions in parallel…",
+                })
+                results = await asyncio.gather(*tasks)
+                _vtk_progress_emit(run_id, {
+                    "phase": "download",
+                    "total": len(tasks),
+                    "done":  len(tasks),
+                    "message": "Downloads complete — preparing merge",
+                })
+
+                # Group results back by region, preserving order
+                grouped: dict[str, list] = {r: [] for r in sim_regions.keys()}
+                for (region_name, _), r in zip(task_keys, results):
+                    grouped[region_name].append(r)
+
+                # Build the per-region index entries (preserved for any
+                # future region-aware UI that wants to isolate one mesh).
+                # Also group VTP bytes by time across regions for merging.
+                by_time: dict[float, list[tuple[str, bytes]]] = {}
+                for region_name, region_results in grouped.items():
+                    region_results_sorted = sorted(
+                        region_results, key=lambda r: r[0],
+                    )
+                    region_timesteps: list[dict] = []
+                    for _, time_float, normalized_filename, vtp_bytes, step_fields in region_results_sorted:
+                        entry: dict = {
+                            "time": time_float,
+                            "filename": normalized_filename,
+                            "vtp_url": (
+                                f"/api/runs/{run_id}/vtk-timestep/"
+                                f"{time_float}/{region_name}/surface.vtp"
+                            ),
+                        }
+                        if step_fields:
+                            entry["fields"] = step_fields
+                        region_timesteps.append(entry)
+                        by_time.setdefault(time_float, []).append(
+                            (region_name, vtp_bytes),
+                        )
+                    local_regions[region_name] = {
+                        "fields":    sim_regions[region_name].get("fields", []),
+                        "timesteps": region_timesteps,
+                    }
+
+                # ── Pipelined merge + upload ───────────────────────────────
+                # Previously: ``await asyncio.gather(merges)`` followed by a
+                # ``for ... await storage.upload`` loop.  The merges WERE
+                # parallel but the upload loop serialised everything after,
+                # adding ~1s per timestep (visible in logs as monotonic
+                # 1.3-second gaps between "merged VTP for t=X" lines).
+                # Now each timestep's merge + upload runs in its own task,
+                # so 20 timesteps pipeline through the thread pool + GCS
+                # connection pool concurrently.  Wall time drops from ~25 s
+                # to a handful.
+                times_sorted = sorted(by_time.keys())
+                total = len(times_sorted)
+                _vtk_progress_emit(run_id, {
+                    "phase":   "merge",
+                    "done":    0,
+                    "total":   total,
+                    "message": f"Merging {total} timesteps across "
+                               f"{len(local_regions)} regions in parallel…",
+                })
+
+                done_count = 0
+                done_lock = asyncio.Lock()
+
+                async def _merge_and_upload(t: float) -> tuple[float, str, list[dict], bytes]:
+                    """Merge one timestep across regions, then upload it.
+
+                    Runs the CPU-bound pyvista work on a thread (releases the
+                    GIL for VTK's C++ paths) and the upload as an async I/O
+                    call.  Multiple instances of this coroutine race through
+                    the event loop in parallel.
+                    """
+                    nonlocal done_count
+                    merged_bytes, merged_fields = await asyncio.to_thread(
+                        _merge_region_vtps_sync, by_time[t],
+                    )
+                    normalized_filename = f"t_{str(t).replace('.', '_')}.vtp"
+                    await storage.upload(
+                        _vtk_key(run_id, f"timesteps/{normalized_filename}"),
+                        merged_bytes, "application/xml",
+                    )
+                    # Progress: bump counter under a lock so concurrent
+                    # tasks don't race on the increment.
+                    async with done_lock:
+                        done_count += 1
+                        _vtk_progress_emit(run_id, {
+                            "phase":   "merge",
+                            "done":    done_count,
+                            "total":   total,
+                            "message": f"Merged {done_count}/{total} timesteps",
+                        })
+                    return t, normalized_filename, merged_fields, merged_bytes
+
+                # Fire all merges+uploads as parallel tasks.  asyncio.gather
+                # preserves order so we don't need to sort again.
+                pipeline_results = await asyncio.gather(*[
+                    _merge_and_upload(t) for t in times_sorted
+                ])
+
+                local_timesteps = []
+                last_merged_fields: list[dict] = []
+                for t, normalized_filename, merged_fields, merged_bytes in pipeline_results:
+                    local_timesteps.append({
+                        "time": t,
+                        "filename": normalized_filename,
+                        "vtp_url": f"/api/runs/{run_id}/vtk-timestep/{t}/surface.vtp",
+                        "fields": merged_fields,
+                    })
+                    last_vtp_bytes = merged_bytes
+                    last_merged_fields = merged_fields
+
+                top_level_fields = last_merged_fields
+                total_timesteps = len(local_timesteps)
+                logger.info(
+                    f"[VTK] multi-region cache: "
+                    + ", ".join(
+                        f"{name}({len(b['timesteps'])}ts)"
+                        for name, b in local_regions.items()
+                    )
+                    + f" → merged into {total_timesteps} combined timestep(s)"
+                )
+            else:
+                # Single-region path — unchanged behaviour.
+                raw_ts_list = sim_index.get("timesteps", [])
+                logger.info(
+                    f"[VTK] About to download {len(raw_ts_list)} timesteps in parallel: "
+                    + str([ts.get("time") for ts in raw_ts_list])
+                )
+                ts_results = await asyncio.gather(*[
+                    _download_one_ts(i, len(raw_ts_list), ts, None)
+                    for i, ts in enumerate(raw_ts_list)
+                ])
+                ts_results_sorted = sorted(ts_results, key=lambda r: r[0])
+                local_timesteps = []
+                for _, time_float, normalized_filename, vtp_bytes, step_fields in ts_results_sorted:
+                    last_vtp_bytes = vtp_bytes
+                    entry = {
+                        "time": time_float,
+                        "filename": normalized_filename,
+                        "vtp_url": f"/api/runs/{run_id}/vtk-timestep/{time_float}/surface.vtp",
+                    }
+                    if step_fields:
+                        entry["fields"] = step_fields
+                    local_timesteps.append(entry)
+                top_level_fields = sim_index.get("fields", [])
+                total_timesteps = len(local_timesteps)
+                logger.info(
+                    f"[VTK] Saved {len(local_timesteps)} timesteps: "
+                    + str([ts["time"] for ts in local_timesteps])
+                )
+
+            # If surface.vtp was unavailable, use the last (highest-time) timestep.
+            # Multi-region always lands here because we skipped the sim-server
+            # surface.vtp download above — the merged VTP is the surface.
             if surface_bytes is None and local_timesteps and last_vtp_bytes:
                 sorted_ts = sorted(local_timesteps, key=lambda t: float(t["time"]))
                 last_ts = sorted_ts[-1]
-                last_ts_data = await storage.download(
-                    _vtk_key(run_id, f"timesteps/{last_ts['filename']}")
-                )
+                last_storage_subpath = f"timesteps/{last_ts['filename']}"
+                last_ts_data = await storage.download(_vtk_key(run_id, last_storage_subpath))
                 if last_ts_data:
                     await storage.upload(_vtk_key(run_id, "surface.vtp"), last_ts_data, "application/xml")
                     logger.info(f"[VTK] Used last timestep (t={last_ts['time']}) as surface.vtp")
 
             # ── 4. Write index ────────────────────────────────────────────────
-            local_index = {
-                "run_id": run_id,
-                "sim_run_id": sim_run_id,
-                "total": len(local_timesteps),
-                "fields": sim_index.get("fields", []),
+            local_index: dict = {
+                "run_id":      run_id,
+                "sim_run_id":  sim_run_id,
+                "total":       total_timesteps,
+                "fields":      top_level_fields,
                 "surface_vtp": f"/api/runs/{run_id}/vtk/surface.vtp",
-                "timesteps": local_timesteps,
+                "timesteps":   local_timesteps,
             }
+            if is_multi_region:
+                local_index["regions"] = local_regions
             await storage.upload(index_key, json.dumps(local_index).encode())
-            logger.info(f"[VTK] Cached {len(local_timesteps)} VTPs for run {run_id}")
+            logger.info(
+                f"[VTK] Cached {total_timesteps} VTP(s) for run {run_id}"
+                f"{' across ' + str(len(local_regions)) + ' regions' if is_multi_region else ''}"
+            )
+            _vtk_progress_emit(run_id, {
+                "phase":   "done",
+                "total":   total_timesteps,
+                "done":    total_timesteps,
+                "message": f"Ready — {total_timesteps} timestep(s) cached",
+            })
             return local_index
 
         except SimulationServerError as e:
+            _vtk_progress_emit(run_id, {
+                "phase":   "error",
+                "message": f"Simulation server error: {e}",
+            })
             raise HTTPException(status_code=502, detail=f"Simulation server error: {e}")
         finally:
             await sim.close()
 
 
 # ── VTK Results ──────────────────────────────────────────────────────────────
+
+@app.get("/api/runs/{run_id}/vtk-progress")
+async def vtk_progress_stream(run_id: str, request: Request):
+    """Server-Sent Events stream of cache-fill progress for ``run_id``.
+
+    The frontend opens this alongside ``/vtk-results`` so the user sees
+    "Downloading 60 VTPs…", "Merged 12/20 timesteps…", "Ready" instead of
+    a blank loading box while the agent pipelines downloads + per-region
+    merges + GCS uploads.  Each event has shape::
+
+        {"phase": "download" | "merge" | "done" | "error",
+         "done": int, "total": int, "message": str}
+
+    Streaming protocol: SSE, one ``data:`` line per event, ``\\n\\n``
+    delimited.  The client is responsible for closing on phase=done.
+    """
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    _vtk_progress_subscribers.setdefault(run_id, []).append(queue)
+
+    # Replay the most recent event so the frontend immediately knows the
+    # current phase — important for late subscribers (page reload mid-fill,
+    # SSE handshake races the producer).
+    if run_id in _vtk_progress_last:
+        try:
+            queue.put_nowait(_vtk_progress_last[run_id])
+        except asyncio.QueueFull:
+            pass
+
+    async def _stream():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    # Heartbeat so intermediaries don't reap the connection.
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+                if event.get("phase") in ("done", "error"):
+                    break
+        finally:
+            subs = _vtk_progress_subscribers.get(run_id, [])
+            if queue in subs:
+                subs.remove(queue)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "Connection":        "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/runs/{run_id}/vtk-debug")
+async def vtk_debug(run_id: str) -> dict[str, Any]:
+    """Diagnostic dump of the cached VTK index + a peek into surface.vtp.
+
+    Use this when the 3D viewer renders a white mesh: the response tells
+    you whether the cached index has fields, whether the merged surface
+    VTP actually carries the simulation arrays, or whether the run went
+    through the fallback path (no precomputed index).
+    """
+    from simd_agent.storage import get_storage
+    storage = get_storage()
+
+    index_data = await storage.download(_vtk_key(run_id, "index.json"))
+    index = json.loads(index_data) if index_data else None
+
+    surface_bytes = await storage.download(_vtk_key(run_id, "surface.vtp"))
+    surface_peek = (
+        await asyncio.to_thread(_peek_vtp_sync, "surface.vtp", surface_bytes)
+        if surface_bytes else None
+    )
+
+    return {
+        "run_id": run_id,
+        "index": index,
+        "surface_vtp_peek": surface_peek,
+    }
+
+
+@app.post("/api/runs/{run_id}/vtk-clear-cache")
+async def vtk_clear_cache(run_id: str) -> dict[str, Any]:
+    """Delete the cached VTK index + surface so the next /vtk-results call
+    re-downloads everything from the sim server.  Useful after fixing a
+    bad cache (e.g. one created before the multi-region merge fix)."""
+    from simd_agent.storage import get_storage
+    storage = get_storage()
+    # Delete the index — _ensure_vtk_cached re-runs when it's gone.
+    deleted = []
+    for sub in ("index.json", "surface.vtp"):
+        try:
+            await storage.delete(_vtk_key(run_id, sub))
+            deleted.append(sub)
+        except Exception as e:
+            logger.warning(f"[VTK] clear-cache: could not delete {sub}: {e}")
+    return {"run_id": run_id, "deleted": deleted}
+
+
+def _dedupe_fields(fields: list[dict]) -> list[dict]:
+    """Drop duplicate field entries that differ only by point/cell location.
+
+    foamToVTK + extract_surface emit the same physical field on both
+    ``point_data`` and ``cell_data``, so a raw field list contains
+    ``[{name: T, location: point}, {name: T, location: cell}]``.  React
+    keys collide and the picker shows duplicates.  Prefer the point
+    entry — that's what vtk.js maps best for surface rendering.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for f in fields:
+        name = f.get("name")
+        if not name or name in seen:
+            continue
+        out.append(f)
+        seen.add(name)
+    return out
+
+
+def _absolute_region_block(base: str, region_block: dict) -> dict:
+    """Return a copy of a region block with relative ``vtp_url``s rewritten
+    to absolute URLs against the agent's base URL.  Same shape as the
+    sim server's index but ready for the frontend to fetch."""
+    out: dict[str, Any] = {
+        "fields": _dedupe_fields(region_block.get("fields", []) or []),
+        "timesteps": [],
+    }
+    for ts in region_block.get("timesteps", []):
+        entry = dict(ts)
+        entry["fields"] = _dedupe_fields(ts.get("fields", []) or [])
+        if "vtp_url" in entry and not str(entry["vtp_url"]).startswith("http"):
+            entry["vtp_url"] = f"{base}{entry['vtp_url']}"
+        out["timesteps"].append(entry)
+    # Last frame URL for the viewer's initial render.
+    if out["timesteps"]:
+        last = max(out["timesteps"], key=lambda t: float(t["time"]))
+        out["last_vtp_url"] = last.get("vtp_url")
+        out["last_time"] = float(last["time"])
+    return out
+
 
 @app.get("/api/runs/{run_id}/vtk-results")
 async def get_vtk_results(run_id: str, request: Request) -> dict[str, Any]:
@@ -1498,6 +2335,8 @@ async def get_vtk_results(run_id: str, request: Request) -> dict[str, Any]:
             "vtp_url":         str,
             "fields":          [{...}],
             "total_timesteps": int,
+            # multi-region only:
+            "regions":         {"<name>": {fields, timesteps, last_vtp_url, last_time}, ...}
         }
     """
     local_index = await _ensure_vtk_cached(run_id)
@@ -1517,13 +2356,21 @@ async def get_vtk_results(run_id: str, request: Request) -> dict[str, Any]:
     from simd_agent.telemetry import get_telemetry, ResultsViewed
     get_telemetry().capture(ResultsViewed())
 
-    return {
+    response: dict[str, Any] = {
         "run_id": run_id,
         "time": last_time,
         "vtp_url": last_vtp_url,
-        "fields": local_index.get("fields", []),
+        "fields": _dedupe_fields(local_index.get("fields", []) or []),
         "total_timesteps": len(timesteps),
     }
+
+    raw_regions = local_index.get("regions")
+    if raw_regions:
+        response["regions"] = {
+            name: _absolute_region_block(base, block)
+            for name, block in raw_regions.items()
+        }
+    return response
 
 
 @app.get("/api/runs/{run_id}/vtk/surface.vtp")
@@ -1575,26 +2422,39 @@ async def get_timesteps(run_id: str, request: Request) -> dict[str, Any]:
     base = str(request.base_url).rstrip("/")
     timesteps = []
     for ts in sorted(local_index.get("timesteps", []), key=lambda t: float(t["time"])):
-        entry = {
+        entry: dict = {
             "time": ts["time"],
             "vtp_url": f"{base}{ts['vtp_url']}",
         }
         if "fields" in ts:
-            entry["fields"] = ts["fields"]
+            entry["fields"] = _dedupe_fields(ts["fields"] or [])
         timesteps.append(entry)
-    return {
+    response: dict[str, Any] = {
         "run_id": run_id,
         "total": local_index.get("total", len(timesteps)),
-        "fields": local_index.get("fields", []),
+        "fields": _dedupe_fields(local_index.get("fields", []) or []),
         "timesteps": timesteps,
     }
+    raw_regions = local_index.get("regions")
+    if raw_regions:
+        response["regions"] = {
+            name: _absolute_region_block(base, block)
+            for name, block in raw_regions.items()
+        }
+    return response
 
 
 # ── Per-timestep VTP ─────────────────────────────────────────────────────────
 
 @app.get("/api/runs/{run_id}/vtk-timestep/{time_str}/surface.vtp")
 async def serve_timestep_vtp(run_id: str, time_str: str):
-    """Serve a timestep VTP from object storage."""
+    """Serve a single-region timestep VTP from object storage.
+
+    Backward-compat path: cached at ``timesteps/<filename>.vtp``.  For
+    multi-region cases, callers should use the per-region endpoint
+    :func:`serve_region_timestep_vtp` below — that's the URL emitted in
+    the multi-region branch of ``_ensure_vtk_cache``.
+    """
     from simd_agent.storage import get_storage
 
     filename = f"t_{time_str.replace('.', '_')}.vtp"
@@ -1618,6 +2478,52 @@ async def serve_timestep_vtp(run_id: str, time_str: str):
         media_type="application/xml",
         headers={
             "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "public, max-age=86400",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+@app.get("/api/runs/{run_id}/vtk-timestep/{time_str}/{region}/surface.vtp")
+async def serve_region_timestep_vtp(run_id: str, time_str: str, region: str):
+    """Serve a per-region timestep VTP from object storage (CHT cases).
+
+    Multi-region cases cache each region's VTPs under the storage prefix
+    ``timesteps/<region>/`` so they never collide with other regions.
+    The local index built by ``_ensure_vtk_cache`` emits URLs in this
+    exact shape:
+
+        /api/runs/{run_id}/vtk-timestep/{time}/{region}/surface.vtp
+    """
+    from simd_agent.storage import get_storage
+
+    # Mirror the sim server's filename convention — replace '.' with '_'
+    # so 1.5 → t_1_5.vtp, 200 → t_200.vtp.
+    filename = f"t_{time_str.replace('.', '_')}.vtp"
+    key = _vtk_key(run_id, f"timesteps/{region}/{filename}")
+    data = await get_storage().download(key)
+
+    if data is None:
+        # Trigger cache fill then retry — covers the case where the
+        # client polls the URL before the post-run download finishes.
+        await _ensure_vtk_cached(run_id)
+        data = await get_storage().download(key)
+
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"region={region!r} t={time_str!r} VTP not found — "
+                "ensure /vtk-results has been called and the case is multi-region"
+            ),
+        )
+
+    from fastapi.responses import Response
+    return Response(
+        content=data,
+        media_type="application/xml",
+        headers={
+            "Content-Disposition": f'inline; filename="{region}_{filename}"',
             "Cache-Control": "public, max-age=86400",
             "Access-Control-Allow-Origin": "*",
         },

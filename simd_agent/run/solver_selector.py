@@ -15,6 +15,7 @@ A heuristic fallback (deterministic rules) is applied if the LLM call fails or
 returns an invalid/unsupported solver name.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -31,35 +32,45 @@ logger = logging.getLogger(__name__)
 # ── Supported single-phase solvers ───────────────────────────────────────────
 # Multiphase (interFoam, compressibleInterFoam, etc.) is reserved for a later phase.
 
-# Solvers where pressure is *kinematic* p (m²/s²) — generate 0/p
-P_SOLVERS: set[str] = {
-    "simpleFoam",
-    "pimpleFoam",
-    "rhoSimpleFoam",
-    "rhoPimpleFoam",
-}
+# The following sets are derived from the live plugin registry so a new
+# solver dropped under ``simd_agent/solvers/`` becomes visible everywhere
+# without editing this file.  The static fallback (used only when the
+# registry can't be imported, e.g. tooling that pulls this module in
+# isolation) covers the original six core solvers.
+def _registry_or_fallback(getter, fallback: set[str]) -> set[str]:
+    try:
+        from simd_agent.solvers import get_registry
+        return set(getter(get_registry()))
+    except Exception:
+        return fallback
 
-# Solvers where pressure is p_rgh (Pa relative) — generate 0/p_rgh + constant/g
-P_RGH_SOLVERS: set[str] = {
-    "buoyantSimpleFoam",
-    "buoyantPimpleFoam",
-}
 
-# Solvers that solve the energy equation and MUST have 0/T
-ENERGY_SOLVERS: set[str] = {
-    "rhoSimpleFoam",
-    "rhoPimpleFoam",
-    "buoyantSimpleFoam",
-    "buoyantPimpleFoam",
-}
+P_SOLVERS: set[str] = _registry_or_fallback(
+    lambda r: r.p_solvers(),
+    {"simpleFoam", "pimpleFoam", "rhoSimpleFoam", "rhoPimpleFoam"},
+)
 
-# Solvers that require constant/g (gravity vector)
-GRAVITY_SOLVERS: set[str] = P_RGH_SOLVERS
+P_RGH_SOLVERS: set[str] = _registry_or_fallback(
+    lambda r: r.p_rgh_solvers(),
+    {"buoyantSimpleFoam", "buoyantPimpleFoam"},
+)
 
-# Solvers that require constant/thermophysicalProperties
+ENERGY_SOLVERS: set[str] = _registry_or_fallback(
+    lambda r: r.energy_solvers(),
+    {"rhoSimpleFoam", "rhoPimpleFoam", "buoyantSimpleFoam", "buoyantPimpleFoam"},
+)
+
+GRAVITY_SOLVERS: set[str] = _registry_or_fallback(
+    lambda r: r.gravity_solvers(),
+    P_RGH_SOLVERS,
+)
+
 THERMO_SOLVERS: set[str] = ENERGY_SOLVERS
 
-ALLOWED_SOLVERS: set[str] = P_SOLVERS | P_RGH_SOLVERS
+ALLOWED_SOLVERS: set[str] = _registry_or_fallback(
+    lambda r: r.allowed_solvers(),
+    P_SOLVERS | P_RGH_SOLVERS,
+)
 
 
 def _assert_sets_match_registry() -> None:
@@ -222,11 +233,16 @@ def _is_cryogenic_boiling(validated_config: dict[str, Any]) -> bool:
     return bool(bc_temps) and max(bc_temps) > boiling_k + 10
 
 
-def _heuristic_fallback(validated_config: dict[str, Any]) -> str:
+def _heuristic_fallback(
+    validated_config: dict[str, Any],
+    user_requirements: str = "",
+) -> str:
     """Pure-logic fallback when the LLM response is unparseable or invalid.
 
     Decision logic, in order:
 
+      0. Honor explicit solver names in the user prompt (highest priority —
+         user knows what they want; only override on direct contradiction).
       1. Cryogenic liquid (name keyword or T_inlet < 130 K) → rho*  (density-T coupling)
       2. Heat transfer active:
            - with gravity / buoyancy → buoyant*  (natural convection)
@@ -237,6 +253,38 @@ def _heuristic_fallback(validated_config: dict[str, Any]) -> str:
       4. Otherwise → simple* / pimple* (incompressible isothermal)
     """
     f = _extract_flags(validated_config)
+    prompt_squashed = "".join((user_requirements or "").lower().split())
+
+    # 0. Explicit solver mention in the prompt — most specific first.
+    _USER_SOLVER_MAP = (
+        ("buoyantboussinesqsimplefoam", "buoyantBoussinesqSimpleFoam"),
+        ("buoyantboussinesqpimplefoam", "buoyantBoussinesqPimpleFoam"),
+        ("chtmultiregionsimplefoam",   "chtMultiRegionSimpleFoam"),
+        ("chtmultiregionfoam",         "chtMultiRegionFoam"),
+        ("buoyantsimplefoam",          "buoyantSimpleFoam"),
+        ("buoyantpimplefoam",          "buoyantPimpleFoam"),
+        ("rhosimplefoam",              "rhoSimpleFoam"),
+        ("rhopimplefoam",              "rhoPimpleFoam"),
+        ("simplefoam",                 "simpleFoam"),
+        ("pimplefoam",                 "pimpleFoam"),
+    )
+    for token, canonical in _USER_SOLVER_MAP:
+        if token in prompt_squashed and canonical in ALLOWED_SOLVERS:
+            user_is_steady = canonical.endswith("SimpleFoam")
+            user_is_transient = (
+                canonical.endswith("PimpleFoam")
+                or canonical == "chtMultiRegionFoam"
+            )
+            if (user_is_steady and not f["transient"]) or (user_is_transient and f["transient"]):
+                logger.info(
+                    f"[SOLVER_SELECT] Heuristic: user named '{canonical}' — honoring"
+                )
+                return canonical
+            logger.warning(
+                f"[SOLVER_SELECT] User named '{canonical}' but it contradicts "
+                f"the time scheme (transient={f['transient']}) — ignoring"
+            )
+            break
 
     # 1. Cryogenic single-phase liquid (LH2, LN2, LOX, LHe, etc.) → rho*
     if _is_cryogenic_liquid(validated_config):
@@ -247,8 +295,26 @@ def _heuristic_fallback(validated_config: dict[str, Any]) -> str:
         return "rhoPimpleFoam" if f["transient"] else "rhoSimpleFoam"
 
     # 2. Heat transfer active → buoyant (with gravity) or rho* (forced convection)
+    #    "Gravity" is detected both from the explicit flag AND from natural-
+    #    language mentions in the prompt ("gravity acts downward at 9.81…",
+    #    "natural convection", "buoyancy-driven", …) — the form's gravity
+    #    checkbox is often left unticked even when the prompt is explicit.
+    prompt_gravity_keywords = (
+        "gravity", "gravitational", "buoyancy", "buoyant",
+        "natural convection", "free convection",
+    )
+    prompt_no_gravity = any(p in (user_requirements or "").lower() for p in (
+        "no gravity", "without gravity", "ignore gravity",
+        "no buoyancy", "without buoyancy",
+        "forced convection",
+    ))
+    has_gravity = f["gravity"] or (
+        not prompt_no_gravity
+        and any(kw in (user_requirements or "").lower() for kw in prompt_gravity_keywords)
+    )
+
     if f["heat"]:
-        if f["gravity"]:
+        if has_gravity:
             logger.info(
                 "[SOLVER_SELECT] Heuristic: heat transfer + gravity → buoyant solver"
             )
@@ -281,19 +347,35 @@ single most appropriate OpenFOAM solver from the allowed list below.
 ALLOWED SOLVERS — return EXACTLY one of these names (or null for unsupported cases):
 
   # No heat transfer, incompressible
-  simpleFoam        — steady-state, standard industrial flows (pipes, ducts, external aero)
-  pimpleFoam        — transient, vortex shedding, moving mesh, pulsating flow
+  simpleFoam                       — steady-state, standard industrial flows (pipes, ducts, external aero)
+  pimpleFoam                       — transient, vortex shedding, moving mesh, pulsating flow
 
-  # High-speed compressible with heat (Mach > 0.3)
-  rhoSimpleFoam     — compressible steady-state, high-speed aerodynamics
-  rhoPimpleFoam     — compressible transient, pressure waves, acoustics
+  # Compressible with heat (high-speed, large ΔT, or cryogenic — needs full EOS)
+  rhoSimpleFoam                    — compressible steady-state, high-speed aerodynamics, cryogenic
+  rhoPimpleFoam                    — compressible transient, pressure waves, acoustics, cryogenic
 
-  # Buoyancy-driven (natural/forced convection, gravity-dominated, HVAC)
-  buoyantSimpleFoam — buoyancy steady-state, heated rooms, HVAC, electronic cooling
-  buoyantPimpleFoam — buoyancy transient, smoke spread, fire, ventilation transients
+  # Buoyancy-driven, full compressible (gravity + significant β·ΔT — fire, smoke, large rooms)
+  buoyantSimpleFoam                — buoyancy steady-state, heated rooms, HVAC, electronic cooling
+  buoyantPimpleFoam                — buoyancy transient, smoke spread, fire, ventilation transients
+
+  # Buoyancy-driven, BOUSSINESQ approximation (small β·ΔT ≲ 10–20 %, faster than full compressible)
+  buoyantBoussinesqSimpleFoam      — Boussinesq steady, mild heating, natural convection benchmarks
+  buoyantBoussinesqPimpleFoam      — Boussinesq transient, plume oscillation, weak unsteadiness
+
+  # Conjugate heat transfer — fluid AND solid regions, heat passes through solid walls
+  chtMultiRegionSimpleFoam         — CHT steady, heat exchangers, electronic packages with metal walls
+  chtMultiRegionFoam               — CHT transient, thermal start-up, time-dependent heat transfer
 
 NOTE: Multiphase (interFoam, compressibleInterFoam, etc.) is NOT currently supported.
 If the case requires two or more phases, set solver to null and warn the user.
+
+When the user explicitly names "Boussinesq" / "incompressible Boussinesq"
+or mentions β (volumetric expansion coefficient) + T_ref, prefer the
+buoyantBoussinesq* variant over the full buoyant* variant.
+
+When the user describes multiple regions (a solid wall between two
+fluids, a pipe-in-pipe with metal in between, a heat exchanger with
+a wall region), pick chtMultiRegion{Simple,}Foam.
 ══════════════════════════════════════════════════════════════
 
 ──────────────────────────────────────────────────────────────
@@ -379,23 +461,41 @@ Transient: "transient", "unsteady", "time-varying", "oscillating", "pulsating",
   "start-up", "smoke spread", "moving parts", "ventilation transient"
 When ambiguous: default to steady.
 
+## 7. Honor explicit user solver requests (UNLESS they contradict the physics)
+If the user explicitly names an OpenFOAM solver in the User Requirements
+section ("use rhoPimpleFoam", "with buoyantBoussinesqSimpleFoam", "run
+simpleFoam", …), HONOR that choice — return exactly that solver name —
+UNLESS it contradicts another statement they made in the same prompt:
+
+  • User says "rhoSimpleFoam" but ALSO says "transient" → CONTRADICTION.
+    Pick `rhoPimpleFoam` and add a warning explaining the swap.
+  • User says "pimpleFoam" but ALSO says "steady-state" → CONTRADICTION.
+    Pick `simpleFoam` and warn.
+  • User says "simpleFoam" but ALSO mentions hot/cold walls / heat
+    transfer / temperature gradients → CONTRADICTION (simpleFoam has no
+    energy equation).  Pick the appropriate compressible-energy or
+    buoyant solver and warn.
+  • User says "buoyantSimpleFoam" but ALSO says "no gravity / forced
+    convection" → CONTRADICTION.  Pick `rhoSimpleFoam` and warn.
+
+Otherwise (no contradiction), the user's explicit name wins over the
+deterministic rules above.  Use `confidence: "high"` and put "Honoring
+user-requested solver" in `reason`.
+
 ──────────────────────────────────────────────────────────────
-OUTPUT FORMAT — return ONLY valid JSON, no other text
+OUTPUT — call the report_selected_solver tool
 ──────────────────────────────────────────────────────────────
-{
-  "solver": "<solver_name_or_null>",
-  "confidence": "high" | "medium" | "low",
-  "reason": "<one sentence explaining the key decision>",
-  "flags": {
-    "phases": <integer>,
-    "compressible": <bool>,
-    "transient": <bool>,
-    "heat": <bool>,
-    "phase_change": <bool>,
-    "sharp_interface": <bool>
-  },
-  "warnings": ["<optional — note assumptions, ambiguities, or phase-change advice>"]
-}
+You MUST emit your decision by calling the ``report_selected_solver``
+tool exactly once.  Do NOT respond with free text.  Tool parameters:
+
+  • solver (enum, nullable): the canonical solver name, or null only
+    when no supported single-phase solver can model the case (e.g.
+    real multiphase / phase-change cases that need interFoam family).
+  • confidence: "high" / "medium" / "low".
+  • reason: one sentence explaining the key decision.
+  • phase_change: true iff the case involves boiling, cavitation,
+    evaporation, or condensation.
+  • warnings: optional list of strings.
 """
 
 
@@ -461,6 +561,9 @@ class SolverSelector:
     ) -> str:
         """Select the best OpenFOAM solver.
 
+        0. LLM-fuzzy extraction of explicit user solver mention — if the
+           user typed a solver name (even with typos), honor it unless it
+           hard-contradicts the time-scheme.
         1. Call the LLM with the full decision prompt.
         2. Parse JSON response — extract solver, confidence, warnings.
         3. Fall back to heuristic if LLM fails or returns invalid solver.
@@ -471,30 +574,77 @@ class SolverSelector:
         vconfig = validated_config or {}
         flags = _extract_flags(vconfig)
 
-        # ── LLM full selection ────────────────────────────────────────────────
+        # ── Step 0: LLM-fuzzy extraction of explicit user solver name ───────
+        # CFD engineers using this tool routinely name the solver they want.
+        # We must honor that, including typos ("smiplefoam" → simpleFoam,
+        # "BUOYANTBOUSSINESQsimpleFOAM" → buoyantBoussinesqSimpleFoam).  Only
+        # veto on a direct steady↔transient mismatch — anything else is the
+        # user's call, not ours.
+        extracted = await self.extract_user_solver_from_prompt(user_requirements)
+        if extracted:
+            contradiction = self._time_scheme_contradiction(extracted, flags, user_requirements)
+            if contradiction is None:
+                self.last_result = {
+                    "solver": extracted,
+                    "confidence": "high",
+                    "reason": "Honoring user-named solver (LLM-fuzzy extraction).",
+                    "flags": {},
+                    "warnings": [],
+                }
+                logger.info(f"[SOLVER_SELECT] User-named solver honored: '{extracted}'")
+                print(
+                    f"\n{'='*70}\n"
+                    f"[SOLVER_SELECT] User-named solver honored: '{extracted}'\n"
+                    f"  (fuzzy extraction from prompt — no physics override)\n"
+                    f"{'='*70}\n"
+                )
+                return extracted
+            logger.warning(
+                f"[SOLVER_SELECT] User named '{extracted}' but {contradiction} — "
+                f"falling through to physics-based selection"
+            )
+
+        # ── LLM full selection (forced tool call) ───────────────────────────
         user_msg = self._build_message(user_requirements, simulation_config, vconfig, flags)
+        select_tool = self._build_select_solver_tool()
 
         for attempt in (1, 2):
             try:
-                response = await self.client.aio.models.generate_content(
-                    model=self.model,
-                    contents=user_msg,
-                    config=self._provider.types.GenerateContentConfig(
-                        system_instruction=_build_llm_system_prompt(),
-                        temperature=0.0,
-                        max_output_tokens=512,
+                # 30 s timeout so a slow Pro-model request falls back to
+                # the heuristic instead of stalling the entire run.  We
+                # never want a single LLM round-trip to block the
+                # orchestrator for minutes — solver selection is a fast
+                # decision in absolute terms; a long delay means
+                # something is wrong upstream and the heuristic
+                # fallback is preferable.
+                response = await asyncio.wait_for(
+                    self.client.aio.models.generate_content(
+                        model=self.model,
+                        contents=user_msg,
+                        config=self._provider.types.GenerateContentConfig(
+                            system_instruction=_build_llm_system_prompt(),
+                            temperature=0.0,
+                            tools=[select_tool],
+                            tool_config=self._provider.types.ToolConfig(
+                                function_calling_config=self._provider.types.FunctionCallingConfig(
+                                    mode="ANY",
+                                    allowed_function_names=["report_selected_solver"],
+                                ),
+                            ),
+                        ),
                     ),
+                    timeout=30,
                 )
-                raw = (response.text or "").strip()
-                result = self._parse_json(raw)
 
-                if result:
+                result = self._extract_select_tool_call(response)
+
+                if result is not None:
                     self.last_result = result
                     llm_solver = result.get("solver")
                     confidence = result.get("confidence", "high")
                     reason = result.get("reason", "")
                     warnings = result.get("warnings") or []
-                    phase_change = (result.get("flags") or {}).get("phase_change", False)
+                    phase_change = bool(result.get("phase_change", False))
 
                     # Log warnings prominently
                     if warnings:
@@ -515,7 +665,7 @@ class SolverSelector:
                         )
                         # Phase-change case: multiphase support not yet available; use best heuristic
                         if llm_solver not in ALLOWED_SOLVERS:
-                            llm_solver = _heuristic_fallback(validated_config)
+                            llm_solver = _heuristic_fallback(validated_config, user_requirements)
 
                     if llm_solver in ALLOWED_SOLVERS:
                         logger.info(
@@ -534,20 +684,26 @@ class SolverSelector:
                         return llm_solver
 
                     logger.warning(
-                        f"[SOLVER_SELECT] LLM returned invalid solver '{llm_solver}' "
+                        f"[SOLVER_SELECT] LLM returned invalid/null solver "
                         f"(attempt {attempt}) — retrying"
                     )
-                    user_msg = (
-                        f"{user_msg}\n\n"
-                        f"NOTE: '{llm_solver}' is not in the allowed solver list. "
-                        f"Choose exactly one of: {sorted(ALLOWED_SOLVERS)}"
+                else:
+                    logger.warning(
+                        f"[SOLVER_SELECT] LLM produced no tool call "
+                        f"(attempt {attempt}) — retrying"
                     )
 
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[SOLVER_SELECT] LLM call timed out after 30 s "
+                    f"(attempt {attempt}) — retrying once, then falling "
+                    "back to the heuristic"
+                )
             except Exception as exc:
                 logger.warning(f"[SOLVER_SELECT] LLM call failed (attempt {attempt}): {exc}")
 
         # ── Heuristic fallback ────────────────────────────────────────────────
-        fallback = _heuristic_fallback(vconfig)
+        fallback = _heuristic_fallback(vconfig, user_requirements)
         logger.info(f"[SOLVER_SELECT] Heuristic fallback: '{fallback}'")
         print(
             f"\n{'='*70}\n"
@@ -556,6 +712,241 @@ class SolverSelector:
             f"{'='*70}\n"
         )
         return fallback
+
+    # ─────────────────────────────────────────────────────────
+    # Forced tool-call builders for the main select() decision
+    # ─────────────────────────────────────────────────────────
+
+    def _build_select_solver_tool(self):
+        """Build the Gemini Tool used to force a structured solver decision.
+
+        Forcing the LLM to call ``report_selected_solver`` (mode="ANY")
+        eliminates the entire class of "model returned partial JSON / wrong
+        format / refusal text" failures.  The ``solver`` parameter is
+        enum-constrained to the registered allowed solvers (plus the
+        ``nullable=True`` escape hatch for unsupported phase-change cases),
+        so the model literally cannot emit a name we don't recognise.
+        """
+        types_ = self._provider.types
+        allowed = sorted(ALLOWED_SOLVERS)
+        return types_.Tool(
+            function_declarations=[
+                types_.FunctionDeclaration(
+                    name="report_selected_solver",
+                    description=(
+                        "Report the OpenFOAM solver chosen for this case, "
+                        "along with confidence, reason, warnings, and a "
+                        "phase-change flag.  Set solver=null only when no "
+                        "supported single-phase solver can model the case "
+                        "(true multiphase / phase-change scenarios)."
+                    ),
+                    parameters=types_.Schema(
+                        type="OBJECT",
+                        properties={
+                            "solver": types_.Schema(
+                                type="STRING",
+                                nullable=True,
+                                enum=allowed,
+                                description="Canonical solver name, or null for unsupported cases.",
+                            ),
+                            "confidence": types_.Schema(
+                                type="STRING",
+                                enum=["high", "medium", "low"],
+                                description="Decision confidence.",
+                            ),
+                            "reason": types_.Schema(
+                                type="STRING",
+                                description="One sentence explaining the choice.",
+                            ),
+                            "phase_change": types_.Schema(
+                                type="BOOLEAN",
+                                description="True if the case involves boiling, cavitation, evaporation, or condensation.",
+                            ),
+                            "warnings": types_.Schema(
+                                type="ARRAY",
+                                items=types_.Schema(type="STRING"),
+                                description="Optional warnings about assumptions, ambiguities, or phase-change advice.",
+                            ),
+                        },
+                        required=["solver", "confidence", "reason"],
+                    ),
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _extract_select_tool_call(response) -> dict[str, Any] | None:
+        """Walk a Gemini response and return the report_selected_solver args
+        as a plain dict, or None if no such tool call exists."""
+        for candidate_msg in (getattr(response, "candidates", None) or []):
+            content = getattr(candidate_msg, "content", None)
+            for part in (getattr(content, "parts", None) or []):
+                fc = getattr(part, "function_call", None)
+                if fc is None or fc.name != "report_selected_solver":
+                    continue
+                args = dict(fc.args) if fc.args else {}
+                # Normalise warnings to a plain list of strings
+                warnings = args.get("warnings") or []
+                if not isinstance(warnings, list):
+                    warnings = [str(warnings)]
+                args["warnings"] = [str(w) for w in warnings]
+                return args
+        return None
+
+    # ─────────────────────────────────────────────────────────
+    # User-intent extraction (LLM-fuzzy, typo-tolerant)
+    # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _time_scheme_contradiction(
+        solver: str,
+        flags: dict[str, Any],
+        user_requirements: str,
+    ) -> str | None:
+        """Return a reason string if the user-named solver hard-contradicts
+        the time scheme, else None.
+
+        We only veto on the steady↔transient axis — every other physics
+        consideration (heat, gravity, compressibility, …) is the user's
+        call when they typed the solver name themselves.
+        """
+        # Case-insensitive: "simpleFoam" / "pimpleFoam" use lowercase initials
+        # so a literal .endswith("SimpleFoam") would miss them.
+        solver_lower = solver.lower()
+        user_is_steady = solver_lower.endswith("simplefoam")
+        user_is_transient = (
+            solver_lower.endswith("pimplefoam") or solver == "chtMultiRegionFoam"
+        )
+        flag_transient = bool(flags.get("transient"))
+        prompt_lower = (user_requirements or "").lower()
+        prompt_says_transient = any(
+            kw in prompt_lower
+            for kw in ("transient", "unsteady", "time-varying", "time varying")
+        )
+        prompt_says_steady = any(
+            kw in prompt_lower
+            for kw in ("steady-state", "steady state", " steady ")
+        )
+
+        # Trust the prompt over the flags (the flags may not be set yet in
+        # precheck).  Fall back to flags only when the prompt is silent.
+        is_transient = (
+            prompt_says_transient if (prompt_says_transient or prompt_says_steady)
+            else flag_transient
+        )
+
+        if user_is_steady and is_transient:
+            return "prompt/flags indicate transient but the named solver is steady"
+        if user_is_transient and not is_transient and prompt_says_steady:
+            return "prompt says steady-state but the named solver is transient"
+        return None
+
+    async def extract_user_solver_from_prompt(self, user_requirements: str) -> str | None:
+        """LLM-fuzzy extraction of an explicit OpenFOAM solver name.
+
+        Uses Gemini function calling (forced, mode="ANY") so the model
+        MUST emit a structured tool call with the chosen solver — no
+        free-text response, no JSON parsing.  The tool's ``solver``
+        parameter is an enum constrained to ``ALLOWED_SOLVERS`` (with
+        nullable=True), so the LLM can only return one of the canonical
+        names or null.  Returns None when the prompt contains no
+        explicit solver name.
+        """
+        if not user_requirements or not user_requirements.strip():
+            return None
+
+        types_ = self._provider.types
+        allowed = sorted(ALLOWED_SOLVERS)
+
+        tool = types_.Tool(
+            function_declarations=[
+                types_.FunctionDeclaration(
+                    name="report_explicit_solver",
+                    description=(
+                        "Report which OpenFOAM solver the user EXPLICITLY named in "
+                        "their prompt.  Tolerate typos and casing differences "
+                        "(map 'smiplefoam' → simpleFoam, "
+                        "'buoyantboussinesqsimplefoam' → "
+                        "buoyantBoussinesqSimpleFoam, 'rho pimple' → "
+                        "rhoPimpleFoam).  Set solver=null when the user described "
+                        "the case but did NOT type a solver name — do not infer "
+                        "from physics."
+                    ),
+                    parameters=types_.Schema(
+                        type="OBJECT",
+                        properties={
+                            "solver": types_.Schema(
+                                type="STRING",
+                                nullable=True,
+                                enum=allowed,
+                                description=(
+                                    "Canonical solver name matching what the user "
+                                    "typed (after typo correction).  Null if the "
+                                    "user did not name any solver."
+                                ),
+                            ),
+                        },
+                        required=["solver"],
+                    ),
+                ),
+            ],
+        )
+
+        config = types_.GenerateContentConfig(
+            system_instruction=(
+                "You extract one structured fact from a CFD user prompt: which "
+                "OpenFOAM solver did the user EXPLICITLY name?  Tolerate typos "
+                "and casing.  Do NOT infer a solver from the physics described "
+                "in the prompt (heat, gravity, compressibility, etc.) — only "
+                "report a solver if the user literally typed its name.  You "
+                "MUST call the report_explicit_solver tool exactly once."
+            ),
+            temperature=0.0,
+            tools=[tool],
+            tool_config=types_.ToolConfig(
+                function_calling_config=types_.FunctionCallingConfig(
+                    mode="ANY",
+                    allowed_function_names=["report_explicit_solver"],
+                ),
+            ),
+        )
+
+        try:
+            # 20 s timeout — the extractor is a single-tool fast call; if
+            # it's slower than that something is wrong upstream and we
+            # should fall through to the physics-based selector or the
+            # heuristic instead of stalling.
+            response = await asyncio.wait_for(
+                self.client.aio.models.generate_content(
+                    model=self.model,
+                    contents=user_requirements,
+                    config=config,
+                ),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[SOLVER_SELECT] User-intent extraction timed out after 20 s "
+                "— falling through to physics-based selection"
+            )
+            return None
+        except Exception as exc:
+            logger.warning(f"[SOLVER_SELECT] User-intent extraction failed: {exc}")
+            return None
+
+        for candidate_msg in (response.candidates or []):
+            content = getattr(candidate_msg, "content", None)
+            for part in (getattr(content, "parts", None) or []):
+                fc = getattr(part, "function_call", None)
+                if fc is None or fc.name != "report_explicit_solver":
+                    continue
+                args = dict(fc.args) if fc.args else {}
+                solver = args.get("solver")
+                if isinstance(solver, str) and solver in ALLOWED_SOLVERS:
+                    logger.info(f"[SOLVER_SELECT] User-intent extractor → {solver!r}")
+                    return solver
+                return None
+        return None
 
     # ─────────────────────────────────────────────────────────
     # Helpers

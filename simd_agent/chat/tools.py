@@ -48,6 +48,7 @@ class SimulationSnapshot:
         agent_run: dict[str, Any] | None = None,
         mesh_info: dict[str, Any] | None = None,
         all_runs: list[dict[str, Any]] | None = None,
+        vtk_index: dict[str, Any] | None = None,
     ):
         self.run_id = run_id
         self.simulation_id = simulation_id
@@ -66,6 +67,20 @@ class SimulationSnapshot:
         self.agent_run = agent_run or {}
         self.mesh_info = mesh_info or {}
         self.all_runs = all_runs or []
+        # Multi-region (CHT) per-region field metadata.  Populated from the
+        # cached VTK precompute index (``results/<run>/index.json``) by
+        # :func:`build_snapshot`.  Shape (multi-region only — None otherwise):
+        #   {
+        #     "fields":    [...],   # back-compat = first region's
+        #     "timesteps": [...],
+        #     "regions": {
+        #       "<name>": {"fields": [{name, num_components, range, location}],
+        #                   "timesteps": [...]}
+        #     }
+        #   }
+        # Used by :func:`compute_field_stats` to answer per-region spatial
+        # queries like "what's the max T in the wall?".
+        self.vtk_index = vtk_index or {}
 
     def summary_dict(self) -> dict[str, Any]:
         """Compact representation injected into the LLM system prompt."""
@@ -228,13 +243,81 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _extract_stats_from_field_entry(fdata: dict) -> tuple[float | None, float | None, float | None]:
+    """Pull (min, max, mean) from a VTK index ``fields[]`` entry.
+
+    Accepts both shapes the codebase has shipped:
+      * legacy single-region: ``{"min": ..., "max": ..., "mean": ...}``
+      * VTK precompute index: ``{"range": [min, max]}`` (no mean — the
+        precomputer doesn't compute means, only min/max)
+    """
+    mn   = fdata.get("min")
+    mx   = fdata.get("max")
+    mean = fdata.get("mean")
+    raw_range = fdata.get("range")
+    if isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:
+        if mn is None:
+            mn = raw_range[0]
+        if mx is None:
+            mx = raw_range[1]
+    return mn, mx, mean
+
+
+def _build_field_stats_result(
+    field: str,
+    fdata: dict,
+    sim_time: Any,
+    source: str,
+    region: str | None = None,
+) -> dict[str, Any]:
+    """Build the chart artifact a field-stats lookup returns to the LLM."""
+    mn, mx, mean = _extract_stats_from_field_entry(fdata)
+    if not any(v is not None for v in (mn, mx, mean)):
+        return {}
+    num_components = fdata.get("num_components", 1)
+    suffix = " (magnitude)" if num_components > 1 else ""
+    chart_data: list = []
+    if mn is not None:
+        chart_data.append({"stat": "min", field: mn})
+    if mean is not None:
+        chart_data.append({"stat": "mean", field: mean})
+    if mx is not None:
+        chart_data.append({"stat": "max", field: mx})
+    label = f"{field} in {region}" if region else field
+    title_suffix = f" — region: {region}" if region else ""
+    return {
+        "field":          field,
+        "region":         region,
+        "sim_time":       sim_time,
+        "min":            mn,
+        "max":            mx,
+        "mean":           mean,
+        "num_components": num_components,
+        "note":           f"Spatial min/max{suffix} over the {region or 'mesh'}.",
+        "source":         source,
+        "chart": {
+            "type":   "bar",
+            "title":  f"{field} Statistics{suffix}{title_suffix} (t={sim_time} s)",
+            "xKey":   "stat",
+            "yLabel": label,
+            "lines":  [field],
+            "data":   chart_data,
+        },
+    }
+
+
 def compute_field_stats(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str, Any]:
     """Return available statistics for a field, mining all DB sources.
 
     Data sources (in priority order):
-    1. vtk_result.fields — contains min/mean/max if the sim server computed them
-    2. sim_progress residuals — Ux/Uy/Uz/p initial+final per time step → trend stats
-    3. patch_configs (boundary conditions) — inlet/outlet set values
+    1. ``vtk_index.regions`` — per-region min/max range from the
+       precomputed VTK index (multi-region CHT cases).  Supports a
+       ``region`` arg to filter to one region, otherwise reports each
+       region that ships the field.
+    2. ``vtk_index.fields`` / ``vtk_result.fields`` — top-level
+       (single-region) field stats.
+    3. sim_progress residuals — Ux/Uy/Uz/p initial+final per time step → trend stats
+    4. patch_configs (boundary conditions) — inlet/outlet set values
 
     Note: true spatial min/mean/max over the full mesh requires VTK post-processing.
     What Neon stores is residual history and boundary condition set-points, which
@@ -242,8 +325,117 @@ def compute_field_stats(args: dict[str, Any], snap: SimulationSnapshot) -> dict[
     """
     field = args.get("field", "U")
     patch = args.get("patch")
+    region_filter = args.get("region")
+    if isinstance(region_filter, str):
+        region_filter = region_filter.strip() or None
 
-    # ── Source 1: vtk_result ─────────────────────────────────────────────────
+    # ── Source 1: vtk_index.regions (multi-region per-region stats) ─────────
+    vtk_idx = snap.vtk_index or {}
+    regions_block = vtk_idx.get("regions") if isinstance(vtk_idx, dict) else None
+    if isinstance(regions_block, dict) and regions_block:
+        # Discover which regions ship this field (case-insensitive name match).
+        matches: dict[str, dict] = {}
+        for region_name, region_data in regions_block.items():
+            if not isinstance(region_data, dict):
+                continue
+            if region_filter and region_name != region_filter:
+                continue
+            for fdata in region_data.get("fields", []) or []:
+                if not isinstance(fdata, dict):
+                    continue
+                fname = fdata.get("name") or fdata.get("field") or ""
+                if fname == field or fname.lower() == field.lower():
+                    matches[region_name] = fdata
+                    break
+
+        if matches:
+            # Use the LAST timestep's time from this region's timesteps as
+            # the reported sim_time (most relevant for steady-state).
+            def _latest_time(region_data: dict) -> Any:
+                ts = region_data.get("timesteps") or []
+                if ts:
+                    return ts[-1].get("time")
+                return None
+
+            if region_filter or len(matches) == 1:
+                # Single-region answer.
+                region_name, fdata = next(iter(matches.items()))
+                result = _build_field_stats_result(
+                    field, fdata,
+                    sim_time=_latest_time(regions_block[region_name]),
+                    source="vtk_index_region", region=region_name,
+                )
+                if patch:
+                    result["patch"] = patch
+                return result
+
+            # Multiple regions ship this field — return per-region rows
+            # so the LLM can compare/aggregate.  Builds a bar chart with
+            # one stat-row per region, ``min`` and ``max`` as series so
+            # the frontend renders grouped bars by region.
+            per_region: dict[str, dict] = {}
+            chart_data: list = []
+            for region_name, fdata in matches.items():
+                mn, mx, mean = _extract_stats_from_field_entry(fdata)
+                per_region[region_name] = {
+                    "min":            mn,
+                    "max":            mx,
+                    "mean":           mean,
+                    "num_components": fdata.get("num_components", 1),
+                    "sim_time":       _latest_time(regions_block[region_name]),
+                }
+                row: dict = {"region": region_name}
+                if mn is not None:
+                    row["min"] = mn
+                if mx is not None:
+                    row["max"] = mx
+                if mean is not None:
+                    row["mean"] = mean
+                chart_data.append(row)
+            # Dedup the series list — ``min``/``max``/``mean`` appear once
+            # each, not once per region.
+            series: list[str] = []
+            for key in ("min", "mean", "max"):
+                if any(key in row for row in chart_data):
+                    series.append(key)
+            return {
+                "field":      field,
+                "regions":    per_region,
+                "source":     "vtk_index_regions",
+                "note":       (
+                    f"Per-region spatial min/max for {field} across "
+                    f"{len(per_region)} regions.  Pass ``region=<name>`` "
+                    f"to drill into one region only."
+                ),
+                "chart": {
+                    "type":   "bar",
+                    "title":  f"{field} Statistics across regions",
+                    "xKey":   "region",
+                    "yLabel": field,
+                    "lines":  series,
+                    "data":   chart_data,
+                },
+            }
+
+    # ── Source 1b: vtk_index top-level (single-region cases) ────────────────
+    vtk_idx_fields = vtk_idx.get("fields", []) if isinstance(vtk_idx, dict) else []
+    if isinstance(vtk_idx_fields, list):
+        for fdata in vtk_idx_fields:
+            if not isinstance(fdata, dict):
+                continue
+            fname = fdata.get("name") or fdata.get("field") or ""
+            if fname == field or fname.lower() == field.lower():
+                result = _build_field_stats_result(
+                    field, fdata,
+                    sim_time=(vtk_idx.get("timesteps") or [{}])[-1].get("time"),
+                    source="vtk_index",
+                )
+                if result:
+                    if patch:
+                        result["patch"] = patch
+                    return result
+
+    # ── Source 2: legacy vtk_result ─────────────────────────────────────────
     vtk = snap.vtk_result or {}
     vtk_fields = vtk.get("fields", [])
     if isinstance(vtk_fields, list):
@@ -251,48 +443,14 @@ def compute_field_stats(args: dict[str, Any], snap: SimulationSnapshot) -> dict[
             if not isinstance(fdata, dict):
                 continue
             fname = fdata.get("name") or fdata.get("field") or ""
-            # Match "U", "Ux"/"Uy"/"Uz" or any requested name
             if fname == field or fname.lower() == field.lower():
-                # Handle both formats:
-                #   Backend/DB: {"min": 0, "max": 1.5, "mean": 0.7}
-                #   Frontend:   {"range": [0, 1.5]}
-                mn   = fdata.get("min")
-                mx   = fdata.get("max")
-                mean = fdata.get("mean")
-                # Parse range array if separate min/max not available
-                raw_range = fdata.get("range")
-                if isinstance(raw_range, (list, tuple)) and len(raw_range) == 2:
-                    if mn is None:
-                        mn = raw_range[0]
-                    if mx is None:
-                        mx = raw_range[1]
-                if any(v is not None for v in (mn, mx, mean)):
-                    num_components = fdata.get("num_components", 1)
-                    suffix = " (magnitude)" if num_components > 1 else ""
-                    chart_data = []
-                    if mn is not None:
-                        chart_data.append({"stat": "min", field: mn})
-                    if mean is not None:
-                        chart_data.append({"stat": "mean", field: mean})
-                    if mx is not None:
-                        chart_data.append({"stat": "max", field: mx})
-                    return {
-                        "field": field,
-                        "patch": patch,
-                        "sim_time": vtk.get("time"),
-                        "min": mn, "max": mx, "mean": mean,
-                        "num_components": num_components,
-                        "note": f"Spatial min/max over the entire mesh{suffix}.",
-                        "source": "vtk_result",
-                        "chart": {
-                            "type": "bar",
-                            "title": f"{field} Statistics{suffix} (t={vtk.get('time')} s)",
-                            "xKey": "stat",
-                            "yLabel": field,
-                            "lines": [field],
-                            "data": chart_data,
-                        },
-                    }
+                result = _build_field_stats_result(
+                    field, fdata, sim_time=vtk.get("time"), source="vtk_result",
+                )
+                if result:
+                    if patch:
+                        result["patch"] = patch
+                    return result
 
     # ── Source 2: sim_progress residuals ─────────────────────────────────────
     # The residuals table stores Ux, Uy, Uz (and p, k, …) with initial/final
@@ -2684,10 +2842,24 @@ def query_simulation_results(args: dict[str, Any], snap: SimulationSnapshot) -> 
     - Derived quantities (pressure drop, flow rate if computable)
     - Convergence summary
     - Solver/physics context
+    - (Multi-region/CHT only) the region topology and per-region details
+
+    C6 — when ``region`` is set on a CHT case, the result is annotated with
+    the focal region so the LLM can phrase its answer in that scope.  We do
+    NOT yet split the VTK ranges by region (B3 emits per-region VTPs but the
+    snapshot loader still serves the legacy first-region payload); the
+    region annotation gives the chat layer enough context to answer
+    qualitative questions while the per-region VTK loader catches up.
     """
     question = args.get("question", "")
+    region_arg = args.get("region")
+    region_focus: str | None = (
+        str(region_arg).strip() if isinstance(region_arg, str) and region_arg.strip() else None
+    )
 
     result: dict[str, Any] = {}
+    if region_focus:
+        result["region_focus"] = region_focus
 
     # ── 1. VTK field ranges (spatial min/max) ─────────────────────────────
     vtk = snap.vtk_result or {}
@@ -2878,143 +3050,49 @@ def query_simulation_results(args: dict[str, Any], snap: SimulationSnapshot) -> 
                                       or cm.get("max_non_orthogonality") or cm.get("maxNonOrthogonality")),
         }
 
+    # C6 — multi-region (CHT) topology annotation.  Snap.simulation_config
+    # carries the ``regions`` field for CHT cases, populated by the
+    # backend persistence path (cfd_regions DB column).  We surface a
+    # compact topology summary the LLM can use to phrase region-scoped
+    # answers, plus a region-name allowlist that constrains follow-up
+    # ``region=…`` tool calls to real regions the case actually has.
+    sim_cfg = getattr(snap, "simulation_config", None) or {}
+    raw_regions = sim_cfg.get("regions") if isinstance(sim_cfg, dict) else None
+    if isinstance(raw_regions, dict) and (raw_regions.get("fluid") or raw_regions.get("solid")):
+        fluids = list(raw_regions.get("fluid") or [])
+        solids = list(raw_regions.get("solid") or [])
+        names = [r.get("name") for r in fluids + solids if isinstance(r, dict) and r.get("name")]
+        result["regions"] = {
+            "kind": "cht",
+            "fluid": [
+                {
+                    "name": r.get("name"),
+                    "preset": r.get("fluid_preset") or r.get("fluidPreset"),
+                    "interfaces": r.get("interfaces") or [],
+                }
+                for r in fluids if isinstance(r, dict)
+            ],
+            "solid": [
+                {
+                    "name": r.get("name"),
+                    "preset": r.get("solid_preset") or r.get("solidPreset"),
+                    "interfaces": r.get("interfaces") or [],
+                }
+                for r in solids if isinstance(r, dict)
+            ],
+            "names": names,
+        }
+        if region_focus and region_focus not in names:
+            result["region_focus_unknown"] = {
+                "requested": region_focus,
+                "available": names,
+            }
+
     if not result:
         return {"error": "No simulation results available yet."}
 
     result["question"] = question
     return result
-
-
-def plot_field_over_iterations(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str, Any]:
-    """Plot a quantity extracted from sim_progress across all iterations.
-
-    Supports:
-      - Residual fields (Ux, Uy, Uz, p, k, omega, epsilon, …)
-      - "courant" → Courant number over time
-      - "continuity" → continuity error over time
-      - Multiple fields comma-separated ("Ux,p,k")
-
-    Returns a recharts-compatible chart artifact that the frontend renders
-    inline in the chat.
-    """
-    fields_arg = args.get("fields", "")
-    chart_title: str = args.get("title", "")
-
-    if not snap.sim_progress:
-        return {
-            "error": "No iteration-by-iteration progress data was recorded for this run. "
-                     "Try 'compute_field_stats' for VTK-based spatial statistics, or "
-                     "'query_simulation_results' for a results overview."
-        }
-
-    # Parse field list (may be a list from the analyzer or comma-separated string)
-    if isinstance(fields_arg, list):
-        requested = [f.strip() for f in fields_arg if isinstance(f, str) and f.strip()]
-    else:
-        requested = [f.strip() for f in str(fields_arg).split(",") if f.strip()]
-    if not requested:
-        return {"error": "No fields specified. Use e.g. fields='p,Ux' or fields='courant'."}
-
-    transient = _is_transient(snap)
-    has_sim_time = any(
-        step.get("sim_time") is not None for step in snap.sim_progress[:5]
-    )
-    x_key = "sim_time" if has_sim_time else "iteration"
-    x_label = "Simulation Time (s)" if has_sim_time else "Iteration"
-
-    # Determine which data to extract per field
-    special_fields = {"courant", "continuity"}
-    residual_fields = [f for f in requested if f.lower() not in special_fields]
-    include_courant = any(f.lower() == "courant" for f in requested)
-    include_continuity = any(f.lower() == "continuity" for f in requested)
-
-    residual_key = "final" if transient else "initial"
-
-    # Build rows keyed by x value
-    x_to_row: dict[Any, dict[str, Any]] = {}
-
-    for step in snap.sim_progress:
-        xv = step.get("sim_time") if has_sim_time else step.get("iteration", 0)
-        if xv not in x_to_row:
-            x_to_row[xv] = {x_key: xv}
-        row = x_to_row[xv]
-
-        # Residual fields
-        residuals = step.get("residuals", {})
-        for fname in residual_fields:
-            if fname in residuals:
-                r = residuals[fname]
-                val = r.get(residual_key) or r.get("initial") or r.get("final")
-                if val is not None and val > 0:
-                    row[fname] = val
-
-        # Courant number (may be a dict {mean, max} or a scalar)
-        if include_courant:
-            co = step.get("courant")
-            if isinstance(co, dict):
-                max_co = co.get("max")
-                if max_co is not None:
-                    try:
-                        row["Courant"] = float(max_co)
-                    except (TypeError, ValueError):
-                        pass
-            elif isinstance(co, (int, float)) and co > 0:
-                row["Courant"] = co
-
-        # Continuity error
-        if include_continuity:
-            cont = step.get("continuity")
-            if cont is not None:
-                row["Continuity"] = abs(cont) if cont != 0 else None
-
-    all_rows = [x_to_row[xv] for xv in sorted(x_to_row.keys())]
-    all_rows = [r for r in all_rows if len(r) > 1]
-
-    if not all_rows:
-        return {"error": f"No data found for fields: {', '.join(requested)}"}
-
-    # Downsample to ≤ 300 points
-    MAX_PTS = 300
-    if len(all_rows) > MAX_PTS:
-        step_size = len(all_rows) / MAX_PTS
-        indices = {0, len(all_rows) - 1}
-        indices |= {int(i * step_size) for i in range(1, MAX_PTS - 1)}
-        all_rows = [all_rows[i] for i in sorted(indices)]
-
-    # Build line names from actual data
-    line_names: list[str] = []
-    for fname in residual_fields:
-        if any(fname in r for r in all_rows):
-            line_names.append(fname)
-    if include_courant and any("Courant" in r for r in all_rows):
-        line_names.append("Courant")
-    if include_continuity and any("Continuity" in r for r in all_rows):
-        line_names.append("Continuity")
-
-    # Determine y-axis scale: log for residuals, auto for Courant/continuity
-    use_log = any(f not in ("Courant", "Continuity") for f in line_names)
-    y_label = (
-        f"{'Final' if transient else 'Initial'} Residual"
-        if use_log else "Value"
-    )
-
-    title = chart_title or f"{', '.join(line_names)} vs {x_label}"
-
-    return {
-        "total_iterations": len(snap.sim_progress),
-        "fields_plotted": line_names,
-        "chart": {
-            "type": "line",
-            "title": title,
-            "xKey": x_key,
-            "xLabel": x_label,
-            "yLabel": y_label,
-            "yScale": "log" if use_log else "auto",
-            "lines": line_names,
-            "data": all_rows,
-        },
-    }
-
 
 def analyze_chart(args: dict[str, Any], snap: SimulationSnapshot) -> dict[str, Any]:
     """Analyze a chart / VTK field and provide textual interpretation."""
@@ -3142,7 +3220,7 @@ def plot_field_values(args: dict[str, Any], snap: SimulationSnapshot) -> dict[st
     if not found_fields:
         # No field_ranges (fieldMinMax) data recorded for this run.
         # Do NOT fall back to residuals here — that duplicates
-        # plot_field_over_iterations / compute_residual_trend and produces
+        # compute_residual_trend and produces
         # two nearly-identical charts when both tools are planned.
         # Instead, fall back to VTK spatial stats or return an error.
         vtk = snap.vtk_result or {}
@@ -3189,7 +3267,7 @@ def plot_field_values(args: dict[str, Any], snap: SimulationSnapshot) -> dict[st
             "error": (
                 f"No field value data found for '{fields_arg}'. "
                 "Field evolution data (fieldMinMax) was not recorded during this run. "
-                "Try 'plot_field_over_iterations' for residual convergence plots, or "
+                "Try 'compute_residual_trend' for residual convergence plots, or "
                 "'compute_field_stats' for VTK-based spatial statistics."
             ),
         }
@@ -3690,7 +3768,6 @@ TOOL_REGISTRY: dict[str, Any] = {
     "analyze_chart": analyze_chart,
     "read_generated_file": read_generated_file,
     "query_simulation_results": query_simulation_results,
-    "plot_field_over_iterations": plot_field_over_iterations,
     "plot_field_values": plot_field_values,
     "plot_patch_values": plot_patch_values,
     "plot_volume_values": plot_volume_values,
@@ -3709,7 +3786,15 @@ CHAT_TOOLS_SCHEMA = types.Tool(
             description=(
                 "Compute min/mean/max statistics of a simulation field "
                 "(e.g. U, p, k, omega, T) from VTK results or residual data. "
-                "Use this whenever the user asks about values of a field."
+                "Use this whenever the user asks about values of a field. "
+                "For multi-region (CHT) cases, the tool reports per-region "
+                "stats automatically when no ``region`` arg is supplied "
+                "(one row per fluid/solid region that ships the field), or "
+                "drills into one region when ``region=<name>`` is passed. "
+                "Example calls for CHT: 'max T in the wall' → "
+                "field='T', region='wall'.  'compare velocity across "
+                "fluid regions' → field='U' (no region — returns per-region "
+                "rows for every region with U)."
             ),
             parameters=types.Schema(
                 type="OBJECT",
@@ -3717,6 +3802,16 @@ CHAT_TOOLS_SCHEMA = types.Tool(
                     "field": types.Schema(type="STRING", description="Field name, e.g. U, p, k, omega, T"),
                     "patch": types.Schema(type="STRING", description="Patch name (optional, e.g. inlet, outlet)"),
                     "time_step": types.Schema(type="STRING", description="Time step (optional)"),
+                    "region": types.Schema(
+                        type="STRING",
+                        description=(
+                            "Region name (multi-region/CHT only).  When set, "
+                            "stats come from that region's mesh only.  When "
+                            "omitted, multi-region cases return one row per "
+                            "region that contains the field.  Allowed values "
+                            "are listed in the case's `regions` block."
+                        ),
+                    ),
                 },
                 required=["field"],
             ),
@@ -3847,7 +3942,9 @@ CHAT_TOOLS_SCHEMA = types.Tool(
                 "call whenever the user asks a broad question about results, wants an "
                 "overview, asks 'how did the simulation go', or asks about multiple fields "
                 "at once. Also use it when the user asks about recommendations, because "
-                "the convergence and derived data help you reason about what to suggest."
+                "the convergence and derived data help you reason about what to suggest. "
+                "For multi-region (CHT) simulations, pass ``region`` to scope the answer "
+                "to one region (e.g. innerFluid, wall, outerFluid)."
             ),
             parameters=types.Schema(
                 type="OBJECT",
@@ -3860,37 +3957,19 @@ CHAT_TOOLS_SCHEMA = types.Tool(
                             "tailor your response."
                         ),
                     ),
-                },
-                required=["question"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="plot_field_over_iterations",
-            description=(
-                "Plot residual fields, Courant number, or continuity error across all "
-                "iterations as an interactive chart. Use this whenever the user asks to "
-                "'plot', 'chart', or 'graph' any quantity over time/iterations. "
-                "Supports residual field names (Ux, Uy, Uz, p, k, omega, epsilon, T, h…), "
-                "'courant' for Courant number, 'continuity' for continuity error. "
-                "Multiple fields can be comma-separated."
-            ),
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "fields": types.Schema(
+                    "region": types.Schema(
                         type="STRING",
+                        nullable=True,
                         description=(
-                            "Comma-separated field names to plot. "
-                            "Examples: 'p', 'Ux,Uy,Uz', 'k,omega', 'courant', "
-                            "'p,continuity'. Use residual field names from sim_progress."
+                            "Optional region name for multi-region (CHT) "
+                            "cases: e.g. 'innerFluid', 'wall', 'outerFluid'.  "
+                            "When set, the result is scoped to that region's "
+                            "fields and patches.  Omit for single-region cases "
+                            "or to summarise across all regions."
                         ),
                     ),
-                    "title": types.Schema(
-                        type="STRING",
-                        description="Optional chart title.",
-                    ),
                 },
-                required=["fields"],
+                required=["question"],
             ),
         ),
         types.FunctionDeclaration(

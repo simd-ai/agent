@@ -50,13 +50,27 @@ class UserService:
         """Local/self-hosted mode has no auth — no usage limits apply."""
         return not get_settings().neon_auth_base_url
 
-    async def get_usage(self, user_id: UUID) -> UsageOut:
+    async def get_usage(
+        self,
+        user_id: UUID,
+        simulation_id: UUID | None = None,
+    ) -> UsageOut:
+        """Return usage info for a user.
+
+        When ``simulation_id`` is provided, ``run_count``/``can_start_run`` are
+        scoped to that single project (each project gets its own run budget).
+        When omitted, ``run_count`` is the total across all of the user's
+        projects (used by the UI account/usage screen).
+        """
         user = await self.repo.get_by_id(user_id)
         if not user:
             raise ValueError(f"User {user_id} not found")
 
         project_count = await self.repo.count_projects(user_id)
-        run_count = await self.repo.count_runs(user_id)
+        if simulation_id is not None:
+            run_count = await self.repo.count_runs_for_simulation(simulation_id)
+        else:
+            run_count = await self.repo.count_runs(user_id)
 
         settings = get_settings()
         max_projects = settings.free_max_projects

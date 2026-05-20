@@ -669,14 +669,35 @@ def validate_config_for_operation(
     if operation == Operation.CFD_CODEGEN_RUN:
         # Check for inlet
         has_inlet = any(bc.is_inlet() for bc in config.boundary_conditions.values())
-        if not has_inlet:
+        has_outlet = any(bc.is_outlet() for bc in config.boundary_conditions.values())
+
+        # "Closed-domain" cases (buoyancy / lid-driven cavity / MRF /
+        # fvOptions source / heat-conduction-only) legitimately have no
+        # inlets and no outlets.  Skip the inlet/outlet requirement when
+        # the user has *explicitly* accounted for every patch (all are
+        # wall/symmetry/empty/wedge/cyclic) — that's a deliberate closed-
+        # domain setup, not a forgotten inlet tag.
+        _CLOSED_OK = {"wall", "symmetry", "empty", "wedge", "cyclic"}
+
+        def _patch_kind(bc) -> str:
+            pt = getattr(bc, "patch_type", "")
+            return getattr(pt, "value", str(pt)).lower()
+
+        is_closed_domain_case = (
+            not has_inlet and not has_outlet
+            and len(config.boundary_conditions) > 0
+            and all(_patch_kind(bc) in _CLOSED_OK
+                    for bc in config.boundary_conditions.values())
+        )
+
+        if not has_inlet and not is_closed_domain_case:
             missing_fields.append(MissingFieldInfo(
                 field="boundary_conditions.inlet",
                 description="At least one inlet boundary condition is required",
                 required_for="codegen",
                 suggested_value={"patch_type": "inlet", "velocity": {"type": "fixedValue", "value": [1, 0, 0]}},
             ))
-        
+
         # Check inlet has velocity
         for name, bc in config.boundary_conditions.items():
             if bc.is_inlet():
@@ -687,10 +708,8 @@ def validate_config_for_operation(
                         required_for="codegen",
                         suggested_value={"type": "fixedValue", "value": [1, 0, 0]},
                     ))
-        
-        # Check for outlet
-        has_outlet = any(bc.is_outlet() for bc in config.boundary_conditions.values())
-        if not has_outlet:
+
+        if not has_outlet and not is_closed_domain_case:
             missing_fields.append(MissingFieldInfo(
                 field="boundary_conditions.outlet",
                 description="At least one outlet boundary condition is required",

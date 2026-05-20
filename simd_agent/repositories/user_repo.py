@@ -49,3 +49,12 @@ class UserRepository(PostgresRepository):
             {"uid": user_id},
         )
         return row["cnt"] if row else 0
+
+    async def count_runs_for_simulation(self, simulation_id: UUID) -> int:
+        """Count CFD_CODEGEN_RUN rows for a single project (simulation)."""
+        row = await self.execute_raw_one(
+            "SELECT COUNT(*) AS cnt FROM runs "
+            "WHERE simulation_id = :sid AND op = 'CFD_CODEGEN_RUN'",
+            {"sid": simulation_id},
+        )
+        return row["cnt"] if row else 0

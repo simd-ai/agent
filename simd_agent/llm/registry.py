@@ -71,7 +71,7 @@ class LLMRegistry:
         settings = get_settings()
         self._default_name = settings.default_provider
 
-        # Gemini (always attempted — it's the default)
+        # Gemini (public AI Studio API key)
         gemini = self._providers.get("gemini")
         if gemini is not None:
             api_key = (
@@ -85,6 +85,26 @@ class LLMRegistry:
                     default_model=settings.gemini_model,
                     super_model=settings.gemini_super_model,
                 )
+
+        # Vertex AI (Gemini via GCP).  Uses Application Default
+        # Credentials — no API key.  Skipped unless VERTEX_PROJECT is set.
+        vertex = self._providers.get("vertex")
+        if vertex is not None and settings.vertex_project:
+            vertex.configure(
+                project=settings.vertex_project,
+                location=settings.vertex_location,
+                default_model=settings.vertex_model,
+                super_model=settings.vertex_super_model,
+            )
+
+        # Ollama (local) — no authentication, just an HTTP host.
+        ollama = self._providers.get("ollama")
+        if ollama is not None:
+            ollama.configure(
+                host=settings.ollama_host,
+                default_model=settings.ollama_model,
+                super_model=settings.ollama_super_model,
+            )
 
     @property
     def providers(self) -> dict[str, LLMProvider]:

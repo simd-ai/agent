@@ -182,6 +182,63 @@ class EventStore:
                     {"id": run_id, "status": status.value},
                 )
     
+    async def set_sim_run_id(self, run_id: UUID, sim_run_id: str) -> None:
+        """Persist the sim-server run id into ``runs.result`` mid-run.
+
+        Without this, a page reload mid-simulation leaves a worker that did
+        not own the orchestrator unable to drive the sim runner (the only
+        place sim_run_id is otherwise available is the orchestrator's
+        in-process state).  Stop / continue endpoints fall back to this
+        column when ``_active_orchestrators`` doesn't have the run.
+
+        The update is a JSONB merge — pre-existing keys in ``result`` are
+        preserved so this does not clobber anything the orchestrator has
+        already written.
+        """
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE runs
+                    SET result = COALESCE(result, '{}'::jsonb)
+                                 || jsonb_build_object('sim_run_id', :sim_run_id)
+                    WHERE id = :id
+                    """
+                ),
+                {"id": run_id, "sim_run_id": sim_run_id},
+            )
+
+    async def set_convergence(
+        self, run_id: UUID, convergence: dict[str, Any],
+    ) -> None:
+        """Persist the latest convergence assessment into ``runs.result`` mid-run.
+
+        Convergence is recomputed every ~25 sim_progress steps by the
+        orchestrator and emitted via WebSocket as ``convergence_update``
+        events.  Without this DB write, a page refresh mid-run would
+        leave the frontend with empty OoM badges — the WS event was
+        delivered but lost on reload, and the DB had no copy yet because
+        ``finalize_run`` only runs at end-of-run.
+
+        JSONB merge into the existing ``result`` field, so any other
+        keys (``sim_run_id``, …) the orchestrator has already written
+        are preserved.  Called on every assessment refresh; the
+        frontend's ``restore-run.ts`` reads back from ``result.convergence``.
+        """
+        import json as _json
+        async with get_session() as session:
+            await session.execute(
+                text(
+                    """
+                    UPDATE runs
+                    SET result = COALESCE(result, '{}'::jsonb)
+                                 || jsonb_build_object('convergence', CAST(:conv AS jsonb))
+                    WHERE id = :id
+                    """
+                ),
+                {"id": run_id, "conv": _json.dumps(convergence)},
+            )
+
     async def finalize_run(
         self,
         run_id: UUID,

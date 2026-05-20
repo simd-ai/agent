@@ -33,9 +33,13 @@ async def update_user(user_id: UUID, body: UserUpdate) -> UserOut:
 
 
 @router.get("/{user_id}/usage")
-async def get_user_usage(user_id: UUID) -> UsageOut:
+async def get_user_usage(
+    user_id: UUID,
+    simulation_id: UUID | None = None,
+) -> UsageOut:
+    """Return usage. Pass ?simulation_id=... to scope run_count to one project."""
     try:
-        return await user_service.get_usage(user_id)
+        return await user_service.get_usage(user_id, simulation_id=simulation_id)
     except ValueError:
         raise HTTPException(404, f"User {user_id} not found")
 

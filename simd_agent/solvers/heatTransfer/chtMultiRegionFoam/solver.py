@@ -67,10 +67,17 @@ class ChtMultiRegionFoamSolver(MultiRegionBase, TransientBase):
     def validate(
         self, files: dict[str, str], config: dict[str, Any]
     ) -> ValidationResult:
-        """Phase 1 validate — same scope as the SIMPLE variant."""
+        """Validate a CHT case: render the deterministic per-region tree,
+        ensure ``application`` in ``system/controlDict`` matches the solver
+        name.  Gravity is emitted per-region by ``render_deterministic_files``
+        so there's no top-level ``constant/g`` to enforce here.
+        """
         issues: list[ValidationIssue] = []
         fixed = dict(files)
         fixed.update(self.render_deterministic_files(config))
         fixed = self._fix_controldict_solver(fixed, issues)
-        fixed = self._ensure_gravity(fixed, issues)
+        # A6 — per-region function objects (volAverage T, patch averages
+        # on inlets/outlets) so the runner's per-region progress parser
+        # has structured data to consume on every timestep.
+        fixed = self.inject_function_objects(fixed, config)
         return ValidationResult(files=fixed, issues=issues)

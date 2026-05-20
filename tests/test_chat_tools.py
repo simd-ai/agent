@@ -1,7 +1,11 @@
 # tests/test_chat_tools.py
-"""Tests for chat tool functions — plot_field_values, plot_field_over_iterations, etc.
+"""Tests for chat tool functions — plot_field_values, compute_field_stats, etc.
 
 All tests are pure-Python (no DB, no LLM calls) and run in parallel via pytest-xdist.
+
+``plot_field_over_iterations`` was removed (it overlapped with the always-on
+residual chart in LiveTab); see ``test_multi_region_isolation.py::
+test_plot_field_over_iterations_tool_is_removed`` for the regression guard.
 """
 
 import pytest
@@ -10,7 +14,6 @@ from simd_agent.chat.tools import SimulationSnapshot
 # Import the tool functions directly from the module
 from simd_agent.chat.tools import (
     plot_field_values,
-    plot_field_over_iterations,
     compute_field_stats,
     query_simulation_results,
     plot_patch_values,
@@ -188,8 +191,9 @@ class TestPlotFieldValues:
         """sim_progress has residuals but no field_ranges → no duplicate residual chart.
 
         Previously this fell back to building a residual line chart, which
-        duplicated plot_field_over_iterations.  Now it either falls through to
-        the VTK bar chart or returns an error.
+        duplicated the (now-removed) ``plot_field_over_iterations``.  Now
+        it either falls through to the VTK bar chart or returns an error
+        pointing the LLM at ``compute_residual_trend`` instead.
         """
         progress_no_fr = [
             {"iteration": i, "residuals": {"Ux": {"initial": 0.1 / (i + 1)}, "Uy": {"initial": 0.08 / (i + 1)}}}
@@ -200,8 +204,9 @@ class TestPlotFieldValues:
         result = plot_field_values({"fields": "U"}, snap)
 
         # Without the residual fallback AND no VTK data for U, we get an error
+        # message that points the LLM at the remaining residual-trend tool.
         assert "error" in result
-        assert "plot_field_over_iterations" in result["error"]
+        assert "compute_residual_trend" in result["error"]
 
     def test_sim_progress_no_matching_residuals_falls_to_vtk(self):
         """sim_progress has residuals but NOT for the requested field → VTK bar chart."""
@@ -248,98 +253,6 @@ class TestPlotFieldValues:
 
         assert "error" not in result
         assert "chart" in result
-
-
-# ---------------------------------------------------------------------------
-# plot_field_over_iterations
-# ---------------------------------------------------------------------------
-
-class TestPlotFieldOverIterations:
-    """Tests for the plot_field_over_iterations tool (residuals/courant)."""
-
-    def test_residual_plot(self):
-        """Plot residuals for a field."""
-        snap = _make_snap(sim_progress=SIM_PROGRESS)
-        result = plot_field_over_iterations({"fields": "Ux"}, snap)
-
-        assert "error" not in result
-        assert "chart" in result
-        chart = result["chart"]
-        assert chart["type"] == "line"
-        assert "Ux" in chart["lines"]
-        assert len(chart["data"]) == 10
-
-    def test_multiple_residual_fields(self):
-        """Plot multiple residual fields at once."""
-        snap = _make_snap(sim_progress=SIM_PROGRESS)
-        result = plot_field_over_iterations({"fields": "Ux,p,k"}, snap)
-
-        assert "chart" in result
-        lines = result["chart"]["lines"]
-        assert "Ux" in lines
-        assert "p" in lines
-        assert "k" in lines
-
-    def test_courant_number(self):
-        """Plot Courant number."""
-        snap = _make_snap(sim_progress=SIM_PROGRESS)
-        result = plot_field_over_iterations({"fields": "courant"}, snap)
-
-        assert "chart" in result
-        assert "Courant" in result["chart"]["lines"]
-
-    def test_continuity_error(self):
-        """Plot continuity error."""
-        snap = _make_snap(sim_progress=SIM_PROGRESS)
-        result = plot_field_over_iterations({"fields": "continuity"}, snap)
-
-        assert "chart" in result
-        assert "Continuity" in result["chart"]["lines"]
-
-    def test_no_sim_progress(self):
-        """When sim_progress is empty, return descriptive error."""
-        snap = _make_snap(sim_progress=[])
-        result = plot_field_over_iterations({"fields": "Ux"}, snap)
-
-        assert "error" in result
-        assert "compute_field_stats" in result["error"]
-
-    def test_no_fields_specified(self):
-        """When no fields specified, return error."""
-        snap = _make_snap(sim_progress=SIM_PROGRESS)
-        result = plot_field_over_iterations({"fields": ""}, snap)
-
-        assert "error" in result
-
-    def test_steady_uses_initial_residuals(self):
-        """Steady simulations should use initial residuals."""
-        snap = _make_snap(
-            sim_progress=SIM_PROGRESS,
-            physics={"time_scheme": "steady"},
-        )
-        result = plot_field_over_iterations({"fields": "Ux"}, snap)
-
-        assert "chart" in result
-        # Verify data uses initial residuals (values > final)
-        first_point = result["chart"]["data"][0]
-        assert first_point.get("Ux") == pytest.approx(1.0)  # initial residual at i=0
-
-    def test_log_scale_for_residuals(self):
-        """Residual plots should use log scale."""
-        snap = _make_snap(sim_progress=SIM_PROGRESS)
-        result = plot_field_over_iterations({"fields": "Ux"}, snap)
-
-        assert result["chart"].get("yScale") == "log"
-
-    def test_fields_as_list(self):
-        """fields arg as a list (from query analyzer) should work."""
-        snap = _make_snap(sim_progress=SIM_PROGRESS)
-        result = plot_field_over_iterations({"fields": ["Ux", "p"]}, snap)
-
-        assert "error" not in result
-        assert "chart" in result
-        assert "Ux" in result["chart"]["lines"]
-        assert "p" in result["chart"]["lines"]
 
 
 # ---------------------------------------------------------------------------

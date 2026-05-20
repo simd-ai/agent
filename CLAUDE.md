@@ -90,16 +90,36 @@ simd_agent/llm/
   __init__.py          # exports get_provider(), get_llm_registry()
   base.py              # LLMProvider abstract base class
   registry.py          # auto-discovery + settings-based configuration
-  gemini/
-    __init__.py        # exports provider_plugin = GeminiProvider()
-    provider.py        # wraps google-genai SDK
+  gemini/              # public AI Studio Gemini (API key)
+  vertex/              # Gemini via Google Cloud Vertex AI (ADC, no daily cap)
+  ollama/              # local inference via Ollama HTTP server
 ```
+
+`LLMProvider.configure()` accepts arbitrary kwargs — each provider declares its own credentials (e.g. `api_key=` for Gemini, `project=`/`location=` for Vertex, `host=` for Ollama). The registry reads `Settings` and passes the right kwargs in `configure_from_settings()`.
 
 **Adding a new provider** — create `simd_agent/llm/<name>/` with:
 - `__init__.py` exporting `provider_plugin = YourProvider()`
-- `provider.py` subclassing `LLMProvider` with `configure()`, `client`, `types`, `generate()`, `generate_stream()`
+- `provider.py` subclassing `LLMProvider` with `configure(**kwargs)`, `client`, `types`, `generate()`, `generate_stream()`
 
-Set `DEFAULT_PROVIDER=<name>` in `.env` and add the provider's API key to settings.
+Set `DEFAULT_PROVIDER=<name>` in `.env` and add the provider's credentials to settings.
+
+**Switching to Vertex AI (lifts the AI Studio daily request cap)** — service-account JSON only, no `gcloud` CLI needed:
+
+1. In the GCP Console → IAM & Admin → Service Accounts, create a new service account.
+2. Grant it the role `Vertex AI User` (`roles/aiplatform.user`).
+3. Create a JSON key for that service account and download it. Save it somewhere safe (e.g. `~/.gcp/simd-agent-sa.json`, **outside** the repo — `.gitignore` already excludes it but treat the file as a secret).
+4. Enable the Vertex AI API on the project (`aiplatform.googleapis.com`).
+
+Then in `.env`:
+```
+DEFAULT_PROVIDER=vertex
+VERTEX_PROJECT=<your-gcp-project>
+VERTEX_LOCATION=us-central1
+GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/sa-key.json
+```
+The Vertex provider injects `GOOGLE_APPLICATION_CREDENTIALS` into `os.environ` on first use (same pattern as `storage/gcs.py`), and `google-auth` picks it up — no CLI login needed. Restart the FastAPI service and `get_provider()` will return the Vertex provider everywhere.
+
+Vertex uses the same `google-genai` SDK as Gemini, so model IDs are identical (`gemini-2.5-pro`, `gemini-2.5-flash`, …). All call sites continue to use `get_provider()` — no code changes needed when flipping the default.
 
 ### Solver Plugins — self-contained packages
 
@@ -164,8 +184,12 @@ Required:
 Key optional overrides:
 - `SIMULATION_SERVER_URL` — external OpenFOAM runner base URL (configurable endpoint)
 - `DEFAULT_PROVIDER` — LLM provider name (default `gemini`, must match a package under `simd_agent/llm/`)
-- `GEMINI_API_KEY` — Google Gemini API key (primary LLM)
+- `GEMINI_API_KEY` — Google Gemini API key (public AI Studio tier — has a daily request cap)
 - `GEMINI_MODEL` / `GEMINI_SUPER_MODEL` — model names for codegen and verification
+- `VERTEX_PROJECT` — GCP project ID (required when `DEFAULT_PROVIDER=vertex`; no daily cap)
+- `VERTEX_LOCATION` — Vertex region (default `us-central1`)
+- `VERTEX_MODEL` / `VERTEX_SUPER_MODEL` — Vertex model names (default `gemini-2.5-flash` / `gemini-2.5-pro`)
+- `GOOGLE_APPLICATION_CREDENTIALS` — absolute path to a GCP service-account JSON key. Required for `DEFAULT_PROVIDER=vertex` and for `STORAGE_BACKEND=gcs` (one key can serve both — grant `roles/aiplatform.user` and `roles/storage.objectAdmin`).
 - `VTK_CACHE_DIR` — local directory for caching VTP files (default `/tmp/simd_vtk_cache`)
 
 ### VTK Results

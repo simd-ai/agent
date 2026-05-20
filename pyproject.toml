@@ -21,12 +21,14 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.25",
     "asyncpg>=0.29.0",
     "google-genai>=1.0.0",
+    "ollama>=0.4.0",
     "python-multipart==0.0.19",
     "zstandard>=0.22.0",
     "google-cloud-storage>=2.14.0",
     "numpy>=2.0.0",
     "pyvista>=0.45.0",
     "meshio>=5.3.5",
+    "matplotlib>=3.8.0",
 ]
 
 [project.optional-dependencies]

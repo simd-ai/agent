@@ -9,6 +9,9 @@ class ConfigRepository(PostgresRepository):
     pk = "simulation_id"
     columns = [
         "simulation_id", "case_spec", "cfd_physics", "cfd_solver",
-        "cfd_fluid", "cfd_turbulence", "cfd_derived",
+        "cfd_fluid", "cfd_turbulence", "cfd_derived", "cfd_regions",
     ]
-    json_columns = {"case_spec", "cfd_physics", "cfd_solver", "cfd_fluid", "cfd_turbulence", "cfd_derived"}
+    json_columns = {
+        "case_spec", "cfd_physics", "cfd_solver",
+        "cfd_fluid", "cfd_turbulence", "cfd_derived", "cfd_regions",
+    }

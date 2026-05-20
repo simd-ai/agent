@@ -53,6 +53,48 @@ class Settings(BaseSettings):
         description="High-capacity Gemini model used for solver selection and verification",
     )
 
+    # ── Vertex AI (Gemini via Google Cloud) ──────────────────────
+    # Same google-genai SDK as the public Gemini provider, but
+    # authenticated with Application Default Credentials against a
+    # GCP project + region.  Removes the daily request cap that the
+    # AI Studio tier enforces.  Run once on the host:
+    #
+    #   gcloud auth application-default login
+    #   gcloud services enable aiplatform.googleapis.com
+    vertex_project: str | None = Field(
+        default=None,
+        description="GCP project ID hosting the Vertex AI API",
+    )
+    vertex_location: str = Field(
+        default="us-central1",
+        description="Vertex AI region (e.g. us-central1, europe-west4)",
+    )
+    vertex_model: str = Field(
+        default="gemini-2.5-flash",
+        description="Default Vertex model for code generation",
+    )
+    vertex_super_model: str = Field(
+        default="gemini-2.5-pro",
+        description="High-capacity Vertex model for solver selection and verification",
+    )
+
+    # ── Ollama (local LLM) ───────────────────────────────────────
+    # Talks to a `llama-server`-style HTTP endpoint exposed by Ollama
+    # (default port 11434).  Models are pulled out-of-band via
+    # `ollama pull gemma4` — this app only references them by tag.
+    ollama_host: str = Field(
+        default="http://localhost:11434",
+        description="Base URL of the local Ollama server",
+    )
+    ollama_model: str = Field(
+        default="gemma4",
+        description="Default Ollama model tag for code generation (e.g. gemma4, gemma4:31b)",
+    )
+    ollama_super_model: str = Field(
+        default="gemma4:31b",
+        description="High-capacity Ollama model for solver selection and verification",
+    )
+
     # Logging
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(
         default="INFO",
@@ -112,12 +154,15 @@ class Settings(BaseSettings):
     )
 
     # Google Cloud credentials file (service account key JSON).
-    # google.cloud.storage.Client() reads this from os.environ, but
-    # pydantic-settings doesn't export .env vars to os.environ — so we
-    # read it here and inject it during app startup.
+    # Used by every Google SDK in the codebase — GCS storage, Vertex AI
+    # (via google-genai), etc.  pydantic-settings doesn't export .env
+    # vars to os.environ, so each caller injects this into os.environ
+    # before constructing the Google SDK client (see storage/gcs.py and
+    # llm/vertex/provider.py).
     google_application_credentials: str | None = Field(
         default=None,
-        description="Path to GCS service account key JSON file",
+        description="Path to a GCP service-account JSON key file. Required for "
+                    "STORAGE_BACKEND=gcs and DEFAULT_PROVIDER=vertex.",
     )
 
     # ── Usage / tier limits ──────────────────────────────────────

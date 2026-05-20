@@ -86,17 +86,39 @@ def validate_generated_files(
     config: dict[str, Any],
 ) -> tuple[dict[str, str], list[ValidationIssue]]:
     """Validate and auto-fix generated OpenFOAM files for consistency.
-    
+
     Checks:
     1. controlDict application matches expected solver
     2. If solver is simpleFoam/pimpleFoam, ensure 0/p exists (not p_rgh)
     3. All patch names appear in every 0/* field file
     4. No buoyant-only files if solver is not buoyant
     5. Turbulence fields match selected model
-    
+
+    **Single-region only.**  Multi-region (CHT) cases have a flat ``0/<field>``
+    file layout that does not exist — fields live under ``0/<region>/`` and
+    every single-region check here would either misfire or quietly damage
+    the per-region tree.  When this function is called for a multi-region
+    solver it returns the input untouched with a loud log line so the bug
+    is visible upstream.  See :mod:`simd_agent.run.multi_region` for the
+    multi-region equivalents.
+
     Returns:
         Tuple of (possibly-fixed files dict, list of issues found)
     """
+    # Defensive depth — single-region checks must NEVER run against a
+    # multi-region case.  base.py:validate_full also gates this call from
+    # the caller side, but a second self-defending guard here means an
+    # unguarded import-and-call (e.g. tests, future refactors) is safe.
+    from simd_agent.solvers import is_multi_region_solver
+    if is_multi_region_solver(solver):
+        logger.warning(
+            "[VALIDATE] validate_generated_files called for multi-region "
+            "solver %r — skipped (single-region validator does not "
+            "understand the per-region case tree)",
+            solver,
+        )
+        return dict(files), []
+
     issues: list[ValidationIssue] = []
     fixed_files = dict(files)
     
@@ -135,6 +157,24 @@ def validate_generated_files(
         if app_match:
             declared_solver = app_match.group(1)
             if declared_solver != solver:
+                # Loud log so a solver-swap attempt by the LLM is obvious
+                # in production output.  This is a defensive correction:
+                # the selected solver is set ONCE at run start by the
+                # orchestrator and must never be changed during retries.
+                logger.warning(
+                    "[VALIDATE] ⚠ LLM attempted solver swap in controlDict: "
+                    "'application %s;' → corrected to 'application %s;' "
+                    "(orchestrator-locked solver)",
+                    declared_solver, solver,
+                )
+                print(
+                    f"\n{'='*70}\n"
+                    f"[VALIDATE] ⚠ SOLVER-SWAP ATTEMPT BLOCKED\n"
+                    f"  LLM wrote: application {declared_solver};\n"
+                    f"  Corrected to: application {solver};\n"
+                    f"  The selected solver is locked for the duration of this run.\n"
+                    f"{'='*70}\n"
+                )
                 issues.append(ValidationIssue(
                     "warning", "system/controlDict",
                     f"LLM wrote 'application {declared_solver}' but selected solver is "
@@ -1305,7 +1345,14 @@ functions
         required_files.append("0/p")
 
     # Transport / thermo
-    if solver in THERMO_SOLVERS:
+    # Boussinesq variants are an exception inside THERMO_SOLVERS: they solve
+    # the energy equation BUT use constant/transportProperties (β, T_ref, ν)
+    # instead of constant/thermophysicalProperties — density is constant ρ₀
+    # in the Boussinesq approximation, no full EOS is needed.
+    _is_boussinesq = "Boussinesq" in solver
+    if _is_boussinesq:
+        required_files.append("constant/transportProperties")
+    elif solver in THERMO_SOLVERS:
         required_files.append("constant/thermophysicalProperties")
     elif solver not in P_RGH_SOLVERS:
         # Simple single-phase incompressible need transportProperties
@@ -1346,14 +1393,27 @@ functions
             ))
     
     # ── Check 6: fvSolution solver algorithm ──
+    # Suffix-driven: *SimpleFoam → SIMPLE block, *PimpleFoam → PIMPLE,
+    # chtMultiRegionFoam (transient) → PIMPLE.  Covers every variant we
+    # ship (rho*, buoyant*, buoyantBoussinesq*, chtMultiRegion*) without
+    # listing them by name.
     fv_solution = fixed_files.get("system/fvSolution", "")
     if fv_solution:
-        if solver in ("simpleFoam", "rhoSimpleFoam", "buoyantSimpleFoam") and "SIMPLE" not in fv_solution:
-            issues.append(ValidationIssue("warning", "system/fvSolution", f"{solver} requires a SIMPLE block in fvSolution."))
-        elif solver in ("pimpleFoam", "rhoPimpleFoam", "buoyantPimpleFoam") and "PIMPLE" not in fv_solution:
-            issues.append(ValidationIssue("warning", "system/fvSolution", f"{solver} requires a PIMPLE block in fvSolution."))
-        elif solver in P_RGH_SOLVERS and solver not in ("buoyantSimpleFoam", "buoyantPimpleFoam") and "PIMPLE" not in fv_solution:
-            issues.append(ValidationIssue("warning", "system/fvSolution", f"{solver} (VOF) requires a PIMPLE block in fvSolution."))
+        needs_simple = solver.endswith("SimpleFoam")
+        needs_pimple = (
+            solver.endswith("PimpleFoam")
+            or solver == "chtMultiRegionFoam"
+        )
+        if needs_simple and "SIMPLE" not in fv_solution:
+            issues.append(ValidationIssue(
+                "warning", "system/fvSolution",
+                f"{solver} requires a SIMPLE block in fvSolution.",
+            ))
+        elif needs_pimple and "PIMPLE" not in fv_solution:
+            issues.append(ValidationIssue(
+                "warning", "system/fvSolution",
+                f"{solver} requires a PIMPLE block in fvSolution.",
+            ))
     
     # ── Check 7: wallDist in fvSchemes (required for kOmegaSST, kEpsilon, etc.) ──
     fv_schemes = fixed_files.get("system/fvSchemes", "")
@@ -1836,6 +1896,74 @@ functions
                 f"Ratio: {_tf_gen_val/_ref_val:.2f}x."
             )
 
+    # ── Check 2d: OF 2406 requires `value` on certain inlet BCs ──────────────
+    # turbulentIntensityKineticEnergyInlet, turbulentMixingLengthFrequencyInlet,
+    # turbulentMixingLengthDissipationRateInlet (and a few siblings) MUST carry
+    # an explicit `value uniform <X>;` entry under OpenFOAM 2406's stricter
+    # reader — without it the solver dies on iteration 0 with
+    #   "Required entry 'value' : missing for patch <inlet> in dictionary
+    #   '0/<field>/boundaryField/<inlet>'"
+    # We patch each patch block in 0/k, 0/omega, 0/epsilon: if it uses one of
+    # these inlet types AND has no `value` line, append `value uniform $internalField;`
+    # immediately before the closing brace.
+    _VALUE_REQUIRING_TYPES = (
+        "turbulentIntensityKineticEnergyInlet",
+        "turbulentMixingLengthFrequencyInlet",
+        "turbulentMixingLengthDissipationRateInlet",
+    )
+    # Block matcher: a patch entry is `<name> { ... }`.  We allow nested
+    # braces (none expected at this level) by matching the shortest balanced
+    # block via a non-greedy outer + greedy inner trick.
+    _PATCH_BLOCK_RE = _ic_re.compile(
+        r'(\b\w+\s*\{)([^{}]*)(\})',
+        _ic_re.DOTALL,
+    )
+    for _tf_name in ("k", "omega", "epsilon"):
+        _tf_path = f"0/{_tf_name}"
+        _tf_content = fixed_files.get(_tf_path, "")
+        if not _tf_content:
+            continue
+        _patched_any = False
+        _patched_blocks: list[str] = []
+
+        def _maybe_inject_value(m):
+            nonlocal _patched_any
+            head, body, tail = m.group(1), m.group(2), m.group(3)
+            # Only consider blocks that DECLARE one of the value-requiring types.
+            type_m = _ic_re.search(r'\btype\s+([A-Za-z]+)\s*;', body)
+            if not type_m or type_m.group(1) not in _VALUE_REQUIRING_TYPES:
+                return m.group(0)
+            # Already has a `value` line — nothing to do.
+            if _ic_re.search(r'\bvalue\b\s', body):
+                return m.group(0)
+            # Inject `value uniform $internalField;` right before the closing brace,
+            # preserving indentation from the line before the brace if we can find it.
+            indent_m = _ic_re.search(r'(?m)^(\s*)\S', body.splitlines()[-1] if body.strip() else "")
+            indent = indent_m.group(1) if indent_m else "        "
+            new_body = body.rstrip() + f"\n{indent}value           uniform $internalField;\n    "
+            _patched_any = True
+            # Grab patch name from head for diagnostics
+            name_m = _ic_re.match(r'\s*(\w+)', head)
+            _patched_blocks.append(name_m.group(1) if name_m else "?")
+            return head + new_body + tail
+
+        _new_content = _PATCH_BLOCK_RE.sub(_maybe_inject_value, _tf_content)
+        if _patched_any:
+            fixed_files[_tf_path] = _new_content
+            issues.append(ValidationIssue(
+                "warning", _tf_path,
+                f"OF 2406 requires `value` entry on inlet BC types "
+                f"({', '.join(_VALUE_REQUIRING_TYPES)}). Auto-injected "
+                f"`value uniform $internalField;` for patch(es): "
+                f"{', '.join(_patched_blocks)}.",
+                fix=f"Injected missing value entries in 0/{_tf_name} ({len(_patched_blocks)} patch(es))",
+            ))
+            logger.warning(
+                "[VALIDATE] Check 2d: 0/%s — injected missing `value` "
+                "entries for value-requiring inlet types on patch(es): %s",
+                _tf_name, _patched_blocks,
+            )
+
     # Check 3: for icoPolynomial EOS, warn if any T BC exceeds eos_t_ceiling
     if _eos_ceiling is not None:
         for _field_name, _content in fixed_files.items():
@@ -1981,9 +2109,27 @@ def build_required_files_list(solver: str, config: dict[str, Any]) -> list[str]:
     is registered (the plugin is the single source of truth post-refactor).
     Falls back to the legacy inline logic for unknown solvers, so callers can
     still ask for files without a plugin being installed.
+
+    **Multi-region cases never reach the legacy fallback.**  The plugin
+    contract pins the LLM-owned manifest to ``["system/controlDict"]`` for
+    every CHT solver; every other case file is rendered deterministically
+    by :class:`MultiRegionBase`.  A defensive early-return below guarantees
+    this even if a future refactor accidentally bypasses the plugin lookup.
     """
+    from simd_agent.solvers import get_registry, is_multi_region_solver
+
+    if is_multi_region_solver(solver):
+        try:
+            _plugin = get_registry().get(solver)
+            if _plugin is not None:
+                return _plugin.required_files(config)
+        except Exception:
+            pass
+        # Plugin lookup failed but we know it's multi-region — pin to the
+        # one file the LLM legitimately owns in any CHT case.
+        return ["system/controlDict"]
+
     try:
-        from simd_agent.solvers import get_registry
         _plugin = get_registry().get(solver)
     except Exception:
         _plugin = None
@@ -2088,7 +2234,20 @@ def determine_solver(config: dict[str, Any]) -> str:
 
     Prefer SolverSelector (LLM-assisted) over this function.
     This is a pure-logic fallback used when the selector is unavailable.
+
+    Multi-region (CHT) is handled BEFORE this function runs — see
+    :func:`simd_agent.run.multi_region.force_cht_solver_if_multi_region`,
+    which the orchestrator calls first and returns the canonical
+    ``chtMultiRegionSimpleFoam`` / ``chtMultiRegionFoam`` without an
+    LLM call.  If a multi-region ``config["regions"]`` somehow reaches
+    this single-region heuristic, we short-circuit to the CHT solver so
+    we never run single-region physics rules on CHT topology.
     """
+    from simd_agent.run.multi_region import force_cht_solver_if_multi_region
+    _cht = force_cht_solver_if_multi_region(config)
+    if _cht is not None:
+        return _cht
+
     from simd_agent.run.solver_selector import _heuristic_fallback
     return _heuristic_fallback(config)
 
@@ -2820,7 +2979,12 @@ class GenAICodeGenerator:
             f"1. Output ONLY `{file_path}` — no other files\n"
             f"2. Patch names MUST match `patch_names` in CaseSpec exactly\n"
             f"3. Physical values MUST come from CaseSpec/BC table — do NOT invent defaults\n"
-            f"4. `application` in controlDict MUST be `{solver}`\n"
+            f"4. `application` in controlDict MUST be EXACTLY `{solver}` — "
+            f"this solver is LOCKED for this run, never substitute another\n"
+            f"   solver name (rhoSimpleFoam, buoyantSimpleFoam, etc.) even if "
+            f"the error log seems to suggest a different solver would fix it.\n"
+            f"   Fixes belong in BCs, schemes, relaxation, fvOptions — never\n"
+            f"   in the `application` field.\n"
             f"5. endTime in controlDict MUST be an integer (e.g. 88 not 88.0); deltaT may be float\n"
             f"6. Generate the COMPLETE file — include ALL patches in boundaryField\n"
             f"7. No leading spaces on top-level dict keys\n"

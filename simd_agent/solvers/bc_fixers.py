@@ -118,6 +118,119 @@ def classify_patches(
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Mesh-side patch types  (constraint-patch BC enforcement)
+# ────────────────────────────────────────────────────────────────────────────
+
+# Mesh-side patch types that require a matching BC type on every field —
+# OpenFOAM rejects fields whose ``patchField`` type is incompatible with the
+# constraint patch type at solver startup.  ``symmetryPlane`` is the legacy
+# spelling of ``symmetry``; both map to the same patchField name.
+CONSTRAINT_PATCH_TYPES: tuple[str, ...] = (
+    "symmetry", "symmetryPlane", "empty", "wedge",
+)
+
+
+def patch_type_map(config: dict[str, Any]) -> dict[str, str]:
+    """Return ``{patch_name: polyMesh_type}`` from the validated config.
+
+    Reads ``config["mesh"]["patches"]`` (populated by the mesh-info
+    importer).  Patches missing a name or type are skipped; callers that
+    can't find a given patch in the map should leave its BC untouched.
+    """
+    mesh = config.get("mesh") or {}
+    if not isinstance(mesh, dict):
+        return {}
+    out: dict[str, str] = {}
+    for mp in mesh.get("patches", []) or []:
+        if isinstance(mp, dict):
+            n, t = mp.get("name"), mp.get("type")
+        else:
+            n, t = getattr(mp, "name", None), getattr(mp, "type", None)
+        if n and t:
+            out[n] = t
+    return out
+
+
+def fix_constraint_patch_bcs(
+    files: dict[str, str],
+    issues: list[ValidationIssue],
+    config: dict[str, Any],
+) -> dict[str, str]:
+    """Force the BC type to match the polyMesh patch type for constraint patches.
+
+    OpenFOAM rejects fields whose ``patchField`` type is incompatible with
+    the mesh-side patch type:
+
+      * patch type ``symmetry``  → patchField MUST be ``symmetry``
+      * patch type ``empty``     → patchField MUST be ``empty``
+      * patch type ``wedge``     → patchField MUST be ``wedge``
+
+    The LLM often emits ``zeroGradient`` on these — a fatal IO error at
+    solver startup ("inconsistent patch and patchField types").  This
+    fixer walks every primary ``0/<field>`` and ``0/<region>/<field>``
+    file, finds each constraint-typed patch by name, and rewrites its
+    BC body to ``type <constraint>;`` via :func:`rewrite_patch_body`.
+
+    Non-constraint patches (regular ``patch``, ``wall``) are left alone,
+    so single-region cases (and the LLM-authored BCs on regular inlets/
+    outlets/walls in CHT) keep their generated content.  Single-region
+    cases with no constraint patches are an exact no-op.
+    """
+    type_by_name = patch_type_map(config)
+    if not type_by_name:
+        return files
+
+    out = dict(files)
+    for path, content in list(files.items()):
+        # Field files only: paths like 0/U, 0/p, 0/T, 0/<region>/U, ...
+        if not path.startswith("0/"):
+            continue
+        # Two-segment (single-region: ["0", field]) or three-segment
+        # (multi-region: ["0", region, field]).  Anything deeper isn't a
+        # primary field file.
+        if path.count("/") not in (1, 2):
+            continue
+
+        new_content = content
+        changed = False
+        for patch_name, mesh_type in type_by_name.items():
+            if mesh_type not in CONSTRAINT_PATCH_TYPES:
+                continue
+            # Capture the existing BC type for the log (best-effort).
+            prev_bc = ""
+            m = re.search(
+                rf"(?<![A-Za-z_]){re.escape(patch_name)}\s*\{{\s*[^}}]*?\btype\s+([A-Za-z_:][\w:.]*)\s*;",
+                new_content,
+            )
+            if m:
+                prev_bc = m.group(1)
+
+            replaced = rewrite_patch_body(
+                new_content, patch_name, f"type            {mesh_type};",
+            )
+            if replaced is None or replaced == new_content:
+                continue
+            new_content = replaced
+            changed = True
+            if prev_bc and prev_bc != mesh_type:
+                issues.append(
+                    ValidationIssue(
+                        severity="info",
+                        file=path,
+                        message=(
+                            f"Patch {patch_name!r} has polyMesh type "
+                            f"{mesh_type!r}; rewrote BC {prev_bc!r} → "
+                            f"{mesh_type!r}"
+                        ),
+                        fix=f"forced constraint BC type {mesh_type}",
+                    )
+                )
+        if changed:
+            out[path] = new_content
+    return out
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Outlet backflow safety (zeroGradient → inletOutlet)
 # ────────────────────────────────────────────────────────────────────────────
 

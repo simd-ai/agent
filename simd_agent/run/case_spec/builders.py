@@ -31,6 +31,32 @@ def _safe_float(v: Any) -> float | None:
         return None
 
 
+def _from_case_defaults(
+    validated_config: dict[str, Any], key: str, default: Any = None,
+) -> Any:
+    """Read a single key from the enrichment-resolved ``case_defaults`` block.
+
+    Returns ``default`` when the enrichment pipeline hasn't run (e.g.
+    a test calls :func:`build_case_spec` directly without going
+    through the orchestrator).  This is the strangler-fig fallback:
+    each inline-lookup branch in :func:`build_case_spec` first tries
+    its existing direct-config logic; whatever it can't resolve falls
+    through to this helper, which checks the canonical
+    ``case_defaults`` block populated by
+    :mod:`simd_agent.run.enrichment.case_defaults`.
+
+    The split keeps backward compat (every legacy test still passes)
+    while letting freshly-enriched configs win automatically: as soon
+    as ``case_defaults`` is present, the bulk-property + inlet/wall
+    values it resolved feed straight into :class:`CaseSpec`.
+    """
+    cd = validated_config.get("case_defaults")
+    if not isinstance(cd, dict):
+        return default
+    v = cd.get(key)
+    return v if v is not None else default
+
+
 def build_case_spec(solver: str, validated_config: dict[str, Any]) -> CaseSpec:
     """Compute CaseSpec deterministically — no LLM, no side effects."""
     props = (
@@ -317,16 +343,39 @@ def build_case_spec(solver: str, validated_config: dict[str, Any]) -> CaseSpec:
             return [float(_bc_value(mag) or mag), 0.0, 0.0]
         return [0.0, 0.0, 0.0]
 
+    # ── Inlet velocity / temperature / pressure ──────────────────────────────
+    # Each branch keeps its existing direct-config lookup as the primary path
+    # so legacy tests (and any call site that builds a config by hand)
+    # continue to work unchanged.  Anything not resolved by the direct path
+    # falls through to ``case_defaults`` — populated by the enrichment
+    # pipeline from the user's wizard inputs + per-patch BCs in one place.
     inlet_vel = _vel(inlet_bc)
+    if inlet_vel == [0.0, 0.0, 0.0]:
+        _cd_u = _from_case_defaults(validated_config, "inlet_velocity")
+        if isinstance(_cd_u, (list, tuple)) and len(_cd_u) >= 3:
+            inlet_vel = [float(_cd_u[0]), float(_cd_u[1]), float(_cd_u[2])]
+
     inlet_T = _safe_float(
         _bc_value(inlet_bc.get("temperature") or inlet_bc.get("T"))
         or validated_config.get("inlet_temperature")
     )
+    if inlet_T is None:
+        inlet_T = _safe_float(_from_case_defaults(validated_config, "inlet_temperature"))
+
     wall_bc = bcs.get("wall", {}) or {}
     wall_T = _safe_float(
         _bc_value(wall_bc.get("temperature") or wall_bc.get("T"))
         or validated_config.get("wall_temperature")
     )
+    if wall_T is None:
+        # case_defaults.wall_temperatures is a {patch: T} dict — collapse to
+        # the canonical hot/cold value used by the legacy single-wall logic.
+        # Max is what fvOptions cares about (high-T side bounds icoPolynomial).
+        _cd_walls = _from_case_defaults(validated_config, "wall_temperatures")
+        if isinstance(_cd_walls, dict) and _cd_walls:
+            wall_T = max(float(v) for v in _cd_walls.values()
+                         if isinstance(v, (int, float)) and v > 0) or None
+
     # Operating pressure: prefer explicit config value; fall back to outlet fixedValue, then inlet fixedValue
     _inlet_p_raw = inlet_bc.get("pressure")
     _inlet_p_val = _bc_value(_inlet_p_raw) if isinstance(_inlet_p_raw, dict) else None
@@ -340,14 +389,34 @@ def build_case_spec(solver: str, validated_config: dict[str, Any]) -> CaseSpec:
         or validated_config.get("pressure")
         or _outlet_p
         or _inlet_p
-    ) or 101325.0
+    )
+    if op_p is None:
+        op_p = _safe_float(_from_case_defaults(validated_config, "ambient_pressure")) \
+            or _safe_float(_from_case_defaults(validated_config, "inlet_pressure"))
+    op_p = op_p or 101325.0
 
+    # ── Bulk fluid properties ────────────────────────────────────────────────
+    # Same strangler pattern: direct lookup first, case_defaults as fallback.
+    # Cp is left on the direct-only path because case_defaults doesn't (yet)
+    # carry a canonical specific-heat field — easy follow-up if we want to
+    # close that gap.
     fluid_name = (fluid.get("name") or "").strip()
     nu = _safe_float(fluid.get("nu") or fluid.get("kinematic_viscosity"))
+    if nu is None:
+        nu = _safe_float(_from_case_defaults(validated_config, "bulk_kinematic_viscosity"))
+
     rho = _safe_float(fluid.get("rho") or fluid.get("density"))
+    if rho is None:
+        rho = _safe_float(_from_case_defaults(validated_config, "bulk_density"))
+
     mu = _safe_float(fluid.get("mu") or fluid.get("dynamic_viscosity"))
+    if mu is None:
+        mu = _safe_float(_from_case_defaults(validated_config, "bulk_dynamic_viscosity"))
+
     cp = _safe_float(fluid.get("Cp") or fluid.get("cp") or fluid.get("specific_heat"))
     pr = _safe_float(fluid.get("Pr") or fluid.get("prandtl"))
+    if pr is None:
+        pr = _safe_float(_from_case_defaults(validated_config, "bulk_prandtl"))
 
     if nu is None and mu is not None and rho is not None and rho > 0:
         nu = mu / rho

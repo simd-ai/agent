@@ -41,6 +41,7 @@ async def upsert_simulation_config(
     fluid: dict[str, Any],
     turbulence: dict[str, Any],
     derived: dict[str, Any] | None = None,
+    regions: dict[str, Any] | list[Any] | None = None,
 ) -> None:
     """Write the normalised simulation config directly into the simulation_config table.
 
@@ -49,22 +50,27 @@ async def upsert_simulation_config(
     the simulation_config_ready event.
 
     turbulence must be empty ({}) for laminar flows.
+    regions is None / empty for single-region cases; a multi-region (CHT) case
+    carries either the backend's ``{"fluid": [...], "solid": [...]}`` shape
+    or the frontend's flat ``[{name, kind, …}, …]``.
     """
     try:
         async with get_session() as session:
             await session.execute(
                 text("""
                     INSERT INTO simulation_config
-                        (simulation_id, cfd_physics, cfd_solver, cfd_fluid, cfd_turbulence, cfd_derived)
+                        (simulation_id, cfd_physics, cfd_solver, cfd_fluid,
+                         cfd_turbulence, cfd_derived, cfd_regions)
                     VALUES
                         (:sid, :physics::jsonb, :solver::jsonb, :fluid::jsonb,
-                         :turbulence::jsonb, :derived::jsonb)
+                         :turbulence::jsonb, :derived::jsonb, :regions::jsonb)
                     ON CONFLICT (simulation_id) DO UPDATE SET
                         cfd_physics    = EXCLUDED.cfd_physics,
                         cfd_solver     = EXCLUDED.cfd_solver,
                         cfd_fluid      = EXCLUDED.cfd_fluid,
                         cfd_turbulence = EXCLUDED.cfd_turbulence,
-                        cfd_derived    = EXCLUDED.cfd_derived
+                        cfd_derived    = EXCLUDED.cfd_derived,
+                        cfd_regions    = EXCLUDED.cfd_regions
                 """),
                 {
                     "sid":       simulation_id,
@@ -73,6 +79,10 @@ async def upsert_simulation_config(
                     "fluid":     json.dumps(fluid),
                     "turbulence": json.dumps(turbulence),
                     "derived":   json.dumps(derived or {}),
+                    # NULL (not "{}") when no regions — distinguishes
+                    # "single-region case" from "user explicitly emptied
+                    # the regions list".
+                    "regions":   json.dumps(regions) if regions else None,
                 },
             )
         logger.info(f"[chat/db] upsert_simulation_config OK — sim={simulation_id}")
@@ -81,12 +91,13 @@ async def upsert_simulation_config(
 
 
 async def fetch_simulation_config(simulation_id: str) -> dict[str, Any]:
-    """Fetch cfd_physics, cfd_solver, cfd_fluid, cfd_turbulence from simulation_config."""
+    """Fetch the full CFD config snapshot for a simulation."""
     try:
         async with get_session() as session:
             row = await session.execute(
                 text("""
-                    SELECT cfd_physics, cfd_solver, cfd_fluid, cfd_turbulence, cfd_derived
+                    SELECT cfd_physics, cfd_solver, cfd_fluid, cfd_turbulence,
+                           cfd_derived, cfd_regions
                     FROM simulation_config
                     WHERE simulation_id = :sid
                 """),
@@ -96,11 +107,16 @@ async def fetch_simulation_config(simulation_id: str) -> dict[str, Any]:
             if not r:
                 return {}
             return {
-                "physics": r["cfd_physics"] or {},
-                "solver": r["cfd_solver"] or {},
-                "fluid": r["cfd_fluid"] or {},
+                "physics":    r["cfd_physics"]    or {},
+                "solver":     r["cfd_solver"]     or {},
+                "fluid":      r["cfd_fluid"]      or {},
                 "turbulence": r["cfd_turbulence"] or {},
-                "derived": r["cfd_derived"] or {},
+                "derived":    r["cfd_derived"]    or {},
+                # ``regions`` is the only field that distinguishes its
+                # missing case (None) from its empty case ([] / {}): a
+                # multi-region case with no regions yet is meaningless,
+                # while NULL ⇒ "single-region case, never set".
+                "regions":    r["cfd_regions"],
             }
     except Exception as exc:
         logger.warning(f"[chat/db] fetch_simulation_config failed: {exc}")
@@ -397,6 +413,28 @@ async def build_snapshot(
                     if isinstance(f, dict) and f.get("content"):
                         generated_files[f.get("path", f"file_{i}")] = f["content"]
 
+    # Multi-region per-region field metadata — fetched from the cached VTK
+    # precompute index in object storage (``results/<run>/index.json``).
+    # Populated by ``_ensure_vtk_cache`` in ``main.py`` after the
+    # simulation completes; carries per-region fields with their min/max
+    # range so chat tools can answer "max T in the wall" without falling
+    # back to residual-trend surrogates.  Empty dict for single-region
+    # runs and for runs whose VTK cache hasn't been built yet.
+    vtk_index: dict[str, Any] = {}
+    run_id_for_vtk = ctx.run_id or (str(db_run.get("id")) if db_run.get("id") else None)
+    if run_id_for_vtk and (fetch_all or (data_needs and data_needs.vtk_result)):
+        try:
+            import json as _json
+            from simd_agent.storage import get_storage
+            _storage = get_storage()
+            _idx_bytes = await _storage.download(f"results/{run_id_for_vtk}/index.json")
+            if _idx_bytes:
+                vtk_index = _json.loads(_idx_bytes) or {}
+        except Exception:
+            # Storage unavailable or index not yet written — fall through
+            # to legacy ``vtk_result`` path.  Chat tools degrade gracefully.
+            vtk_index = {}
+
     return SimulationSnapshot(
         run_id=ctx.run_id or (str(db_run["id"]) if db_run.get("id") else None),
         simulation_id=sim_id,
@@ -415,4 +453,5 @@ async def build_snapshot(
         agent_run=db_run,
         mesh_info=db_mesh.get("check_mesh") or db_mesh,
         all_runs=db_all_runs,
+        vtk_index=vtk_index,
     )

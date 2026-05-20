@@ -350,10 +350,6 @@ CRYOGENIC_KEYWORDS: tuple[str, ...] = (
 # Gemini tool schema
 # ---------------------------------------------------------------------------
 
-PRECHECK_MODEL     = "gemini-3.1-pro-preview"   # gemini-3-flash-preview -  gemini-3.1-pro-preview
-REVIEW_MODEL       = "gemini-3-flash-preview"   # deep review + corrections
-CONVERSATION_MODEL = "gemini-3-flash-preview"   # lighter model for chat + summarization
-
 # Token threshold: when conversation history exceeds this, summarize with the
 # lighter model so the context window stays manageable.
 CONVERSATION_TOKEN_LIMIT = 30_000

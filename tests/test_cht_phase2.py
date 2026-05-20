@@ -110,6 +110,19 @@ class TestPerRegionFvSchemes:
         ):
             assert line in sc, f"missing fvSchemes line: {line!r}"
 
+    def test_fluid_fvSchemes_has_wallDist_for_OF2406(self):
+        """Regression: OF 2406 demands ``wallDist { method ...; }`` for any
+        fluid region with wall-function turbulence (kOmegaSST, kEpsilon).
+        Without it the solver aborts at startup with
+        ``Entry 'method' not found in dictionary wallDist``.
+        """
+        det = _det(ChtMultiRegionFoamSolver())
+        sc = det["system/topAir/fvSchemes"]
+        assert "wallDist" in sc, "fluid fvSchemes must declare wallDist block"
+        assert "method" in sc, "wallDist block must specify a method"
+        # meshWave is the OF tutorial default — fast and works on any mesh
+        assert "meshWave" in sc
+
     def test_solid_fvSchemes_only_has_laplacian(self):
         det = _det(ChtMultiRegionFoamSolver())
         sc = det["system/heater/fvSchemes"]
@@ -260,12 +273,25 @@ class TestZeroFieldShape:
         assert "kqRWallFunction" in k
         assert "epsilonWallFunction" in eps
 
-    def test_solid_only_has_T_field(self):
-        """Solid regions have 0/<region>/T but no U/p/p_rgh/k/ε."""
+    def test_solid_ships_T_plus_passive_p_pRgh_U(self):
+        """Solid regions ship 0/<region>/{T, p, p_rgh, U} but no turbulence fields.
+
+        T is the equation actually solved in solids.  p / p_rgh / U are
+        passive (calculated / noSlip everywhere) — required by ESI v2406's
+        chtMultiRegionSimpleFoam objectRegistry lookup at startup but not
+        used in the solid heat equation.  Turbulence fields (k, ε, nut)
+        are fluid-only.
+        """
         det = _det(ChtMultiRegionFoamSolver())
-        assert "0/heater/T" in det
-        for f in ("U", "p", "p_rgh", "k", "epsilon", "nut"):
-            assert f"0/heater/{f}" not in det
+        for required in ("T", "p", "p_rgh", "U"):
+            assert f"0/heater/{required}" in det, (
+                f"Solid region must ship 0/heater/{required}"
+            )
+        for fluid_only in ("k", "epsilon", "omega", "nut", "alphat"):
+            assert f"0/heater/{fluid_only}" not in det, (
+                f"Solid region must NOT ship turbulence field "
+                f"0/heater/{fluid_only}"
+            )
 
     def test_kEpsilon_emits_both_k_and_epsilon(self):
         det = _det(ChtMultiRegionFoamSolver())
@@ -345,7 +371,7 @@ class TestRegionPresets:
             "regions": {
                 "fluid": [{
                     "name": "custom",
-                    "fluid_preset": "air",   # Cp=1006, μ=1.8e-5, Pr=0.71
+                    "fluid_preset": "air",   # Cp=1006, μ=1.81e-5, Pr=0.714
                     "Cp": 1200,              # override only Cp
                 }],
                 "solid": [{"name": "s"}],
@@ -355,9 +381,9 @@ class TestRegionPresets:
         f = regions.fluid_regions[0]
         # Override applied:
         assert f.Cp == 1200.0
-        # Other preset values preserved:
-        assert f.mu == 1.8e-5
-        assert f.Pr == 0.71
+        # Other preset values preserved (NIST-traceable air at 293 K):
+        assert f.mu == 1.81e-5
+        assert f.Pr == 0.714
 
     def test_unknown_preset_silently_falls_back_to_defaults(self):
         """Unknown preset names = no preset applied; air-like defaults."""
@@ -413,21 +439,31 @@ class TestRegionPresets:
 
 
 class TestManifestMatchesRendered:
-    """Every file in required_files() must actually be rendered (or LLM-generated)."""
+    """Every file in the full case manifest must actually be rendered or
+    LLM-generated.
+
+    Phase 3 split: ``required_files()`` is the LLM-targeted slice (just
+    ``system/controlDict``), and ``all_case_files()`` is the full manifest.
+    The deterministic renderer must cover everything in the full manifest
+    minus the LLM-targeted slice.
+    """
 
     def test_no_renderer_gap(self):
         plugin = ChtMultiRegionFoamSolver()
-        manifest = set(plugin.required_files(_CFG))
+        llm_files = set(plugin.required_files(_CFG))
+        manifest = set(plugin.all_case_files(_CFG))
         rendered = set(plugin.render_deterministic_files(_CFG).keys())
-        # Manifest may include LLM-only files (controlDict).  Rendered may
-        # include files not in the manifest (e.g. changeDictionaryDict isn't
-        # strictly required at runtime — it's applied via the Allrun script).
-        # We don't enforce equality; just check that the OVERLAP makes sense.
-        common = manifest & rendered
-        # At minimum, both should agree on the bulk: regionProperties,
-        # per-region thermo, per-region 0/T.
-        assert "constant/regionProperties" in common
-        assert "constant/topAir/thermophysicalProperties" in common
-        assert "constant/heater/thermophysicalProperties" in common
-        assert "0/topAir/T" in common
-        assert "0/heater/T" in common
+        # Everything in the manifest except the LLM-targeted slice must be
+        # produced by the deterministic renderer.
+        deterministic_expected = manifest - llm_files
+        missing = deterministic_expected - rendered
+        assert not missing, f"Files in manifest with no deterministic renderer: {sorted(missing)}"
+        # Specific spot-checks the original test cared about:
+        for f in (
+            "constant/regionProperties",
+            "constant/topAir/thermophysicalProperties",
+            "constant/heater/thermophysicalProperties",
+            "0/topAir/T",
+            "0/heater/T",
+        ):
+            assert f in rendered, f"{f} not rendered deterministically"

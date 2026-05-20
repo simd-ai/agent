@@ -33,11 +33,16 @@ from simd_agent.run.packaging import (
     merge_files,
 )
 from simd_agent.run.planning import Planner
-from simd_agent.run.genai_codegen import (
+from simd_agent.run.single_region import (
     GenAICodeGenerator,
     validate_generated_files,
     determine_solver,
 )
+from simd_agent.run.enrichment import enrich_validated_config
+from simd_agent.run.multi_region import (
+    force_cht_solver_if_multi_region,
+)
+from simd_agent.run.value_filler import fill_field_values
 from simd_agent.run.solver_selector import SolverSelector
 from simd_agent.run.solver_docs import load_prompt_pack
 from simd_agent.solvers import get_registry, SolverPlugin
@@ -62,6 +67,180 @@ PROMPTS_DIR = Path(__file__).parent / "prompts" / "packs"
 class OrchestrationError(Exception):
     """Error during orchestration."""
     pass
+
+
+# ── Multi-region (CHT) helpers ────────────────────────────────────────────
+#
+# All CHT region detection / dispatch logic lives in
+# :mod:`simd_agent.run.multi_region.region_detection`.  Public callers
+# import from the package (``from simd_agent.run.multi_region import …``);
+# the underscore-prefixed aliases below keep the existing in-file call
+# sites readable until Phase C moves the whole dispatch into a single
+# orchestrator method.
+
+_force_cht_solver_if_multi_region = force_cht_solver_if_multi_region
+
+
+def _precheck_solver(validated_config: dict[str, Any]) -> str | None:
+    """Return the precheck-chosen OpenFOAM solver iff it's a live plugin.
+
+    The precheck pipeline writes the chosen solver to
+    ``validated_config["solver"]["openfoam_solver"]`` (or its camelCase
+    sibling) and the UI carries it through.  When that value names a
+    plugin currently registered in :mod:`simd_agent.solvers`, the run
+    flow honors it directly — no LLM call.
+
+    Returns ``None`` when the field is missing, blank, the wrong type,
+    or names a plugin we don't know about.  The caller then falls
+    through to the full :class:`SolverSelector` path.
+    """
+    if not isinstance(validated_config, dict):
+        return None
+    solver_section = validated_config.get("solver") or {}
+    if not isinstance(solver_section, dict):
+        return None
+    candidate = (
+        solver_section.get("openfoam_solver")
+        or solver_section.get("openfoamSolver")
+    )
+    if not isinstance(candidate, str) or not candidate.strip():
+        return None
+    try:
+        from simd_agent.solvers import get_registry
+        if get_registry().get(candidate) is None:
+            return None
+    except Exception:
+        return None
+    return candidate
+
+
+def _normalise_residual_entry(val: Any) -> dict[str, float | int]:
+    """Coerce one residual value into the ``{initial, final, iters}`` shape.
+
+    Accepts either:
+      * a scalar (older runner versions emitted plain floats), or
+      * a dict with ``initial`` / ``final`` / ``iters`` keys (current shape).
+    """
+    if isinstance(val, dict):
+        return {
+            "initial": float(val.get("initial", 0)),
+            "final":   float(val.get("final", val.get("initial", 0))),
+            "iters":   int(val.get("iters", 1)),
+        }
+    return {
+        "initial": float(val),
+        "final":   float(val),
+        "iters":   1,
+    }
+
+
+def build_sim_progress(p: dict[str, Any]) -> dict[str, Any]:
+    """Normalise one parsed time-step into the frontend ``sim_progress`` contract.
+
+    **Single-region runs** ship residuals + continuity at the top level
+    (``p["residuals"]``, ``p["continuity"]``) — forwarded as-is.
+
+    **Multi-region (CHT) runs** leave the top level empty and put
+    per-region data in ``p["regions"]`` — a dict keyed by region name,
+    each entry carrying its own ``residuals`` / ``continuity`` / ``kind``.
+    The frontend's residual chart reads a flat ``residuals`` dict, so we:
+
+      1. **Flatten** per-region residuals into namespaced keys
+         (``innerFluid:Ux``, ``wall:h``, …).  This drops straight into
+         the existing chart with no frontend change — each region's
+         fields show as separate lines.
+      2. **Aggregate continuity** to the worst-case region (largest
+         ``|cumulative|``) so the top-level "Continuity sum" tile has a
+         meaningful value instead of "—".
+      3. **Forward** the full per-region payload under ``regions`` so
+         any future UI component (per-region tabs, drill-in panel) can
+         consume it without another shape change.
+
+    Without the flattening, every CHT timestep arrives at the frontend
+    with an empty ``residuals`` dict and the live convergence chart
+    stays blank — observed in the wild as a fully-iterating chtMultiRegion
+    case showing zero data on the UI.
+    """
+    residuals: dict[str, dict] = {}
+    for field, val in (p.get("residuals") or {}).items():
+        residuals[field] = _normalise_residual_entry(val)
+
+    cont_raw = p.get("continuity")
+    continuity: dict[str, float] | None = (
+        {
+            "local":      float(cont_raw["local"]),
+            "global":     float(cont_raw["global"]),
+            "cumulative": float(cont_raw["cumulative"]),
+        }
+        if isinstance(cont_raw, dict) else None
+    )
+
+    # Multi-region flattening + worst-case continuity.
+    regions_raw = p.get("regions") or {}
+    regions_payload: dict[str, dict] = {}
+    cont_candidates: list[dict] = []
+    for region_name, region_data in regions_raw.items():
+        if not isinstance(region_data, dict):
+            continue
+        region_res: dict[str, dict] = {}
+        for field, val in (region_data.get("residuals") or {}).items():
+            entry = _normalise_residual_entry(val)
+            region_res[field] = entry
+            residuals[f"{region_name}:{field}"] = entry
+        region_cont = region_data.get("continuity")
+        if isinstance(region_cont, dict):
+            cont_candidates.append(region_cont)
+        regions_payload[region_name] = {
+            "kind":       region_data.get("kind", "fluid"),
+            "residuals":  region_res,
+            "continuity": region_cont,
+        }
+
+    if continuity is None and cont_candidates:
+        worst = max(
+            cont_candidates,
+            key=lambda c: abs(float(c.get("cumulative", 0.0) or 0.0)),
+        )
+        continuity = {
+            "local":      float(worst.get("local", 0.0) or 0.0),
+            "global":     float(worst.get("global", 0.0) or 0.0),
+            "cumulative": float(worst.get("cumulative", 0.0) or 0.0),
+        }
+
+    courant_raw = p.get("courant")
+    courant: dict[str, float] | None = (
+        {"mean": float(courant_raw["mean"]), "max": float(courant_raw["max"])}
+        if isinstance(courant_raw, dict) else None
+    )
+
+    exec_raw = p.get("execution")
+    execution: dict[str, Any] | None = (
+        {
+            "stepSeconds":  float(exec_raw.get("stepSeconds", exec_raw.get("step_seconds", 0))),
+            "clockSeconds": float(exec_raw.get("clockSeconds", exec_raw.get("clock_seconds", 0))),
+            "label":        exec_raw.get("label", ""),
+        }
+        if isinstance(exec_raw, dict) else None
+    )
+
+    result: dict[str, Any] = {
+        "iteration":  int(p.get("iteration", 0)),
+        "simTime":    float(p.get("time", p.get("simTime", 0))),
+        # Field list — drives the frontend chart's series.  Runner ships
+        # ``fields = list(self._residuals.keys())`` which is **empty** for
+        # CHT runs (all data sits in ``_region_residuals`` instead), so we
+        # can't trust the runner's ``fields`` value directly.  Use the
+        # flattened ``residuals`` keys when the runner-supplied list is
+        # missing or empty.
+        "fields":     list((p.get("fields") or list(residuals.keys()))),
+        "residuals":  residuals,
+        "courant":    courant,
+        "continuity": continuity,
+        "execution":  execution,
+    }
+    if regions_payload:
+        result["regions"] = regions_payload
+    return result
 
 
 class Orchestrator:
@@ -96,6 +275,7 @@ class Orchestrator:
         self.request = request
         self._cancelled = cancelled or asyncio.Event()
         self._stop_requested = asyncio.Event()
+        self._sim_run_id: str | None = None
         self.settings = get_settings()
 
         # Components (lazily initialized)
@@ -160,9 +340,17 @@ class Orchestrator:
         return self._error_summarizer
 
     def _check_cancelled(self):
-        """Raise if the run has been cancelled (client disconnected or timeout)."""
+        """Raise if the run has been cancelled (client disconnected or timeout).
+
+        Also escalates a stop request to a cancel when no simulation has been
+        submitted yet — there are no partial results to reconstruct, so the
+        only sensible action is to abort the run.
+        """
         if self._cancelled.is_set():
             raise OrchestrationError("Run cancelled")
+        if self._stop_requested.is_set() and self._sim_run_id is None:
+            self._cancelled.set()
+            raise OrchestrationError("Run stopped before simulation submission")
 
     async def _init_code_generator(self) -> None:
         """Initialize the code generator using Google GenAI."""
@@ -415,6 +603,52 @@ class Orchestrator:
             config=self._lint_result.validated_config,
         )
         
+        # ── Stage 4: config enrichment pipeline ─────────────────────────
+        # One call resolves canonical case-level intent (inlet U/T/p,
+        # bulk T), auto-detects any multi-region topology, refines per-
+        # region details with the LLM extractor, backfills missing
+        # region inits from case-level signals, propagates inits onto
+        # inlet patches, and runs topology lint.  Each of those is a
+        # discrete step in ``simd_agent.run.enrichment`` — see the
+        # package docstring for the step list and contracts.
+        _vcfg = self._lint_result.validated_config
+        _enrich_issues = await enrich_validated_config(
+            config=_vcfg,
+            user_requirements=self.request.user_requirements or "",
+        )
+
+        # Surface warnings to the UI; abort on the first error.
+        for issue in _enrich_issues:
+            if issue.severity == "warning":
+                await self.event_bus.emit(
+                    "region_lint_warning",
+                    message=issue.message,
+                    payload={
+                        "code":    issue.code,
+                        "step":    issue.step,
+                        "details": issue.payload,
+                    },
+                    level="warn",
+                )
+
+        _enrich_errors = [i for i in _enrich_issues if i.severity == "error"]
+        if _enrich_errors:
+            _summary = "; ".join(
+                f"[{e.code}] {e.message}" for e in _enrich_errors
+            )
+            await self.event_bus.emit_final(
+                status="config_incomplete",
+                validated_config=_vcfg,
+                summary="Configuration enrichment failed",
+                error=_summary,
+            )
+            return FinalResult(
+                status=RunStatus.CONFIG_INCOMPLETE,
+                validated_config=_vcfg,
+                summary="Configuration enrichment failed",
+                error=_summary,
+            )
+
         # ── Phase 1: LLM-assisted solver selection ───────────────────────
         await self.event_bus.emit(
             "solver_selection_started",
@@ -422,18 +656,62 @@ class Orchestrator:
             payload={"iteration": self._iteration},
         )
         await self.event_bus.emit_thinking_started("Selecting solver…")
-        try:
-            selector = SolverSelector()
-            solver = await selector.select(
-                user_requirements=self.request.user_requirements,
-                simulation_config=self.request.simulation_config,
-                validated_config=self._lint_result.validated_config,
+
+        # A5 — honor a precheck-saved solver before invoking the LLM.
+        # If the precheck (or the UI) already wrote a canonical solver
+        # name to ``validated_config["solver"]["openfoam_solver"]``, that
+        # is the user-visible choice and we should not re-derive it at
+        # run time.  Skipping ``SolverSelector.select()`` here is cheap
+        # insurance against the truncated-prompt edge case where the
+        # extractor would have to fight a summarised ``user_requirements``
+        # to recover the same name.  We still fall through to the
+        # full selector if the precheck didn't pick anything or the
+        # saved name isn't in the live plugin registry.
+        selector = None
+        solver = _precheck_solver(self._lint_result.validated_config)
+
+        # Multi-region (CHT) short-circuit — deterministic, fast, and
+        # respects live physics edits.
+        #
+        # When the mesh carries fluid + solid cellZones (detected
+        # earlier into ``config["regions"]``), the solver is uniquely
+        # determined by the time scheme:
+        #   steady     → chtMultiRegionSimpleFoam
+        #   transient  → chtMultiRegionFoam
+        # No other solver in the registry can consume a multi-region
+        # case — rhoSimpleFoam / buoyant* / simpleFoam all assume a
+        # single ``constant/polyMesh`` and would fail before iteration 1.
+        # Routing CHT cases through ``SolverSelector.select()`` is what
+        # was hanging the Regascold run for 4+ minutes: the physics LLM
+        # sees ``heat=True, gravity=False`` and tries to pick
+        # rhoSimpleFoam, then the forced tool-call schema makes the Pro
+        # model thrash trying to reconcile its picked name with the
+        # multi-region topology it can't read.  Dispatching on the
+        # topology directly is the right behaviour AND a 1000× speed-up.
+        if solver is None:
+            solver = _force_cht_solver_if_multi_region(
+                self._lint_result.validated_config,
             )
-        except Exception as _sel_exc:
-            logger.warning(f"[CODEGEN] SolverSelector failed ({_sel_exc}), using heuristic fallback")
-            solver = determine_solver(self._lint_result.validated_config)
-        finally:
-            await self.event_bus.emit_thinking_complete()
+            if solver is not None:
+                logger.info(
+                    f"[CODEGEN] Multi-region topology → forcing solver={solver!r} "
+                    "(skipping LLM selection — deterministic on time scheme)"
+                )
+
+        if solver is not None:
+            logger.info(f"[CODEGEN] Honoring precheck-saved solver: {solver!r}")
+        else:
+            try:
+                selector = SolverSelector()
+                solver = await selector.select(
+                    user_requirements=self.request.user_requirements,
+                    simulation_config=self.request.simulation_config,
+                    validated_config=self._lint_result.validated_config,
+                )
+            except Exception as _sel_exc:
+                logger.warning(f"[CODEGEN] SolverSelector failed ({_sel_exc}), using heuristic fallback")
+                solver = determine_solver(self._lint_result.validated_config)
+        await self.event_bus.emit_thinking_complete()
 
         self._selected_solver = solver
         logger.info(f"[CODEGEN] Solver selected: {solver}")
@@ -446,10 +724,17 @@ class Orchestrator:
         _mesh = _vc.get("mesh", {})
         _uid = self.request.metadata.user_id
 
+        # ``selector is None`` ⇒ we honored the precheck-saved solver
+        # without invoking the LLM selector.  Treat it as a non-fallback
+        # high-confidence path for telemetry.
         get_telemetry().capture(SolverSelected(
             solver=solver,
-            confidence=getattr(selector, "last_result", {}).get("confidence") if "selector" in dir() else None,
-            was_fallback="selector" not in dir(),
+            confidence=(
+                getattr(selector, "last_result", {}).get("confidence")
+                if selector is not None
+                else "precheck"
+            ),
+            was_fallback=False,
             flow_regime=_physics.get("flow_regime"),
             heat_transfer=_physics.get("heat_transfer_enabled"),
             compressibility=_physics.get("compressibility"),
@@ -581,6 +866,13 @@ class Orchestrator:
                 solver=_solver_section,
                 fluid=_fluid_section,
                 turbulence=_turbulence_section,
+                # Multi-region (CHT) topology — None for single-region cases.
+                # The enrichment pipeline (Stage 4) may have populated
+                # ``validated_config["regions"]``.
+                regions=(
+                    self._lint_result.validated_config.get("regions")
+                    if self._lint_result else None
+                ),
             )
 
         # Get mesh_id from simulation config.
@@ -706,6 +998,29 @@ class Orchestrator:
                         logger.info(
                             "[CODEGEN] Restored AI-editable files from LLM output: %s",
                             sorted(_llm_owned.keys()),
+                        )
+
+                    # Value-fill pass — runs for both single- and multi-
+                    # region cases.  Hands the LLM each ``0/<field>`` (or
+                    # ``0/<region>/<field>``) template plus the canonical
+                    # ``case_defaults`` block + per-patch BCs + the user's
+                    # prompt, and asks for a values-only rewrite that
+                    # preserves structure.  Single-region cases use the
+                    # filler as a correctness safety net (byte-identical
+                    # responses are silently kept as-is); multi-region
+                    # cases need it to substitute placeholder numerics
+                    # into the deterministic CHT renderer's output.
+                    # See ``run.value_filler`` for the step pipeline.
+                    try:
+                        files = await fill_field_values(
+                            files,
+                            self._lint_result.validated_config,
+                            self.request.user_requirements or "",
+                        )
+                    except Exception as _vfx:
+                        logger.warning(
+                            "[CODEGEN] Value filler failed (%s); "
+                            "keeping original template", _vfx,
                         )
                 else:
                     # Fallback: no plugin registered for this solver (shouldn't happen
@@ -1196,7 +1511,7 @@ class Orchestrator:
                 # Detect error patterns that have known deterministic fixes.
                 # Applied BEFORE deciding what files to regenerate.
                 try:
-                    from simd_agent.run.genai_codegen import GenAICodeGenerator as _GCG
+                    from simd_agent.run.single_region import GenAICodeGenerator as _GCG
                     _affected_hint = _GCG._identify_affected_files(
                         self._previous_errors,
                         self._current_files,
@@ -1852,63 +2167,7 @@ class Orchestrator:
                     else [event.payload]
                 )
 
-                def _build_sim_progress(p: dict) -> dict:
-                    """Normalise one parsed time-step into the frontend contract."""
-                    residuals_raw = p.get("residuals", {})
-
-                    # Accept {field: scalar} (old) or {field: {initial,final,iters}} (new)
-                    residuals: dict = {}
-                    for field, val in residuals_raw.items():
-                        if isinstance(val, dict):
-                            residuals[field] = {
-                                "initial": float(val.get("initial", 0)),
-                                "final":   float(val.get("final", val.get("initial", 0))),
-                                "iters":   int(val.get("iters", 1)),
-                            }
-                        else:
-                            residuals[field] = {
-                                "initial": float(val),
-                                "final":   float(val),
-                                "iters":   1,
-                            }
-
-                    courant_raw = p.get("courant")
-                    courant = (
-                        {"mean": float(courant_raw["mean"]), "max": float(courant_raw["max"])}
-                        if isinstance(courant_raw, dict) else None
-                    )
-
-                    cont_raw = p.get("continuity")
-                    continuity = (
-                        {
-                            "local":      float(cont_raw["local"]),
-                            "global":     float(cont_raw["global"]),
-                            "cumulative": float(cont_raw["cumulative"]),
-                        }
-                        if isinstance(cont_raw, dict) else None
-                    )
-
-                    exec_raw = p.get("execution")
-                    execution = (
-                        {
-                            "stepSeconds":  float(exec_raw.get("stepSeconds", exec_raw.get("step_seconds", 0))),
-                            "clockSeconds": float(exec_raw.get("clockSeconds", exec_raw.get("clock_seconds", 0))),
-                            "label":        exec_raw.get("label", ""),
-                        }
-                        if isinstance(exec_raw, dict) else None
-                    )
-
-                    return {
-                        "iteration":  int(p.get("iteration", 0)),
-                        "simTime":    float(p.get("time", p.get("simTime", 0))),
-                        "fields":     list(p.get("fields", list(residuals.keys()))),
-                        "residuals":  residuals,
-                        "courant":    courant,
-                        "continuity": continuity,
-                        "execution":  execution,
-                    }
-
-                built = [_build_sim_progress(p) for p in raw_items]
+                built = [build_sim_progress(p) for p in raw_items]
 
                 # Attach accumulated fieldMinMax ranges to the last item in
                 # the batch, then reset the accumulator so each batch gets a
@@ -1973,6 +2232,20 @@ class Orchestrator:
                                 level="info",
                                 persist=False,
                             )
+                            # Persist mid-run so a page refresh restores the
+                            # OoM badges from ``runs.result.convergence`` —
+                            # otherwise the WS event was the only carrier
+                            # and reload would show empty assessment until
+                            # ``finalize_run`` writes it at end-of-run.
+                            try:
+                                await self.store.set_convergence(
+                                    self.run_id, assessment,
+                                )
+                            except Exception as _persist_err:
+                                logger.debug(
+                                    "[convergence] DB persist failed (non-fatal): %s",
+                                    _persist_err,
+                                )
                     except Exception as exc:
                         logger.debug("[convergence] assessment failed: %s", exc)
 
@@ -1994,6 +2267,8 @@ class Orchestrator:
                 "run_started": "sim_run_started",
                 "run_log": "sim_run_log",
                 "run_succeeded": "sim_run_succeeded",
+                "run_stopping": "sim_run_stopping",
+                "run_stopped": "sim_run_stopped",
                 "run_failed": "sim_run_failed",
                 "artifacts_ready": "sim_artifacts_ready",
                 # Test-mode watchdog result (rc=-9 SIGKILL is expected, not an error)
@@ -2019,8 +2294,31 @@ class Orchestrator:
                 payload=payload,
                 level=event.level,
             )
-        
+
         try:
+            # Tell the sim server when the case is a multi-region (CHT) one
+            # so it runs ``splitMeshRegions -cellZones -overwrite`` after
+            # gmshToFoam and before the solver.  False (default) leaves
+            # single-region case submission identical to its prior behaviour.
+            _is_multi_region = bool(
+                self._solver_plugin is not None
+                and getattr(self._solver_plugin, "is_multi_region", False)
+            )
+
+            # Diagnostic — proves whether the multi-region flag is being
+            # sent to the runner.  If splitMeshRegions doesn't run on the
+            # runner side, the question is which side is at fault; this
+            # log line settles it.
+            logger.info(
+                "[SUBMIT] multi_region=%s  solver=%s  plugin=%s  "
+                "plugin.is_multi_region=%s",
+                _is_multi_region,
+                self._selected_solver,
+                type(self._solver_plugin).__name__ if self._solver_plugin else None,
+                getattr(self._solver_plugin, "is_multi_region", "<no attr>")
+                if self._solver_plugin else "<no plugin>",
+            )
+
             # Submit to simulation server
             submit_response = await self.sim_server.submit_run(
                 zip_bytes,
@@ -2028,9 +2326,23 @@ class Orchestrator:
                 run_id=f"{self.run_id}-iter{self._iteration}",
                 n_cores=n_cores,
                 refine_strategy=refine_strategy,
+                multi_region=_is_multi_region,
             )
             sim_run_id = submit_response.run_id
-            
+            self._sim_run_id = sim_run_id
+
+            # Persist sim_run_id to the DB immediately so a stop request
+            # arriving on a different worker (or after page reload while the
+            # /ws/watch fallback path is in use) can drive the sim runner
+            # directly instead of just marking the DB and stranding the
+            # running solver.
+            try:
+                await self.store.set_sim_run_id(self.run_id, sim_run_id)
+            except Exception as _ee:
+                logger.warning(
+                    "[SIM_SERVER] Failed to persist sim_run_id mid-run: %s", _ee,
+                )
+
             await self.event_bus.emit_sim_submitted(
                 sim_run_id=sim_run_id,
                 mode=mode.value,
@@ -2059,10 +2371,39 @@ class Orchestrator:
                 # ── Check for stop request ────────────────────────────────────
                 if self._stop_requested.is_set():
                     logger.info("[SIM_SERVER] Run stop requested — stopping sim server gracefully")
+                    # Emit immediate ACK so the frontend can switch to a
+                    # "Stopping…" state right away — without this, the user
+                    # waits 10–30 s for SIM_RUN_STOPPED with no feedback.
                     try:
-                        await self.sim_server.stop_run(sim_run_id)
+                        await self.event_bus.emit_sim_stopping(sim_run_id=sim_run_id)
+                    except Exception:
+                        pass
+                    stop_ok = False
+                    try:
+                        stop_ok = await self.sim_server.stop_run(sim_run_id)
                     except Exception as _se:
                         logger.warning("[SIM_SERVER] Failed to stop sim server run: %s", _se)
+                    if not stop_ok:
+                        # The sim-server stop call failed (HTTP error, 404, or
+                        # returned stopped=False).  Surface this so the frontend
+                        # can show an error instead of hanging forever waiting
+                        # for artifacts_ready that will never come.
+                        logger.error(
+                            "[SIM_SERVER] sim_server.stop_run() returned False for %s — "
+                            "treating as cancelled to unblock the run", sim_run_id,
+                        )
+                        try:
+                            await self.event_bus.emit_sim_failed(
+                                sim_run_id=sim_run_id,
+                                error="Sim server rejected stop request — falling back to cancel",
+                            )
+                        except Exception:
+                            pass
+                        # Escalate to a hard cancel so the orchestrator does
+                        # not deadlock waiting for events that will not arrive.
+                        self._cancelled.set()
+                        was_cancelled = True
+                        break
                     # Don't break — keep streaming to receive reconstruction events
                     # and the final run_stopped / artifacts_ready events.
                     self._stop_requested.clear()

@@ -3,10 +3,11 @@
 
 import io
 import logging
+import math
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from simd_agent.api.auth import AuthenticatedUser, get_current_user, require_simulation_owner
 from simd_agent.schemas.run import (
@@ -258,3 +259,129 @@ async def insert_progress(run_id: UUID, body: SimProgressBatch) -> dict[str, int
 @router.delete("/{run_id}/progress", status_code=204)
 async def delete_progress(run_id: UUID) -> None:
     await run_service.delete_progress(run_id)
+
+
+# ── Convergence chart (matplotlib PNG, for the PDF report) ──────────────────
+
+
+# Stable color palette — mirrors FIELD_COLORS in the frontend so reports
+# match the in-app live chart at a glance.
+_FIELD_COLORS = [
+    "#F24604", "#3b82f6", "#10b981", "#f59e0b",
+    "#8b5cf6", "#ec4899", "#06b6d4", "#84cc16",
+    "#f43f5e", "#14b8a6",
+]
+
+
+@router.get(
+    "/{run_id}/convergence-chart.png",
+    responses={200: {"content": {"image/png": {}}}},
+)
+async def get_convergence_chart_png(run_id: UUID) -> Response:
+    """Render the residual-vs-time chart as a print-friendly PNG for the PDF report.
+
+    The frontend's Recharts component cannot be screenshot reliably offscreen
+    (SVG paths come out empty), so the report fetches this server-rendered
+    matplotlib image instead.  The in-app live chart is unaffected.
+    """
+    rows = await run_service.list_progress(run_id)
+    if not rows:
+        raise HTTPException(404, "No progress data for this run")
+
+    # Collect every field name across the run (some appear later than iter 0)
+    field_set: set[str] = set()
+    for r in rows:
+        if r.residuals:
+            field_set.update(r.residuals.keys())
+    if not field_set:
+        raise HTTPException(404, "Progress rows contain no residuals")
+    fields = sorted(field_set)
+
+    # Build per-field (x=simTime, y=residual.final) series.  ``residuals`` is
+    # ``{field: {"initial": ..., "final": ...}}`` from the solver runner.
+    series: dict[str, tuple[list[float], list[float]]] = {f: ([], []) for f in fields}
+    for r in rows:
+        if r.sim_time is None or not r.residuals:
+            continue
+        for f in fields:
+            raw = r.residuals.get(f)
+            if isinstance(raw, dict):
+                val = raw.get("final")
+            else:
+                val = raw
+            try:
+                vf = float(val)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(vf) or vf <= 0:
+                continue
+            series[f][0].append(r.sim_time)
+            series[f][1].append(vf)
+
+    # Drop fields with no usable points (avoids empty entries in the legend).
+    fields = [f for f in fields if series[f][0]]
+    if not fields:
+        raise HTTPException(422, "No finite positive residuals to plot")
+
+    # Render — Agg backend, lazy import so app boot doesn't pay for it.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(14, 7), dpi=150)
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("white")
+
+    for i, f in enumerate(fields):
+        xs, ys = series[f]
+        ax.plot(
+            xs, ys,
+            label=f,
+            color=_FIELD_COLORS[i % len(_FIELD_COLORS)],
+            linewidth=1.5,
+        )
+
+    # Log Y for residuals.  Log X only when the time axis spans > 2 decades
+    # and is strictly positive — otherwise stick with linear so early-time
+    # transient runs are not visually compressed.
+    ax.set_yscale("log")
+    all_x = [x for f in fields for x in series[f][0]]
+    if all_x:
+        x_min, x_max = min(all_x), max(all_x)
+        if x_min > 0 and x_max / x_min > 100:
+            ax.set_xscale("log")
+            ax.set_xlabel("Simulation time (s) — log scale", fontsize=11, color="#334155")
+        else:
+            ax.set_xlabel("Simulation time (s)", fontsize=11, color="#334155")
+
+    ax.set_ylabel("Residual (log)", fontsize=11, color="#334155")
+    ax.set_title("Convergence — Residuals", fontsize=13, color="#16213e", pad=12, loc="left")
+
+    ax.grid(True, which="major", linestyle="--", linewidth=0.5, color="#cbd5e1", alpha=0.8)
+    ax.grid(True, which="minor", linestyle=":", linewidth=0.4, color="#e2e8f0", alpha=0.6)
+    ax.tick_params(colors="#475569", labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_color("#cbd5e1")
+        spine.set_linewidth(0.8)
+
+    ax.legend(
+        loc="upper right",
+        fontsize=9,
+        frameon=True,
+        facecolor="white",
+        edgecolor="#e2e8f0",
+        labelcolor="#1a1a2e",
+        ncol=min(3, max(1, len(fields) // 3 + 1)),
+    )
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=300"},
+    )

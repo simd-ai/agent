@@ -272,8 +272,21 @@ async def init_db() -> None:
                 cfd_solver JSONB,
                 cfd_fluid JSONB,
                 cfd_turbulence JSONB,
-                cfd_derived JSONB
+                cfd_derived JSONB,
+                -- Multi-region (CHT) topology + per-region material/inlet
+                -- config.  Empty / NULL for single-region cases.  See
+                -- ``simd_agent/solvers/families/_multi_region.py`` for the
+                -- RegionSpec contract.
+                cfd_regions JSONB
             )
+        """))
+        # Migration: existing DBs created before cfd_regions landed need
+        # the column added.  ``IF NOT EXISTS`` is idempotent — safe to
+        # re-run on every startup.  No data loss; the new column defaults
+        # to NULL which the reader treats as "single-region case".
+        await conn.execute(text("""
+            ALTER TABLE simulation_config
+              ADD COLUMN IF NOT EXISTS cfd_regions JSONB
         """))
 
         # ── Mesh Info (1:1) ──────────────────────────────────────────────

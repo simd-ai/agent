@@ -17,6 +17,41 @@ from simd_agent.watch_bus import get_watch_bus
 logger = logging.getLogger(__name__)
 
 
+# Per-key truncation budget for the one-line payload summary in event
+# logs.  Strings longer than this get cut with an ellipsis; lists/dicts
+# are reported by length only.
+_PAYLOAD_VALUE_TRUNCATE = 120
+_PAYLOAD_TOTAL_TRUNCATE = 800
+
+
+def _summarize_payload(payload: dict[str, Any] | None) -> str:
+    """Render a payload dict as a single-line, truncated key=value summary.
+
+    Used by the default INFO log path so each event becomes one line in
+    the terminal.  Error events bypass this and dump the full payload
+    multi-line (a failure is the moment you want the noise).
+    """
+    if not payload:
+        return "{}"
+    parts: list[str] = []
+    for key, val in payload.items():
+        if isinstance(val, str):
+            v = val.replace("\n", "\\n")
+            if len(v) > _PAYLOAD_VALUE_TRUNCATE:
+                v = v[:_PAYLOAD_VALUE_TRUNCATE] + "…"
+            parts.append(f"{key}={v!r}")
+        elif isinstance(val, (list, tuple, set)):
+            parts.append(f"{key}=<{type(val).__name__}[{len(val)}]>")
+        elif isinstance(val, dict):
+            parts.append(f"{key}=<dict[{len(val)} keys]>")
+        else:
+            parts.append(f"{key}={val}")
+    line = "{" + ", ".join(parts) + "}"
+    if len(line) > _PAYLOAD_TOTAL_TRUNCATE:
+        line = line[:_PAYLOAD_TOTAL_TRUNCATE] + "…}"
+    return line
+
+
 class EventBus:
     """Manages event emission, persistence, and WebSocket streaming."""
     
@@ -78,21 +113,26 @@ class EventBus:
             payload=payload or {},
         )
         
-        # Log event details
-        logger.info(f"[EVENT #{seq}] {level.value.upper()} | {event_type}")
-        logger.info(f"[EVENT #{seq}] Message: {message}")
-        if payload:
-            # Log payload keys and summary (avoid logging huge payloads)
-            payload_keys = list(payload.keys())
-            logger.info(f"[EVENT #{seq}] Payload keys: {payload_keys}")
-            for key in payload_keys[:5]:  # Log first 5 keys
-                val = payload[key]
-                if isinstance(val, str) and len(val) > 2000:
-                    logger.info(f"[EVENT #{seq}]   {key}: {val[:2000]}...")
-                elif isinstance(val, (list, dict)):
-                    logger.info(f"[EVENT #{seq}]   {key}: {type(val).__name__} with {len(val)} items")
-                else:
-                    logger.info(f"[EVENT #{seq}]   {key}: {val}")
+        # ── One-line event summary ────────────────────────────────────────
+        # Default: collapse the full payload to a single truncated line so
+        # the terminal stays readable.  Error-level events keep the
+        # original multi-line dump because diagnosing a failure usually
+        # needs the full stdout / stack trace.
+        if level == EventLevel.ERROR:
+            logger.error(f"[EVENT #{seq}] ERROR | {event_type} | {message}")
+            if payload:
+                for key, val in payload.items():
+                    if isinstance(val, str):
+                        logger.error(f"[EVENT #{seq}]   {key}: {val}")
+                    elif isinstance(val, (list, dict)):
+                        logger.error(f"[EVENT #{seq}]   {key}: {val}")
+                    else:
+                        logger.error(f"[EVENT #{seq}]   {key}: {val}")
+        else:
+            logger.info(
+                f"[EVENT #{seq}] {level.value.upper()} | {event_type} | "
+                f"{message[:200]} | {_summarize_payload(payload)}"
+            )
         
         # Persist to database
         should_persist = persist if persist is not None else self.persist
@@ -113,9 +153,12 @@ class EventBus:
         if not self._ws_closed:
             try:
                 ws_message = event.to_ws_message()
-                logger.info(f"[EVENT #{seq}] >>> SENDING TO FRONTEND: type={ws_message.get('type')}")
+                # Sender log is at DEBUG — the one-line summary above
+                # already tells you what was emitted; the "I shipped it"
+                # confirmation is just noise unless we're debugging the
+                # WS layer itself.
+                logger.debug(f"[EVENT #{seq}] >>> sent type={ws_message.get('type')}")
                 await self.websocket.send_json(ws_message)
-                logger.debug(f"[EVENT #{seq}] Sent successfully")
             except Exception as e:
                 error_msg = str(e)
                 # Detect connection closed errors and mark WS as closed
@@ -666,6 +709,28 @@ class EventBus:
             },
         )
     
+    async def emit_sim_stopping(
+        self,
+        sim_run_id: str | None,
+        accepted: bool = True,
+        reason: str = "",
+    ) -> AgentEvent:
+        """Emit an immediate ACK so the frontend knows the stop was received.
+
+        Fires the moment the orchestrator detects ``_stop_requested`` and
+        BEFORE the sim server has actually killed the solver.  The frontend
+        uses this to flip the button to a "Stopping…" state instead of
+        appearing frozen while reconstruction runs.
+        """
+        return await self.emit_info(
+            EventTypes.SIM_RUN_STOPPING,
+            reason or "Stop requested — terminating solver and reconstructing partial results…",
+            {
+                "sim_run_id": sim_run_id,
+                "accepted": accepted,
+            },
+        )
+
     async def emit_sim_stopped(
         self,
         sim_run_id: str,

@@ -154,41 +154,54 @@ _CFG_TWO_REGIONS = {
 
 
 class TestRequiredFilesTree:
-    def test_manifest_includes_top_level_files(self):
+    """``required_files()`` is the LLM-targeted manifest (Phase 3: only the
+    files the LLM is asked to generate — ``system/controlDict``).  The full
+    case tree is asserted against :meth:`all_case_files` instead, which
+    catalogues every file the case ships with (LLM + deterministic).
+    """
+
+    def test_required_files_is_llm_only(self):
         plugin = ChtMultiRegionSimpleFoamSolver()
         files = plugin.required_files(_CFG_TWO_REGIONS)
+        # The LLM should generate exactly the case-level controlDict and
+        # nothing under constant/<region>/ or 0/<region>/.
+        assert files == ["system/controlDict"]
+
+    def test_all_case_files_includes_top_level(self):
+        plugin = ChtMultiRegionSimpleFoamSolver()
+        files = plugin.all_case_files(_CFG_TWO_REGIONS)
         assert "system/controlDict" in files
         assert "constant/regionProperties" in files
 
-    def test_manifest_includes_per_region_thermo(self):
+    def test_all_case_files_includes_per_region_thermo(self):
         plugin = ChtMultiRegionSimpleFoamSolver()
-        files = plugin.required_files(_CFG_TWO_REGIONS)
+        files = plugin.all_case_files(_CFG_TWO_REGIONS)
         assert "constant/topAir/thermophysicalProperties" in files
         assert "constant/heater/thermophysicalProperties" in files
 
     def test_fluid_region_has_turbulence_and_g(self):
         plugin = ChtMultiRegionSimpleFoamSolver()
-        files = plugin.required_files(_CFG_TWO_REGIONS)
+        files = plugin.all_case_files(_CFG_TWO_REGIONS)
         assert "constant/topAir/turbulenceProperties" in files
         assert "constant/topAir/g" in files
 
     def test_solid_region_has_no_turbulence_or_g(self):
         plugin = ChtMultiRegionSimpleFoamSolver()
-        files = plugin.required_files(_CFG_TWO_REGIONS)
+        files = plugin.all_case_files(_CFG_TWO_REGIONS)
         assert "constant/heater/turbulenceProperties" not in files
         assert "constant/heater/g" not in files
 
     def test_solid_region_only_solves_T(self):
         """Solid regions have 0/<region>/T only — no U / p / k / ε."""
         plugin = ChtMultiRegionSimpleFoamSolver()
-        files = plugin.required_files(_CFG_TWO_REGIONS)
+        files = plugin.all_case_files(_CFG_TWO_REGIONS)
         assert "0/heater/T" in files
         assert "0/heater/U" not in files
         assert "0/heater/p" not in files
 
     def test_fluid_region_solves_full_NS_plus_energy_plus_turb(self):
         plugin = ChtMultiRegionSimpleFoamSolver()
-        files = plugin.required_files(_CFG_TWO_REGIONS)
+        files = plugin.all_case_files(_CFG_TWO_REGIONS)
         for field in ("T", "U", "p", "p_rgh", "k", "epsilon"):
             assert f"0/topAir/{field}" in files, f"missing 0/topAir/{field}"
 

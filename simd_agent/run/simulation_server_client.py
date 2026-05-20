@@ -171,6 +171,7 @@ class SimulationServerClient:
         callback_url: str | None = None,
         n_cores: int = 1,
         refine_strategy: str = "none",
+        multi_region: bool = False,
     ) -> SimSubmitResponse:
         """Submit a case ZIP for execution.
 
@@ -184,12 +185,20 @@ class SimulationServerClient:
                      Ignored for TEST mode — the server force-overrides to 1
                      (agent-simulation/app/runner.py:1112).
             refine_strategy: Mesh refinement: "none", "wall", "global".
+            multi_region: When True, the sim server MUST run
+                     ``splitMeshRegions -cellZones -overwrite`` after
+                     ``gmshToFoam`` and before invoking the solver — the case
+                     ZIP contains the un-split mesh plus pre-populated
+                     ``constant/<region>/``, ``system/<region>/``, and
+                     ``0/<region>/`` directories that the split fills in.
+                     Used for ``chtMultiRegion{Simple,}Foam``.  Default False
+                     keeps every existing single-region case untouched.
 
         Returns:
             SimSubmitResponse with run_id and status URLs
         """
         client = await self._get_client()
-        
+
         files = {
             "case_zip": ("case.zip", case_zip, "application/zip"),
         }
@@ -203,6 +212,8 @@ class SimulationServerClient:
             data["callback_url"] = callback_url
         if refine_strategy and refine_strategy != "none":
             data["refine_strategy"] = refine_strategy
+        if multi_region:
+            data["multi_region"] = "true"
         
         endpoint = "/api/run/test" if mode == SimRunMode.TEST else "/api/run"
         
@@ -537,22 +548,32 @@ class SimulationServerClient:
             logger.error(f"[SIM_SERVER] Precomputed index error: {e}")
             raise SimulationServerError(f"Precomputed index error: {e}")
 
-    async def download_precomputed_vtp(self, run_id: str, filename: str) -> bytes:
+    async def download_precomputed_vtp(
+        self, run_id: str, filename: str, region: str | None = None,
+    ) -> bytes:
         """Download a single precomputed timestep VTP by filename.
 
-        Calls GET /api/run/{run_id}/vtk-timesteps/{filename}.
-        The filename comes from the index (e.g. "t_0_1.vtp").
+        Calls GET /api/run/{run_id}/vtk-timesteps/{filename} for single-region
+        runs, or GET /api/run/{run_id}/vtk-timesteps/{region}/{filename}
+        when ``region`` is set.  The per-region path is required for CHT
+        cases because :func:`precompute_all_vtps` on the sim server writes
+        each region's VTPs under ``VTK/timesteps/<region>/`` and serves
+        them at the matching nested URL.
         """
         client = await self._get_client()
+        path = (
+            f"/api/run/{run_id}/vtk-timesteps/{region}/{filename}"
+            if region
+            else f"/api/run/{run_id}/vtk-timesteps/{filename}"
+        )
         try:
-            response = await client.get(
-                f"/api/run/{run_id}/vtk-timesteps/{filename}",
-                timeout=120.0,
-            )
+            response = await client.get(path, timeout=120.0)
             response.raise_for_status()
             return response.content
         except httpx.HTTPStatusError as e:
-            raise SimulationServerError(f"Precomputed VTP download failed: {e.response.status_code}")
+            raise SimulationServerError(
+                f"Precomputed VTP download failed: {e.response.status_code} ({path})"
+            )
         except Exception as e:
             raise SimulationServerError(f"Precomputed VTP download error: {e}")
 

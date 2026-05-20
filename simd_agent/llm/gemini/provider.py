@@ -29,8 +29,8 @@ class GeminiProvider(LLMProvider):
 
     # ── lifecycle ────────────────────────────────────────────────
 
-    def configure(self, api_key: str, **kwargs: Any) -> None:
-        self._api_key = api_key
+    def configure(self, **kwargs: Any) -> None:
+        self._api_key = kwargs.get("api_key")
         self._client = None  # reset so next access picks up new key
         self.models = {
             "default": kwargs.get("default_model", "gemini-3-flash-preview"),

@@ -41,6 +41,21 @@ class GCSBackend(StorageBackend):
         _ensure_gcs_env()
         from google.cloud import storage as gcs_storage
         self._client = gcs_storage.Client()
+        # Multi-region VTK cache fills can hit GCS with 60+ parallel
+        # uploads (per-region VTPs + merged VTPs).  The default urllib3
+        # connection pool size is 10, which produces ``Connection pool
+        # is full, discarding connection`` warnings and serialises the
+        # uploads — pushing the cache-fill time from a few seconds to
+        # tens of seconds.  Bump the pool so the bursts fit.
+        try:
+            adapter = self._client._http.adapters.get("https://")
+            if adapter is not None:
+                from urllib3.poolmanager import PoolManager
+                adapter.poolmanager = PoolManager(
+                    num_pools=10, maxsize=100, block=False,
+                )
+        except Exception as e:
+            logger.warning(f"[STORAGE/GCS] Could not enlarge HTTP pool: {e}")
         self._bucket = self._client.bucket(bucket_name)
         logger.info(
             "[STORAGE/GCS] Initialized — project=%s bucket=%s",

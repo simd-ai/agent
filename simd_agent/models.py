@@ -112,10 +112,22 @@ class MeshInfoV1(BaseModel):
     mesh_id: str = Field(..., min_length=1, description="Mesh identifier/reference")
     file_name: str | None = Field(default=None, description="Original file name")
     patches: list[MeshPatchV1] = Field(default_factory=list, description="Mesh patches/boundaries")
+    cell_zones: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of 3D cell zones in the mesh (gmsh ``Physical Volume`` "
+            "groups; OpenFOAM ``cellZones`` entries).  Populated by the "
+            "mesh-info importer when the file format carries this info.  "
+            "Multi-region (CHT) detection prefers this field over the "
+            "patch-name prefix heuristic — see "
+            "``simd_agent.run.orchestration._detect_regions_from_mesh``."
+        ),
+        alias="cellZones",
+    )
     check_mesh: CheckMeshInfoV1 | None = Field(default=None, description="checkMesh output")
-    
+
     model_config = ConfigDict(populate_by_name=True)
-    
+
     def get_patch_names(self) -> list[str]:
         """Get list of patch names."""
         return [p.name for p in self.patches]
@@ -683,6 +695,10 @@ class EventTypes:
     SIM_RUN_PROGRESS = "sim_run_progress"
     SIM_RUN_LOG = "sim_run_log"
     SIM_RUN_SUCCEEDED = "sim_run_succeeded"
+    # Emitted the moment a stop is requested — gives the frontend immediate
+    # feedback while the sim server is still killing the solver and starting
+    # reconstruction (which can take 10–30 s before SIM_RUN_STOPPED arrives).
+    SIM_RUN_STOPPING = "sim_run_stopping"
     SIM_RUN_STOPPED = "sim_run_stopped"
     SIM_RUN_FAILED = "sim_run_failed"
     SIM_ARTIFACTS_READY = "sim_artifacts_ready"

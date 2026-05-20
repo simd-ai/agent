@@ -96,17 +96,23 @@ class ChtMultiRegionSimpleFoamSolver(MultiRegionBase, SteadyBase):
         issues: list[ValidationIssue] = []
         fixed = dict(files)
 
-        # Deterministic CHT skeleton (regionProperties + per-region thermo).
+        # Deterministic CHT skeleton (regionProperties + per-region thermo +
+        # per-region fvSchemes / fvSolution / 0/<region>/* with coupled BCs).
         fixed.update(self.render_deterministic_files(config))
 
         # Universal fixers from base.py — operate on top-level files only,
         # so they're safe to apply on a multi-region case.
         fixed = self._fix_controldict_solver(fixed, issues)
 
-        # constant/g — every fluid region needs one; the top-level constant/g
-        # is typically copied into each region's directory by the case
-        # setup.  Phase 2 will emit per-region constant/<region>/g; for now
-        # ensure the top-level file exists.
-        fixed = self._ensure_gravity(fixed, issues)
+        # A6 — inject per-region function objects into the LLM-authored
+        # controlDict so volume averages and inlet/outlet patch averages
+        # are emitted per region every timestep.  Idempotent: replaces an
+        # existing functions { … } block rather than appending alongside.
+        fixed = self.inject_function_objects(fixed, config)
+
+        # NOTE: gravity is rendered per-region inside
+        # ``render_deterministic_files`` (``constant/<fluid>/g``), so there
+        # is no top-level ``constant/g`` to enforce here.  Solid regions
+        # don't need a gravity vector.
 
         return ValidationResult(files=fixed, issues=issues)

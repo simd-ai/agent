@@ -20,7 +20,7 @@ from simd_agent.chat.prompts import SYSTEM_PROMPT, RESPONSE_PROMPT
 from simd_agent.chat.query_analyzer import get_query_analyzer
 from simd_agent.chat.tools import CHAT_TOOLS_SCHEMA, TOOL_REGISTRY, SimulationSnapshot
 from simd_agent.precheck.models import (
-    CONVERSATION_MODEL, CONVERSATION_TOKEN_LIMIT, READY_TOOL_SCHEMA,
+    CONVERSATION_TOKEN_LIMIT, READY_TOOL_SCHEMA,
 )
 from simd_agent.settings import get_settings
 
@@ -600,7 +600,7 @@ class ChatService:
 
         try:
             stream = await self.client.aio.models.generate_content_stream(
-                model=CONVERSATION_MODEL,
+                model=self.model,
                 contents=contents,
                 config=config,
             )

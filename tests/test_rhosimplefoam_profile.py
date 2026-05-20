@@ -619,7 +619,7 @@ def test_fvoptions_max_clamp_does_not_crash_re_sub() -> None:
     Earlier the re.sub call passed (pattern, string) without a replacement,
     triggering 'sub() missing 1 required positional argument: string'.
     """
-    from simd_agent.run.genai_codegen import validate_generated_files
+    from simd_agent.run.single_region import validate_generated_files
     files = {
         "system/fvOptions": (
             "FoamFile { object fvOptions; }\n"

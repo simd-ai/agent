@@ -497,6 +497,7 @@ class RegionSpec(BaseModel):
     U_init: tuple[float, float, float] = (0.0, 0.0, 0.0)  # m/s
     k_init: float = Field(default=0.1, gt=0.0)         # m²/s²
     epsilon_init: float = Field(default=0.01, gt=0.0)  # m²/s³
+    omega_init: float = Field(default=10.0, gt=0.0)    # s⁻¹ (kOmega / kOmegaSST)
 
     model_config = ConfigDict(frozen=True)
 

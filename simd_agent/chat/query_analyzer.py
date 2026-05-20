@@ -77,26 +77,12 @@ that is ``data_plot``, NOT ``setup``.
 | run_python_analysis | Custom computation | code, description |
 | analyze_chart | Explain a chart | chart_type, field |
 
-## Output format
+## Output
 
-Return ONLY valid JSON (no markdown fences, no extra text):
-{
-  "category": "one of the categories above",
-  "resolved_subject": "what the user is asking about, resolved from context if needed",
-  "tool_plan": [
-    {"tool": "tool_name", "args": {"param": "value"}}
-  ],
-  "data_needs": {
-    "sim_progress": false,
-    "field_ranges": false,
-    "vtk_result": false,
-    "generated_files": false,
-    "cross_run": false,
-    "patches": false,
-    "mesh_info": false
-  },
-  "confidence": 0.0
-}
+You MUST emit your classification by calling the ``report_query_intent``
+tool exactly once.  Do NOT respond with free text or JSON.  The tool's
+parameters match the structure documented above (category, resolved_subject,
+tool_plan, data_needs, confidence).
 
 ## Rules
 
@@ -180,6 +166,7 @@ class QueryAnalyzer:
         user_input = self._build_input(message, history, mode=mode)
         logger.info("[query_analyzer] input:\n%s", user_input)
 
+        intent_tool = self._build_intent_tool()
         try:
             response = await self.client.aio.models.generate_content(
                 model=self.model,
@@ -187,16 +174,19 @@ class QueryAnalyzer:
                 config=self.types.GenerateContentConfig(
                     system_instruction=_ANALYZER_SYSTEM_PROMPT,
                     temperature=0.0,
-                    max_output_tokens=1024,
-                    response_mime_type="application/json",
+                    tools=[intent_tool],
+                    tool_config=self.types.ToolConfig(
+                        function_calling_config=self.types.FunctionCallingConfig(
+                            mode="ANY",
+                            allowed_function_names=["report_query_intent"],
+                        ),
+                    ),
                 ),
             )
-            raw = (response.text or "").strip()
-            logger.info("[query_analyzer] raw LLM output:\n%s", raw)
-            parsed = self._parse_json(raw)
 
+            parsed = self._extract_intent_tool_call(response)
             if parsed is None:
-                logger.warning("[query_analyzer] Failed to parse JSON: %s", raw[:200])
+                logger.warning("[query_analyzer] No report_query_intent tool call in response")
                 return self._fallback_intent(message)
 
             intent = self._build_intent(parsed)
@@ -237,6 +227,97 @@ class QueryAnalyzer:
 
         parts.append(f"Current message: {message}")
         return "\n".join(parts)
+
+    def _build_intent_tool(self):
+        """Build the Gemini Tool used to force a structured intent result.
+
+        Using forced tool calls (mode="ANY") eliminates JSON parsing
+        failures: the model literally cannot emit anything other than a
+        report_query_intent() call with the schema-defined fields.
+        """
+        types_ = self.types
+
+        valid_categories = [
+            "setup", "data_plot", "residuals", "data_query", "file_inspect",
+            "cross_run", "report", "troubleshoot", "theory", "general",
+        ]
+
+        tool_call_plan_item = types_.Schema(
+            type="OBJECT",
+            properties={
+                "tool": types_.Schema(type="STRING", description="Tool name to call"),
+                "args": types_.Schema(
+                    type="OBJECT",
+                    description="Pre-filled arguments for the tool (free-form).",
+                ),
+            },
+            required=["tool"],
+        )
+
+        data_needs_schema = types_.Schema(
+            type="OBJECT",
+            properties={
+                "sim_progress":     types_.Schema(type="BOOLEAN"),
+                "field_ranges":     types_.Schema(type="BOOLEAN"),
+                "vtk_result":       types_.Schema(type="BOOLEAN"),
+                "generated_files":  types_.Schema(type="BOOLEAN"),
+                "cross_run":        types_.Schema(type="BOOLEAN"),
+                "patches":          types_.Schema(type="BOOLEAN"),
+                "mesh_info":        types_.Schema(type="BOOLEAN"),
+            },
+        )
+
+        return types_.Tool(
+            function_declarations=[
+                types_.FunctionDeclaration(
+                    name="report_query_intent",
+                    description=(
+                        "Report the classified user query intent so the backend "
+                        "can route tool calls and fetch the right data."
+                    ),
+                    parameters=types_.Schema(
+                        type="OBJECT",
+                        properties={
+                            "category": types_.Schema(
+                                type="STRING",
+                                enum=valid_categories,
+                                description="One of the classification categories.",
+                            ),
+                            "resolved_subject": types_.Schema(
+                                type="STRING",
+                                description="What the user is asking about, with pronouns resolved.",
+                            ),
+                            "tool_plan": types_.Schema(
+                                type="ARRAY",
+                                items=tool_call_plan_item,
+                                description="Tools the backend should call, with pre-filled args.",
+                            ),
+                            "data_needs": data_needs_schema,
+                            "confidence": types_.Schema(
+                                type="NUMBER",
+                                description="Classification confidence in [0,1].",
+                            ),
+                        },
+                        required=["category", "confidence"],
+                    ),
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _extract_intent_tool_call(response) -> dict[str, Any] | None:
+        """Return the report_query_intent args as a plain dict, or None."""
+        for candidate_msg in (getattr(response, "candidates", None) or []):
+            content = getattr(candidate_msg, "content", None)
+            for part in (getattr(content, "parts", None) or []):
+                fc = getattr(part, "function_call", None)
+                if fc is None or fc.name != "report_query_intent":
+                    continue
+                args = dict(fc.args) if fc.args else {}
+                # data_needs and tool_plan may come back as Gemini dict/list types;
+                # _build_intent handles missing keys defensively.
+                return args
+        return None
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any] | None:

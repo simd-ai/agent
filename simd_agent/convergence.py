@@ -73,9 +73,28 @@ _DEFAULT_THRESHOLD = 1e-4
 _CRITICAL_FIELDS = {"p", "p_rgh", "Ux", "Uy", "Uz"}
 
 
+def _bare_field_name(field: str) -> str:
+    """Strip the optional ``<region>:`` namespace from a residual key.
+
+    Multi-region (CHT) cases ship residuals under namespaced keys like
+    ``innerFluid:Ux`` / ``wall:h`` — the underlying physics field is
+    just ``Ux`` / ``h``, so any lookup into the threshold table or
+    critical-fields set must operate on the bare name.  Single-region
+    fields have no colon and pass through unchanged.
+    """
+    return field.split(":", 1)[1] if ":" in field else field
+
+
 def _threshold_for(field: str) -> float:
-    """Return the convergence threshold for a field name."""
-    return _FIELD_THRESHOLDS.get(field, _DEFAULT_THRESHOLD)
+    """Return the convergence threshold for a field name.
+
+    Multi-region-safe: ``innerFluid:Ux`` → looks up ``Ux`` threshold
+    (1e-5), not the default 1e-4 fallback.  Without this fix the
+    threshold for every CHT field was 1e-4 — much looser than physics
+    requires, especially for velocity (Ux/Uy/Uz: 1e-5) and energy
+    (T/h: 1e-6).
+    """
+    return _FIELD_THRESHOLDS.get(_bare_field_name(field), _DEFAULT_THRESHOLD)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -450,6 +469,17 @@ def _compute_overall_status(
     statuses = {f["field"]: f["status"] for f in fields}
     all_statuses = list(statuses.values())
 
+    # Multi-region (CHT) cases ship field keys as ``<region>:<field>``.
+    # The critical-field check below operates on bare physics names
+    # (p, p_rgh, Ux, Uy, Uz) — without this mapping the check
+    # vacuously passes (``critical_present = []``) and the overall
+    # status falls through whatever fields happen to converge first,
+    # which is wrong for steady CHT where pressure/momentum convergence
+    # is the actual gate.
+    bare_statuses: dict[str, list[str]] = {}
+    for namespaced, status in statuses.items():
+        bare_statuses.setdefault(_bare_field_name(namespaced), []).append(status)
+
     # 1. Any divergence → overall diverging
     if "diverging" in all_statuses:
         return "diverging"
@@ -461,9 +491,13 @@ def _compute_overall_status(
         return "diverging"
 
     # 3. All converged (with critical fields check)
-    critical_present = [f for f in _CRITICAL_FIELDS if f in statuses]
+    # A critical physics field is "converged overall" only when EVERY
+    # region's copy of it is converged — innerFluid:Ux converged but
+    # outerFluid:Ux still oscillating still counts as not-converged.
+    critical_present = [f for f in _CRITICAL_FIELDS if f in bare_statuses]
     critical_converged = all(
-        statuses.get(f) == "converged" for f in critical_present
+        all(s == "converged" for s in bare_statuses[f])
+        for f in critical_present
     )
     all_converged = all(s == "converged" for s in all_statuses)
     continuity_ok = continuity is None or continuity.get("status") in ("converged", "converging")
@@ -472,8 +506,10 @@ def _compute_overall_status(
         return "converged"
 
     # 4. Critical fields oscillating → oscillating
+    # Any region's copy of a critical field oscillating counts.
     critical_oscillating = any(
-        statuses.get(f) == "oscillating" for f in _CRITICAL_FIELDS if f in statuses
+        "oscillating" in bare_statuses.get(f, [])
+        for f in _CRITICAL_FIELDS
     )
     if critical_oscillating:
         return "oscillating"
@@ -531,10 +567,18 @@ def _field_to_relax_key(field: str) -> str:
     """Map a convergence field name to the relaxation factor key.
 
     Convergence reports Ux/Uy/Uz individually, but fvSolution uses U.
+
+    Multi-region (CHT) cases ship the same physics fields under
+    region-namespaced keys (``innerFluid:Ux``, ``wall:h``, …) — strip
+    the ``<region>:`` prefix first so the same Ux/Uy/Uz → U collapse
+    fires, and so the recommendation engine produces sensible
+    relaxation-factor advice instead of treating ``innerFluid:Ux`` as a
+    distinct never-relaxed field.
     """
-    if field in ("Ux", "Uy", "Uz"):
+    bare = field.split(":", 1)[1] if ":" in field else field
+    if bare in ("Ux", "Uy", "Uz"):
         return "U"
-    return field
+    return bare
 
 
 def _generate_recommendations(
@@ -658,8 +702,18 @@ def _generate_recommendations(
 
     # ── 4. Stalling → more iterations or mesh refinement ──────────────
     if stall_fields and not div_fields and not osc_fields:
-        affected = [f for f in stall_fields if f["field"] in _CRITICAL_FIELDS]
-        turb_stalling = [f for f in stall_fields if f["field"] not in _CRITICAL_FIELDS]
+        # _bare_field_name() handles CHT ``<region>:<field>`` namespacing —
+        # without it every namespaced field reads as "not in CRITICAL"
+        # (since the set has bare physics names only), wrongly classifying
+        # innerFluid:Ux stalls as turbulence stalls.
+        affected = [
+            f for f in stall_fields
+            if _bare_field_name(f["field"]) in _CRITICAL_FIELDS
+        ]
+        turb_stalling = [
+            f for f in stall_fields
+            if _bare_field_name(f["field"]) not in _CRITICAL_FIELDS
+        ]
 
         # If only turbulence fields are stalling, that's often acceptable
         if affected:

@@ -751,8 +751,33 @@ def validate_config_completeness(
     # --- Boundary conditions validation ---
     has_inlet = any(bc.is_inlet() for bc in config.boundary_conditions.values())
     has_outlet = any(bc.is_outlet() for bc in config.boundary_conditions.values())
-    
-    if not has_inlet:
+
+    # "Closed-domain" cases legitimately have no inlets and no outlets — the
+    # flow is driven by something other than a pressure gradient: buoyancy
+    # (gravity + ΔT), a moving wall (lid-driven cavity), an MRF rotating
+    # zone, an fvOptions momentum source.  These are all valid CFD setups.
+    #
+    # The inlet/outlet check is a heuristic to catch the common mistake of
+    # forgetting to tag a patch.  Skip it when the user has *explicitly*
+    # accounted for every mesh patch (every patch has a BC and none of them
+    # are tagged inlet/outlet) — meaning they really did mean "closed
+    # domain", not "I forgot something".
+    _CLOSED_OK = {"wall", "symmetry", "empty", "wedge", "cyclic"}
+
+    def _patch_kind(bc) -> str:
+        pt = getattr(bc, "patch_type", "")
+        # BoundaryType is a str-Enum, so .value gives the canonical name;
+        # fall back to str() for plain-string inputs from the normaliser.
+        return getattr(pt, "value", str(pt)).lower()
+
+    is_closed_domain_case = (
+        not has_inlet and not has_outlet
+        and len(config.boundary_conditions) > 0
+        and all(_patch_kind(bc) in _CLOSED_OK
+                for bc in config.boundary_conditions.values())
+    )
+
+    if not has_inlet and not is_closed_domain_case:
         missing_fields.append(MissingFieldInfo(
             field="boundary_conditions.inlet",
             description="At least one inlet boundary condition is required",
@@ -762,8 +787,8 @@ def validate_config_completeness(
                 "velocity": {"type": "fixedValue", "value": [1, 0, 0]}
             },
         ))
-    
-    if not has_outlet:
+
+    if not has_outlet and not is_closed_domain_case:
         missing_fields.append(MissingFieldInfo(
             field="boundary_conditions.outlet",
             description="At least one outlet boundary condition is required",

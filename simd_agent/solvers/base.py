@@ -103,6 +103,12 @@ class SolverPlugin(ABC):
     supports_energy: bool = False
     needs_gravity: bool = False
     is_multiphase: bool = False
+    # Multi-region (CHT) flag.  Default ``False`` covers every single-
+    # region plugin (simpleFoam, pimpleFoam, rhoSimpleFoam, …); only
+    # :class:`MultiRegionBase` subclasses (cht* solvers) override this to
+    # ``True``.  ``validate_full`` reads it to decide whether to invoke
+    # the flat single-region validator after plugin-specific validate().
+    is_multi_region: bool = False
 
     # Energy variable name as it appears in fvSchemes (``div(phi,h)`` vs
     # ``div(phi,e)``), fvSolution (the equation-solver regex group and
@@ -228,27 +234,43 @@ class SolverPlugin(ABC):
         fixed = plugin_result.files
         issues = list(pre_issues) + list(plugin_result.issues)
 
-        # 2. Shared legacy validator — lazy import to avoid circular deps.
-        try:
-            from simd_agent.run.genai_codegen import (
-                validate_generated_files as _legacy_validate,
-                ValidationIssue as _LegacyIssue,
-            )
-        except ImportError:
-            _legacy_validate = None
-            _LegacyIssue = None
-
-        if _legacy_validate is not None:
-            fixed, legacy_issues = _legacy_validate(fixed, self.name, config)
-            for li in legacy_issues:
-                issues.append(
-                    ValidationIssue(
-                        severity=getattr(li, "severity", "warning"),
-                        file=getattr(li, "file", ""),
-                        message=getattr(li, "message", str(li)),
-                        fix=getattr(li, "fix", None),
-                    )
+        # 2. Shared single-region validator — only runs for single-region
+        # plugins.  Multi-region (CHT) cases ship a flat-incompatible
+        # per-region tree (``0/<region>/<field>``, ``system/<region>/...``,
+        # ``constant/<region>/...``); every check in the single-region
+        # validator is written for the flat single-region layout and would
+        # either no-op noisily or silently damage the per-region files
+        # (e.g. stamp a top-level ``0/T`` "missing", rewrite per-region
+        # boundary lists, …).  The deterministic renderer in
+        # :class:`MultiRegionBase` is authoritative for those files instead.
+        if not self.is_multi_region:
+            try:
+                from simd_agent.run.single_region import (
+                    validate_generated_files as _legacy_validate,
+                    ValidationIssue as _LegacyIssue,
                 )
+            except ImportError:
+                _legacy_validate = None
+                _LegacyIssue = None
+
+            if _legacy_validate is not None:
+                fixed, legacy_issues = _legacy_validate(fixed, self.name, config)
+                for li in legacy_issues:
+                    issues.append(
+                        ValidationIssue(
+                            severity=getattr(li, "severity", "warning"),
+                            file=getattr(li, "file", ""),
+                            message=getattr(li, "message", str(li)),
+                            fix=getattr(li, "fix", None),
+                        )
+                    )
+
+        # 3. Universal constraint-patch BC fix — runs LAST so it overrides
+        #    anything the LLM or the legacy validator left behind on
+        #    symmetry / empty / wedge patches.  Touches single-region and
+        #    multi-region cases identically; only patches whose polyMesh
+        #    type is a constraint type are rewritten.
+        fixed = self._fix_constraint_patch_bcs(fixed, config, issues)
 
         return ValidationResult(files=fixed, issues=issues)
 
@@ -301,6 +323,15 @@ class SolverPlugin(ABC):
         """Fix mismatched curly braces (thin wrapper, see ``legacy_fixers``)."""
         from simd_agent.solvers import legacy_fixers
         return legacy_fixers.fix_brace_balance(files, issues)
+
+    def _fix_constraint_patch_bcs(
+        self, files: dict[str, str], config: dict[str, Any],
+        issues: list[ValidationIssue],
+    ) -> dict[str, str]:
+        """Force ``symmetry`` / ``empty`` / ``wedge`` BCs to match the
+        mesh-side patch type (thin wrapper, see ``bc_fixers``)."""
+        from simd_agent.solvers import bc_fixers
+        return bc_fixers.fix_constraint_patch_bcs(files, issues, config)
 
     @staticmethod
     def _balance_braces(content: str) -> str:
