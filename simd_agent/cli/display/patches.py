@@ -29,6 +29,7 @@ from typing import Any
 from rich.table import Table
 
 from simd_agent.cli.display import console
+from simd_agent.cli.display.arrow import arrow_choice
 
 
 # CHT coupling patches are owned by the deterministic renderer; the user
@@ -126,27 +127,30 @@ def review(
     console.print(_render_table(patches))
 
     while True:
-        console.print(
-            "\n  [enter] accept   [e] edit a patch   "
-            "[d] dump full config   [q] cancel",
-        )
+        console.print("")
         try:
-            choice = input("  > ").strip().lower()
-        except EOFError:
+            idx = arrow_choice(
+                "what next?",
+                [
+                    "accept            — start the run with these BCs",
+                    "edit a patch      — change a single BC type or value",
+                    "dump full config  — re-print the table",
+                    "cancel            — abort this run",
+                ],
+            )
+        except KeyboardInterrupt:
             return None
 
-        if choice == "" or choice == "y":
+        if idx == 0:
             return overrides
-        if choice == "q":
-            return None
-        if choice == "d":
-            console.print(_render_table(patches))
-            continue
-        if choice == "e":
+        if idx == 1:
             _edit_loop(patches, overrides)
             continue
-
-        console.print(f"  unknown choice {choice!r}")
+        if idx == 2:
+            console.print(_render_table(patches))
+            continue
+        if idx == 3:
+            return None
 
 
 def _edit_loop(
@@ -154,24 +158,30 @@ def _edit_loop(
     overrides: dict[str, Any],
 ) -> None:
     """Inner REPL: pick a patch, edit one field, return to the outer."""
-    name_or_num = input("  pick patch (number or name): ").strip()
-    if not name_or_num:
-        return
-
-    target: dict[str, Any] | None = None
-    if name_or_num.isdigit():
-        idx = int(name_or_num) - 1
-        if 0 <= idx < len(patches):
-            target = patches[idx]
-    else:
-        for p in patches:
-            if p.get("name") == name_or_num:
-                target = p
+    # Build menu options — show patch name + the proposed type, so the
+    # user has enough context to decide what to edit without re-running
+    # ``dump full config``.  Append a "back" entry so cancellation is
+    # a one-arrow action; KeyboardInterrupt also bails cleanly.
+    options = []
+    for p in patches:
+        name = p.get("name") or "?"
+        fields = p.get("fields") or {}
+        # Pick the most-interesting BC type to show as a hint.
+        hint = ""
+        for key in ("U", "T", "p", "p_rgh"):
+            if key in fields and isinstance(fields[key], dict):
+                hint = f"  {key}={fields[key].get('type', '?')}"
                 break
+        options.append(f"{name}{hint}")
+    options.append("← back")
 
-    if target is None:
-        console.print(f"  no patch matched {name_or_num!r}")
+    try:
+        idx = arrow_choice("which patch?", options)
+    except KeyboardInterrupt:
         return
+    if idx == len(options) - 1:
+        return  # "back"
+    target = patches[idx]
 
     name = target.get("name") or "?"
     if _is_coupled(name):
@@ -182,9 +192,20 @@ def _edit_loop(
         return
 
     console.print(f"\n  [bold]{name}[/]")
-    field = input("  field to change (T / U / p / p_rgh / k / omega): ").strip()
-    if not field:
+    # Build the field menu from what the patch actually carries, plus the
+    # standard set as fallback so the user can also add a field that
+    # precheck didn't propose.
+    proposed = list((target.get("fields") or {}).keys())
+    standard = ["U", "T", "p", "p_rgh", "k", "omega", "epsilon", "nut"]
+    field_options = list(dict.fromkeys(proposed + standard))  # preserve order, dedupe
+    field_options.append("← back")
+    try:
+        f_idx = arrow_choice("which field?", field_options)
+    except KeyboardInterrupt:
         return
+    if f_idx == len(field_options) - 1:
+        return
+    field = field_options[f_idx]
 
     new_type  = input(f"  new type for {field} (or blank to keep): ").strip() or None
     new_value = input(f"  new value for {field} (or blank to keep): ").strip() or None
