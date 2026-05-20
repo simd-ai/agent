@@ -34,22 +34,21 @@ CFD specialist a week to set up — "does this U-bend overheat at the
 natural convection enough or do I need a forced inlet?" — become a
 paragraph of intent plus a geometry.
 
-Supports:
+### Physics
 
-  - incompressible and compressible flow
-    (simpleFoam, pimpleFoam, rhoSimpleFoam, rhoPimpleFoam,
-    buoyantSimpleFoam, buoyantPimpleFoam, buoyantBoussinesqSimpleFoam,
-    buoyantBoussinesqPimpleFoam, icoFoam)
+  - compressible and incompressible flow
   - laminar and turbulent regimes
-    (k-epsilon, k-omega SST, k-omega, Spalart-Allmaras, laminar)
   - conjugate heat transfer between solids and fluids
-    (chtMultiRegionSimpleFoam, chtMultiRegionFoam)
-  - multiphase flows — experimental
-    (compressibleInterFoam, compressibleInterIsoFoam,
-    compressibleMultiphaseInterFoam, interFoam, interIsoFoam)
-  - LLM providers: Google Gemini, Vertex AI, Ollama (local)
-  - object storage: local filesystem or Google Cloud Storage
-  - authentication: Neon Auth, or none (open mode)
+  - multiphase flows (experimental)
+
+See Documentation/solvers for the full list of supported solvers and turbulence models.
+
+
+### Infrastructure
+
+  - LLM: Google Gemini, Vertex AI, Ollama (local)
+  - storage: local filesystem or Google Cloud Storage
+  - auth: Neon Auth, or none (open mode)
 
 
 what you need
