@@ -296,7 +296,11 @@ async def _ensure_simulation(client: AgentClient, config: CliConfig) -> str:
     ``~/.config/simd/config.toml`` so it survives across runs.
     """
     if not config.user_id:
-        user = await client.get_or_create_user("local@simd.local")
+        resp = await client.get_or_create_user("local@simd.local")
+        # ``POST /api/users`` returns ``{"user": {"id": …}, "is_new": bool}``
+        # (UserCreateResponse).  The older shape was a flat ``{"id": …}``;
+        # both are tolerated so a downgraded backend doesn't break the CLI.
+        user = resp.get("user", resp)
         uid = user.get("uid") or user.get("id")
         if not uid:
             raise _CliError(
