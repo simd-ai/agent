@@ -51,7 +51,7 @@ See Documentation/solvers for the full list of supported solvers and turbulence 
   - auth: Neon Auth, or none (open mode)
 
 
-what you need
+What you need
 -------------
 
   - Docker + Docker Compose
@@ -62,7 +62,7 @@ That's it. The compose stack ships OpenFOAM v2406, Postgres, the
 agent, and the frontend.
 
 
-quick start
+Quick start
 -----------
 
     git clone https://github.com/simd-ai/agent
@@ -82,7 +82,7 @@ the WebSocket / HTTP API (see ``Documentation/api/``) or run the
 frontend at ``http://localhost:3000``.
 
 
-how it works
+How it works
 ------------
 
 A FastAPI service orchestrates per-file OpenFOAM codegen with an LLM,
@@ -97,7 +97,7 @@ See Documentation/architecture for the full design,
 Documentation/self-healing for a walkthrough of one real failure.
 
 
-examples
+Examples
 --------
 
 Four end-to-end cases ship under `examples/`. Each carries its mesh,
@@ -117,7 +117,7 @@ it from the prompt.
 Walk-throughs and screenshots in Documentation/examples/.
 
 
-documentation
+Documentation
 -------------
 
 See Documentation/ for installation, deployment, the WebSocket
@@ -125,7 +125,7 @@ protocol, the solver plugin contract, and the LLM provider plugin
 contract.
 
 
-contributing
+Contributing
 ------------
 
 See CONTRIBUTING. New solver plugins drop into
@@ -134,13 +134,13 @@ providers drop into `simd_agent/llm/<name>/`. No registry edits
 needed.
 
 
-license
+License
 -------
 
 Apache 2.0 — see LICENSE.
 
 
-acknowledgements
+Acknowledgements
 ----------------
 
 OpenFOAM® is a registered trade mark of OpenCFD Ltd. This project is
