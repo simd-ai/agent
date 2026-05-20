@@ -37,8 +37,9 @@ reproduce with OpenFOAM directly
 reproduce via the agent
 -----------------------
 
-    simd run examples/cylindrical-cht/prompt.txt \
-             examples/cylindrical-cht/mesh/cylindrical-cht.msh
+    # post the prompt + mesh to /api/precheck, then open
+    # /ws/run with op=CFD_CODEGEN_RUN.  See Documentation/api/.
+    # The bundled frontend at http://localhost:3000 wires this up.
 
 Or upload the mesh + paste the prompt in the frontend at
 http://localhost:3000 — same backend.

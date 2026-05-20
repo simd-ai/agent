@@ -14,9 +14,8 @@
 #                    own Postgres (or run one in a container).
 #                    Point at a remote runner.
 #
-# Either path writes both .env (for the agent) and
-# ~/.config/simd/config.toml (for the CLI) — no separate
-# `simd init` step needed after install.sh.
+# Either path writes a single ``.env`` file the agent reads on
+# start-up.  No additional config files are produced.
 #
 # Menu choices use arrow keys (↑ ↓ Enter).  Free-text inputs
 # (URLs, API keys, file paths) are typed normally.
@@ -33,8 +32,7 @@ set -uo pipefail
 # ── TTY guard ───────────────────────────────────────────────────
 if [ ! -t 0 ] || [ ! -t 1 ]; then
   echo "install.sh needs an interactive terminal." >&2
-  echo "for non-interactive setup, edit .env by hand and run:" >&2
-  echo "    pip install -e . && simd init" >&2
+  echo "for non-interactive setup, edit .env by hand and run docker compose up -d" >&2
   exit 1
 fi
 
@@ -189,38 +187,6 @@ ask_path() {
 
 # ── CLI config writer ──────────────────────────────────────────
 #
-# Write ~/.config/simd/config.toml directly from the wizard's
-# answers.  Replaces the old approach of calling `simd init` at
-# the end of install.sh (which asked all the same questions again).
-# `simd init` remains a standalone command for users who install
-# just the CLI (e.g. future `pip install simd-agent` without
-# running install.sh).
-
-write_cli_config() {
-  # write_cli_config <agent_url> <agent_mode> <runner_url> <runner_mode>
-  local agent_url="$1" agent_mode="$2" runner_url="$3" runner_mode="$4"
-
-  local cfg_dir="$HOME/.config/simd"
-  local cfg_file="$cfg_dir/config.toml"
-  mkdir -p "$cfg_dir"
-
-  if [ -f "$cfg_file" ]; then
-    cp "$cfg_file" "$cfg_file.bak"
-    warn "$cfg_file already existed — backed up to config.toml.bak"
-  fi
-
-  cat > "$cfg_file" <<TOML
-# Written by install.sh.  Edit by hand or re-run install.sh.
-agent_url = "$agent_url"
-agent_mode = "$agent_mode"
-runner_url = "$runner_url"
-runner_mode = "$runner_mode"
-TOML
-  chmod 600 "$cfg_file" 2>/dev/null || true
-  ok "CLI config written to $cfg_file"
-}
-
-
 # ── locate ourselves ────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_DIR="$SCRIPT_DIR"
@@ -624,11 +590,20 @@ GCSYML
     hint "$COMPOSE_CMD up -d"
   fi
 
-  # CLI config — the agent is in a container exposed on localhost:8000.
-  # Runner mode is "remote" since SIM_SERVER_URL points outside the stack
-  # (the bundled compose file doesn't yet ship a runner image).
-  write_cli_config "http://localhost:8000" "local-docker" \
-                   "$SIM_SERVER_URL" "remote"
+  header "setup complete"
+  cat <<EOF
+
+  the docker stack is configured.  start / stop / view logs with:
+
+    $COMPOSE_CMD up -d
+    $COMPOSE_CMD logs -f
+    $COMPOSE_CMD down
+
+  once it's up, the agent is at http://localhost:8000 and the
+  frontend (if you ran with the bundled compose file) at
+  http://localhost:3000.
+
+EOF
 
 # ══════════════════════════════════════════════════════════════
 # 9B. Bare-metal deployment
@@ -654,12 +629,10 @@ else
   # shellcheck disable=SC1091
   source .venv/bin/activate
 
-  info "installing simd-agent and the CLI …"
+  info "installing simd-agent …"
   pip install --upgrade pip --quiet
   pip install -e . --quiet
-  command -v simd >/dev/null || fail \
-    "the 'simd' command isn't on PATH after install — pip install -e . may have failed silently."
-  ok "installed  $(simd --version)"
+  ok "installed simd-agent"
 
   if [ "$STORAGE_BACKEND" = "local" ]; then
     mkdir -p "$AGENT_DIR/storage"
@@ -667,43 +640,18 @@ else
     ok "storage directories ready"
   fi
 
-  header "CLI configuration"
-
-  # The CLI needs the agent + runner URLs we already collected.  We
-  # write them directly — no need to re-ask via `simd init`.
-  #
-  # For bare-metal mode the agent runs locally via `uvicorn …
-  # --port 8000`.  The runner_mode is "remote" when SIM_SERVER_URL
-  # doesn't point at localhost; "local-bare-metal" when it does.
-  AGENT_URL_FOR_CLI="http://localhost:8000"
-  case "$SIM_SERVER_URL" in
-    http://localhost:*|http://127.0.0.1:*) RUNNER_MODE_FOR_CLI="local-bare-metal" ;;
-    *)                                     RUNNER_MODE_FOR_CLI="remote" ;;
-  esac
-  write_cli_config "$AGENT_URL_FOR_CLI" "local-bare-metal" \
-                   "$SIM_SERVER_URL" "$RUNNER_MODE_FOR_CLI"
-
   header "setup complete"
-
   cat <<EOF
 
-  next steps — two terminals:
+  start the agent in this terminal (or with nohup / systemd):
 
-    # terminal 1 — start the agent (keeps running)
     cd $AGENT_DIR
     source .venv/bin/activate
     uvicorn simd_agent.main:app --port 8000
 
-    # terminal 2 — run an example (pick one)
-    cd $AGENT_DIR
-    source .venv/bin/activate
-    simd run examples/u-shape-pipe/prompt.txt     examples/u-shape-pipe/mesh/u-shape-pipe.msh
-    simd run examples/z-bend/prompt.txt           examples/z-bend/mesh/z-bend.msh
-    simd run examples/inner-outer-pipe/prompt.txt examples/inner-outer-pipe/mesh/inner-outer-pipe.msh
-    simd run examples/cylindrical-cht/prompt.txt  examples/cylindrical-cht/mesh/cylindrical-cht.msh
-
-  to see what's wired up:
-    simd status
+  the agent listens on http://localhost:8000.  drive it via the
+  HTTP / WebSocket API (see Documentation/api/) or run the frontend
+  separately on http://localhost:3000.
 
   to deactivate the venv when you're done:
     deactivate

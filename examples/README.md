@@ -38,16 +38,13 @@ running them
 
 Two ways:
 
-  - **Via the agent — CLI** (after `pip install -e .`):
+  - **Via the agent — frontend**: open http://localhost:3000 once
+    `install.sh` (Docker mode) has the stack up, upload the mesh,
+    paste the prompt, click Run.
 
-        simd run examples/<name>/prompt.txt \
-                 examples/<name>/mesh/<name>.msh
-
-    Walks you through mesh upload, precheck, interactive patch
-    review, then streams the run. See Documentation/cli.md.
-
-  - **Via the agent — frontend**: open http://localhost:3000,
-    upload the mesh, paste the prompt, click Run. Same backend.
+  - **Via the agent — HTTP / WebSocket**: POST the prompt + mesh
+    to `/api/precheck`, then open `/ws/run` with op
+    `CFD_CODEGEN_RUN`. Full schema in `Documentation/api/`.
 
   - **Directly with OpenFOAM (no AI)**:
 

@@ -6,9 +6,9 @@ build-backend = "hatchling.build"
 name = "simd_agent"
 version = "0.1.0"
 description = "FastAPI service for orchestrating CFD workflows via WebSockets"
-readme = "README.md"
+readme = {file = "README", content-type = "text/plain"}
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 authors = [
     {name = "SIMD Team"}
 ]
@@ -30,13 +30,7 @@ dependencies = [
     "pyvista>=0.45.0",
     "meshio>=5.3.5",
     "matplotlib>=3.8.0",
-    "websockets>=12.0",
-    "rich>=13.7.0",
-    "questionary>=2.0.1",
 ]
-
-[project.scripts]
-simd = "simd_agent.cli.main:main"
 
 [project.optional-dependencies]
 dev = [

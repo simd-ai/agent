@@ -184,7 +184,7 @@ Two options:
 If you rename, four files need updates besides the directory
 itself:
 
-  - `README.md`            (the `examples/` block)
+  - `README`               (the `examples/` block)
   - `Documentation/examples/README.md`  (the table)
   - `Documentation/examples/cylindrical-cht.md`  → rename
   - `examples/cylindrical-cht/README.md`  (cross-references)
