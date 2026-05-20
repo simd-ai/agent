@@ -14,20 +14,31 @@
 #                    Bring your own Postgres (or run one in a
 #                    container).  Point at a remote runner.
 #
+# Menu choices use arrow keys (↑ ↓ Enter).  Free-text inputs
+# (URLs, API keys, file paths) are typed normally.
+#
 # Re-run safely — every step is idempotent.
 # ══════════════════════════════════════════════════════════════
 
-set -euo pipefail
+set -uo pipefail
+# NB: not using `-e` because interactive `read` can return non-zero
+# in ways that aren't fatal (escape sequences, etc.).  Errors get
+# surfaced explicitly via `fail`.
+
+
+# ── TTY guard ───────────────────────────────────────────────────
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+  echo "install.sh needs an interactive terminal." >&2
+  echo "for non-interactive setup, edit .env by hand and run:" >&2
+  echo "    pip install -e . && simd init" >&2
+  exit 1
+fi
 
 
 # ── output helpers ──────────────────────────────────────────────
-if [ -t 1 ]; then
-  BOLD=$'\033[1m'; NC=$'\033[0m'
-  GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; RED=$'\033[0;31m'
-  CYAN=$'\033[0;36m'; BLUE=$'\033[0;34m'
-else
-  BOLD=""; NC=""; GREEN=""; YELLOW=""; RED=""; CYAN=""; BLUE=""
-fi
+BOLD=$'\033[1m'; NC=$'\033[0m'
+GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; RED=$'\033[0;31m'
+CYAN=$'\033[0;36m'; BLUE=$'\033[0;34m'; DIM=$'\033[2m'
 
 info()    { printf "${BLUE}[INFO]${NC}  %s\n" "$*"; }
 ok()      { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
@@ -38,7 +49,95 @@ header()  { printf "\n${BOLD}${CYAN}── %s ──${NC}\n\n" "$*"; }
 hint()    { printf "    ${CYAN}→${NC} %s\n" "$*"; }
 
 
-# ── prompt helpers ──────────────────────────────────────────────
+# ── arrow-key menu ──────────────────────────────────────────────
+#
+# Renders a list, highlights the current row, redraws on each
+# keypress.  ↑/↓ (or vim's k/j) move; Enter confirms; q quits.
+# 1..9 digits act as direct hotkeys.  The result lands in two
+# globals:
+#
+#   $_ARROW_INDEX   — 0-based index of the chosen option
+#   $_ARROW_RESULT  — the chosen option's label string
+#
+# Caller reads them right after the function returns.
+
+_ARROW_INDEX=0
+_ARROW_RESULT=""
+
+arrow_choice() {
+  # arrow_choice <prompt> <option1> [<option2> ...]
+  local prompt="$1"
+  shift
+  local options=("$@")
+  local count=${#options[@]}
+  local selected=0
+  local key key2
+
+  printf "${BOLD}%s${NC}\n" "$prompt"
+  printf "${DIM}  (↑/↓ to move, Enter to select, q to quit)${NC}\n"
+
+  tput civis 2>/dev/null || true
+  trap '_arrow_cleanup' INT TERM
+
+  _arrow_draw "$selected" "${options[@]}"
+
+  while true; do
+    IFS= read -rsn1 key 2>/dev/null || break
+    if [[ "$key" == $'\e' ]]; then
+      IFS= read -rsn2 -t 0.05 key2 2>/dev/null || key2=""
+      case "$key2" in
+        '[A'|'OA') ((selected = (selected - 1 + count) % count)) ;;
+        '[B'|'OB') ((selected = (selected + 1) % count)) ;;
+        *) ;;
+      esac
+    elif [[ -z "$key" ]]; then
+      break  # Enter
+    elif [[ "$key" == "k" ]]; then
+      ((selected = (selected - 1 + count) % count))
+    elif [[ "$key" == "j" ]]; then
+      ((selected = (selected + 1) % count))
+    elif [[ "$key" =~ ^[0-9]$ ]] && [ "$key" -ge 1 ] && [ "$key" -le "$count" ]; then
+      selected=$((key - 1))
+      break
+    elif [[ "$key" == "q" ]]; then
+      _arrow_cleanup
+      fail "cancelled."
+    fi
+
+    tput cuu "$count" 2>/dev/null || true
+    _arrow_draw "$selected" "${options[@]}"
+  done
+
+  tput cnorm 2>/dev/null || true
+  trap - INT TERM
+
+  _ARROW_INDEX="$selected"
+  _ARROW_RESULT="${options[selected]}"
+}
+
+_arrow_draw() {
+  local sel="$1"; shift
+  local opts=("$@")
+  local n=${#opts[@]}
+  local i
+  for ((i=0; i<n; i++)); do
+    tput el 2>/dev/null || true
+    if [ "$i" -eq "$sel" ]; then
+      printf "  ${BOLD}${CYAN}❯${NC} ${BOLD}%s${NC}\n" "${opts[i]}"
+    else
+      printf "    %s\n" "${opts[i]}"
+    fi
+  done
+}
+
+_arrow_cleanup() {
+  tput cnorm 2>/dev/null || true
+  echo
+}
+
+
+# ── free-text prompts ───────────────────────────────────────────
+
 ask() {
   # ask <prompt> <default> <var>
   local prompt="$1" default="$2" var="$3" input
@@ -51,27 +150,17 @@ ask() {
   fi
 }
 
-ask_yes_no() {
-  # ask_yes_no <prompt> <default Y/N>
-  local prompt="$1" default="${2:-Y}" answer
-  read -rp "$(printf "${BOLD}%s${NC} [%s/%s]: " "$prompt" \
-              "$( [ "$default" = "Y" ] && echo "Y" || echo "y")" \
-              "$( [ "$default" = "Y" ] && echo "n" || echo "N")")" answer
-  answer="${answer:-$default}"
-  [[ "$answer" =~ ^[Yy]$ ]]
-}
-
-ask_choice() {
-  # ask_choice <prompt> <regex> <default> <var>
-  local prompt="$1" pattern="$2" default="$3" var="$4" input
+ask_path() {
+  # ask_path <prompt> <var> — keeps asking until the file exists
+  local prompt="$1" var="$2" path
   while true; do
-    read -rp "$(printf "${BOLD}%s${NC} [%s]: " "$prompt" "$default")" input
-    input="${input:-$default}"
-    if [[ "$input" =~ $pattern ]]; then
-      eval "$var=\"$input\""
+    read -rp "$(printf "${BOLD}%s${NC}: " "$prompt")" path
+    path="${path/#\~/$HOME}"
+    if [ -f "$path" ]; then
+      eval "$var=\"$path\""
       return
     fi
-    err "invalid choice: $input"
+    err "file not found: $path"
   done
 }
 
@@ -87,105 +176,108 @@ cd "$AGENT_DIR"
 # 1. Welcome
 # ══════════════════════════════════════════════════════════════
 echo
-printf "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗${NC}\n"
-printf "${BOLD}${CYAN}║          simd-agent — installation wizard           ║${NC}\n"
-printf "${BOLD}${CYAN}╚══════════════════════════════════════════════════════╝${NC}\n"
-echo
-echo "  this script will set up the simd-agent stack."
-echo "  you'll be asked a few questions to configure your deployment."
+printf "${BOLD}simd-agent installer${NC}\n"
+printf "${DIM}↑/↓ to move, Enter to confirm.${NC}\n"
 echo
 
 
 # ══════════════════════════════════════════════════════════════
-# 2. Deployment mode (Docker or Bare metal)
+# 2. Deployment mode
 # ══════════════════════════════════════════════════════════════
 header "deployment mode"
 
-echo "  1) Docker     — postgres + agent in containers (recommended"
-echo "                  if you already have Docker installed)"
-echo "  2) Bare metal — Python venv on this machine, you run uvicorn"
-echo
-ask_choice "choose deployment mode" "^[12]$" "1" DEPLOY_CHOICE
+arrow_choice "where should simd-agent run?" \
+  "Docker     — postgres + agent in containers (recommended if Docker is installed)" \
+  "Bare metal — Python venv on this machine, you run uvicorn"
 
-if [ "$DEPLOY_CHOICE" = "1" ]; then
-  DEPLOY_MODE="docker"
-  ok "Docker deployment selected"
-else
-  DEPLOY_MODE="bare-metal"
-  ok "bare-metal deployment selected"
-fi
+case "$_ARROW_INDEX" in
+  0) DEPLOY_MODE="docker"     ; ok "Docker deployment selected" ;;
+  1) DEPLOY_MODE="bare-metal" ; ok "bare-metal deployment selected" ;;
+esac
 
 
 # ══════════════════════════════════════════════════════════════
-# 3. Configuration (asked in both modes)
+# 3. LLM provider
 # ══════════════════════════════════════════════════════════════
 header "LLM provider"
 
-echo "  1) Gemini  (Google AI Studio — easiest, has a daily cap)"
-echo "  2) Vertex  (GCP Vertex AI — no daily cap, needs SA JSON)"
-echo "  3) Ollama  (local — runs models on this machine)"
-echo
-ask_choice "choose LLM provider" "^[123]$" "1" LLM_CHOICE
+arrow_choice "which LLM provider?" \
+  "Gemini  — Google AI Studio (easiest, has a daily cap)" \
+  "Vertex  — GCP Vertex AI (no daily cap, needs a service-account JSON)" \
+  "Ollama  — local (runs models on this machine, no API key)"
 
 GEMINI_API_KEY=""
 VERTEX_PROJECT=""
 GOOGLE_APPLICATION_CREDENTIALS=""
 OLLAMA_HOST=""
 
-if [ "$LLM_CHOICE" = "1" ]; then
-  LLM_PROVIDER="gemini"
-  while [ -z "$GEMINI_API_KEY" ]; do
-    ask "Gemini API key (get one at https://aistudio.google.com/apikey)" "" GEMINI_API_KEY
-    [ -z "$GEMINI_API_KEY" ] && err "a Gemini API key is required."
-  done
-  ok "Gemini configured"
-elif [ "$LLM_CHOICE" = "2" ]; then
-  LLM_PROVIDER="vertex"
-  ask "GCP project ID" "" VERTEX_PROJECT
-  ask "path to service-account JSON" "" GOOGLE_APPLICATION_CREDENTIALS
-  [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ] || fail "file not found: $GOOGLE_APPLICATION_CREDENTIALS"
-  ok "Vertex configured: $VERTEX_PROJECT"
-else
-  LLM_PROVIDER="ollama"
-  ask "Ollama host URL" "http://localhost:11434" OLLAMA_HOST
-  ok "Ollama configured: $OLLAMA_HOST"
-fi
+case "$_ARROW_INDEX" in
+  0)
+    LLM_PROVIDER="gemini"
+    while [ -z "$GEMINI_API_KEY" ]; do
+      ask "Gemini API key (https://aistudio.google.com/apikey)" "" GEMINI_API_KEY
+      [ -z "$GEMINI_API_KEY" ] && err "a Gemini API key is required."
+    done
+    ok "Gemini configured"
+    ;;
+  1)
+    LLM_PROVIDER="vertex"
+    ask_path "path to GCP service-account JSON (e.g. ~/.gcp/key.json)" \
+             GOOGLE_APPLICATION_CREDENTIALS
+    # The project_id is inside the JSON — extract it via python.
+    VERTEX_PROJECT="$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$GOOGLE_APPLICATION_CREDENTIALS'))
+    pid = d.get('project_id')
+    if not pid:
+        sys.exit('no project_id field in JSON')
+    print(pid)
+except Exception as e:
+    sys.exit(f'parse error: {e}')
+" 2>&1)" || fail "couldn't read project_id from $GOOGLE_APPLICATION_CREDENTIALS — $VERTEX_PROJECT"
+    ok "Vertex configured: project = $VERTEX_PROJECT"
+    ;;
+  2)
+    LLM_PROVIDER="ollama"
+    ask "Ollama host URL" "http://localhost:11434" OLLAMA_HOST
+    ok "Ollama configured: $OLLAMA_HOST"
+    ;;
+esac
 
 
+# ══════════════════════════════════════════════════════════════
+# 4. Simulation runner
+# ══════════════════════════════════════════════════════════════
 header "simulation runner"
 
 echo "  the OpenFOAM runner is a separate service (simd-ai/simulation_server)."
-echo "  options:"
+echo "  enter the URL where it's reachable from here."
 echo
-echo "    a) point at an existing runner (e.g. a server you already have)"
-echo "    b) install + run it yourself later (we'll skip for now)"
-echo
-ask "simulation runner URL (e.g. http://localhost:9000)" \
-    "http://localhost:9000" SIM_SERVER_URL
+ask "simulation runner URL" "http://localhost:9000" SIM_SERVER_URL
 
 
+# ══════════════════════════════════════════════════════════════
+# 5. Storage
+# ══════════════════════════════════════════════════════════════
 header "object storage"
 
-echo "  meshes, simulation results, and case files are stored here."
-echo
-echo "  1) local filesystem (default — no setup needed)"
-echo "  2) Google Cloud Storage (requires a bucket + SA JSON)"
-echo
-ask_choice "choose storage backend" "^[12]$" "1" STORAGE_CHOICE
+arrow_choice "where do meshes, VTPs, and case ZIPs live?" \
+  "Local filesystem (default — no setup needed)" \
+  "Google Cloud Storage (requires a bucket)"
 
 STORAGE_BACKEND="local"
 STORAGE_BUCKET=""
-GCS_KEY_PATH=""
 
-if [ "$STORAGE_CHOICE" = "2" ]; then
+if [ "$_ARROW_INDEX" -eq 1 ]; then
   STORAGE_BACKEND="gcs"
   ask "GCS bucket name" "" STORAGE_BUCKET
+
+  # Reuse the SA JSON from the Vertex step if present.
   if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
-    ask "path to GCS service-account JSON" "" GCS_KEY_PATH
-    [ -f "$GCS_KEY_PATH" ] || fail "file not found: $GCS_KEY_PATH"
-    GOOGLE_APPLICATION_CREDENTIALS="$GCS_KEY_PATH"
+    ask_path "path to GCS service-account JSON" GOOGLE_APPLICATION_CREDENTIALS
   else
-    info "reusing GCS credentials from the LLM provider step"
+    info "reusing the SA JSON from the LLM provider step"
   fi
   ok "GCS configured: $STORAGE_BUCKET"
 else
@@ -193,18 +285,17 @@ else
 fi
 
 
+# ══════════════════════════════════════════════════════════════
+# 6. Authentication
+# ══════════════════════════════════════════════════════════════
 header "authentication"
 
-echo "  by default, simd-agent runs without authentication (single local user)."
-echo "  enable Neon Auth only if you want multi-user support."
-echo
-echo "  1) Open  (no authentication — default)"
-echo "  2) Neon Auth  (requires a Neon project)"
-echo
-ask_choice "choose auth mode" "^[12]$" "1" AUTH_CHOICE
+arrow_choice "auth mode" \
+  "Open      — no authentication (single local user, default)" \
+  "Neon Auth — multi-user, requires a Neon project"
 
 NEON_AUTH_URL=""
-if [ "$AUTH_CHOICE" = "2" ]; then
+if [ "$_ARROW_INDEX" -eq 1 ]; then
   ask "Neon Auth base URL" "" NEON_AUTH_URL
   ok "Neon Auth configured"
 else
@@ -212,15 +303,17 @@ else
 fi
 
 
+# ══════════════════════════════════════════════════════════════
+# 7. Database
+# ══════════════════════════════════════════════════════════════
 header "database"
 
 if [ "$DEPLOY_MODE" = "docker" ]; then
-  echo "  1) bundled Postgres  (a postgres container ships with the stack)"
-  echo "  2) external Postgres (Neon, RDS, your own host)"
-  echo
-  ask_choice "choose database" "^[12]$" "1" DB_CHOICE
+  arrow_choice "Postgres" \
+    "bundled  — a postgres container ships with the stack" \
+    "external — Neon, RDS, or your own host (paste the URL)"
 
-  if [ "$DB_CHOICE" = "1" ]; then
+  if [ "$_ARROW_INDEX" -eq 0 ]; then
     DATABASE_URL="postgresql+asyncpg://simd:simd@postgres:5432/simd"
     ok "using bundled Postgres container"
   else
@@ -229,11 +322,11 @@ if [ "$DEPLOY_MODE" = "docker" ]; then
     ok "external database configured"
   fi
 else
-  echo "  bare-metal mode needs you to have Postgres reachable from this machine."
-  echo "  options:"
+  echo "  bare-metal mode needs Postgres reachable from this machine."
+  echo "  three common options:"
   echo "    a) Neon (managed) — paste your connection string"
-  echo "    b) Local Postgres (brew, apt)"
-  echo "    c) Postgres in a container:"
+  echo "    b) local install  — brew install postgresql / apt install postgresql"
+  echo "    c) in a container:"
   hint "docker run -d --name simd-pg \\"
   hint "  -e POSTGRES_USER=simd -e POSTGRES_PASSWORD=simd \\"
   hint "  -e POSTGRES_DB=simd -p 5432:5432 postgres:16-alpine"
@@ -246,7 +339,7 @@ fi
 
 
 # ══════════════════════════════════════════════════════════════
-# 4. Write .env
+# 8. Write .env
 # ══════════════════════════════════════════════════════════════
 header "writing .env"
 
@@ -303,7 +396,7 @@ ok ".env written to $ENV_FILE"
 
 
 # ══════════════════════════════════════════════════════════════
-# 5A. Docker deployment
+# 9A. Docker deployment
 # ══════════════════════════════════════════════════════════════
 if [ "$DEPLOY_MODE" = "docker" ]; then
   header "Docker deployment"
@@ -332,9 +425,12 @@ GCSYML
   warn "docker/docker-compose.yml so docker compose builds locally."
   echo
 
-  if ask_yes_no "start the stack now?" "Y"; then
+  arrow_choice "start the stack now?" \
+    "yes — run docker compose up -d" \
+    "no  — I'll start it later"
+  if [ "$_ARROW_INDEX" -eq 0 ]; then
     info "running:  $COMPOSE_CMD up -d"
-    $COMPOSE_CMD up -d
+    $COMPOSE_CMD up -d || fail "docker compose failed"
     echo
     ok "stack started.  endpoints:"
     hint "Backend:    http://localhost:8000"
@@ -349,12 +445,11 @@ GCSYML
   fi
 
 # ══════════════════════════════════════════════════════════════
-# 5B. Bare-metal deployment
+# 9B. Bare-metal deployment
 # ══════════════════════════════════════════════════════════════
 else
   header "bare-metal setup"
 
-  # ── Python check ─────────────────────────────────────────────
   command -v python3 >/dev/null || fail "python3 not found.  install Python 3.11+."
   PY_VER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
   PY_MAJOR="$(echo "$PY_VER" | cut -d. -f1)"
@@ -364,7 +459,6 @@ else
   fi
   ok "Python $PY_VER"
 
-  # ── venv + install ───────────────────────────────────────────
   if [ -d ".venv" ]; then
     ok ".venv already exists — reusing"
   else
@@ -381,14 +475,12 @@ else
     "the 'simd' command isn't on PATH after install — pip install -e . may have failed silently."
   ok "installed  $(simd --version)"
 
-  # ── storage dir ─────────────────────────────────────────────
   if [ "$STORAGE_BACKEND" = "local" ]; then
     mkdir -p "$AGENT_DIR/storage"
     mkdir -p "$AGENT_DIR/progress_data"
     ok "storage directories ready"
   fi
 
-  # ── simd init ───────────────────────────────────────────────
   header "CLI configuration"
 
   if [ -f "$HOME/.config/simd/config.toml" ]; then
@@ -400,7 +492,6 @@ else
     simd init || warn "simd init cancelled — you can re-run it later"
   fi
 
-  # ── final instructions ──────────────────────────────────────
   header "setup complete"
 
   cat <<EOF
@@ -426,10 +517,6 @@ EOF
 fi
 
 
-# ══════════════════════════════════════════════════════════════
-# 6. Done
-# ══════════════════════════════════════════════════════════════
-printf "${BOLD}${CYAN}════════════════════════════════════════════════════════${NC}\n"
-printf "${BOLD}${CYAN}  installation complete.                                ${NC}\n"
-printf "${BOLD}${CYAN}════════════════════════════════════════════════════════${NC}\n"
+# ── done ────────────────────────────────────────────────────────
+printf "${GREEN}installation complete.${NC}\n"
 echo
