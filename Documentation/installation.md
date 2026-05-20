@@ -1,0 +1,264 @@
+installation
+============
+
+The README quickstart runs everything in Docker. This document covers
+bare-metal: each process on the host. Useful for development, for
+contributors who want fast iteration on the Python code, and for
+environments where Docker isn't an option.
+
+
+what you'll be installing
+-------------------------
+
+Three processes, side by side:
+
+  - **agent** — this repo. FastAPI service on port 8000.
+  - **frontend** — `simd-ai/simd-agent-ui`. Next.js dev server on
+    port 3000.
+  - **sim-server** — `simd-ai/simd-agent-simulation`. OpenFOAM
+    runner on port 9000.
+
+And two backing stores:
+
+  - **Postgres** — for run / event / project records.
+  - **Object storage** — for case ZIPs, meshes, VTPs. Local
+    filesystem is fine for development.
+
+
+prerequisites
+-------------
+
+  - Python 3.13+
+  - Node.js 20+
+  - OpenFOAM v2406 (the sim-server expects exactly this version on
+    its `$PATH`)
+  - Postgres 14+ (local or Neon-hosted)
+  - One LLM credential: a Gemini API key, OR a Vertex AI
+    service-account JSON, OR a local Ollama install
+
+On macOS the sim-server has to run in a Docker container or a Linux
+VM because OpenFOAM doesn't ship native macOS binaries. The agent
+itself runs fine on macOS.
+
+
+1. agent
+--------
+
+    git clone https://github.com/simd-ai/simd-agent
+    cd simd-agent
+
+Create a virtualenv and install:
+
+    python -m venv .venv
+    source .venv/bin/activate
+    pip install -e ".[dev]"
+
+Configure:
+
+    cp .env.example .env
+
+Edit `.env`:
+
+  - `DATABASE_URL` — point at your Postgres (local or Neon).
+    Example: `postgresql+asyncpg://simd:simd@localhost:5432/simd`
+  - `SIMULATION_SERVER_URL` — `http://localhost:9000` if running
+    the sim-server locally, or the URL of your Docker-hosted runner.
+  - `GEMINI_API_KEY` — your AI Studio key. Or switch to Vertex /
+    Ollama (see `llm-providers/`).
+  - `STORAGE_BACKEND=local` and `STORAGE_LOCAL_DIR=./storage`.
+  - Leave `NEON_AUTH_BASE_URL` unset to disable auth.
+
+Initialize the database (the first request creates tables; no
+migration step needed today).
+
+Run:
+
+    uvicorn simd_agent.main:app --reload --port 8000
+
+You should see:
+
+    [LLM/REGISTRY] Discovered providers: ['gemini', 'vertex', 'ollama']
+    INFO:     Uvicorn running on http://0.0.0.0:8000
+
+Smoke-test:
+
+    curl http://localhost:8000/api/health
+    # {"status":"ok"}
+
+
+2. sim-server (OpenFOAM runner)
+-------------------------------
+
+The sim-server is a separate repo and a separate process because it
+owns the OpenFOAM installation. Two options.
+
+**Option A — Docker (recommended for local dev).** OpenFOAM v2406
+in a Linux container, ports to localhost:
+
+    docker run -d --name simd-runner \
+      -p 9000:9000 \
+      -v simd-runs:/tmp/simd-runs \
+      ghcr.io/simd-ai/agent-runner:latest
+
+Then in the agent's `.env`:
+
+    SIMULATION_SERVER_URL=http://localhost:9000
+
+**Option B — bare-metal Linux.** Install OpenFOAM v2406 from the
+ESI distribution, then:
+
+    git clone https://github.com/simd-ai/simd-agent-simulation
+    cd simd-agent-simulation
+    python -m venv .venv && source .venv/bin/activate
+    pip install -r requirements.txt
+    uvicorn app.main:app --port 9000
+
+The sim-server expects `gmshToFoam`, `splitMeshRegions`,
+`decomposePar`, `reconstructPar`, and the chtMultiRegion* / rho* /
+simpleFoam / pimpleFoam / interFoam binaries on `$PATH`. The
+container image ships all of these.
+
+
+3. frontend
+-----------
+
+    git clone https://github.com/simd-ai/simd-agent-ui
+    cd simd-agent-ui
+    npm install
+
+Configure `.env.local`:
+
+    NEXT_PUBLIC_AGENT_URL=http://localhost:8000
+    NEXT_PUBLIC_AGENT_WS_URL=ws://localhost:8000
+    NEXT_PUBLIC_AUTH_DISABLED=true
+
+Run:
+
+    npm run dev
+
+Open http://localhost:3000.
+
+
+4. Postgres
+-----------
+
+The agent uses Postgres for run/event persistence. Three reasonable
+setups:
+
+**Local Postgres (Homebrew, apt):**
+
+    createdb simd
+    # in .env:
+    # DATABASE_URL=postgresql+asyncpg://your-username@localhost:5432/simd
+
+**Local Postgres in Docker:**
+
+    docker run -d --name simd-pg \
+      -e POSTGRES_USER=simd -e POSTGRES_PASSWORD=simd \
+      -e POSTGRES_DB=simd \
+      -p 5432:5432 \
+      postgres:16-alpine
+    # in .env:
+    # DATABASE_URL=postgresql+asyncpg://simd:simd@localhost:5432/simd
+
+**Neon (managed Postgres):** sign up at neon.tech, create a project,
+copy the connection string. Replace `postgresql://` with
+`postgresql+asyncpg://`.
+
+
+5. LLM provider
+---------------
+
+Pick one. Mix-and-match is fine — set `DEFAULT_PROVIDER` to whichever
+should win.
+
+**Gemini (AI Studio API key)** — easiest, has a daily request cap.
+
+    GEMINI_API_KEY=AIza…
+    DEFAULT_PROVIDER=gemini
+
+**Vertex AI (GCP)** — same models, no daily cap, requires a service
+account.
+
+    DEFAULT_PROVIDER=vertex
+    VERTEX_PROJECT=your-gcp-project
+    VERTEX_LOCATION=us-central1
+    GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/sa-key.json
+
+See `llm-providers/vertex.md` for the IAM role setup.
+
+**Ollama (local)** — runs models on your machine, no network calls.
+
+    ollama pull gemma3
+    DEFAULT_PROVIDER=ollama
+    OLLAMA_HOST=http://localhost:11434
+    OLLAMA_MODEL=gemma3
+
+See `llm-providers/ollama.md` for model recommendations.
+
+
+verifying the stack
+-------------------
+
+With all four processes running, open http://localhost:3000 and run
+the simplest example:
+
+    1. Project → new project
+    2. Upload a mesh — use examples/u-shape-pipe/mesh/u-pipe.msh
+    3. Type a prompt: "incompressible turbulent flow, kOmegaSST,
+       100 iterations"
+    4. Click Run
+
+Within 30 seconds you should see:
+
+  - Per-file generation activity (`0/U`, `0/p`, `system/controlDict`,
+    `system/fvSchemes`, `system/fvSolution`, `constant/...`)
+  - Mesh conversion event
+  - Solver start + residual stream
+  - VTK result displayed in the 3D viewer
+
+If anything in that sequence fails, the agent logs are
+`uvicorn …` and the sim-server logs are `docker logs simd-runner`.
+
+
+troubleshooting
+---------------
+
+  - **"LLM provider 'gemini' not configured"** — `GEMINI_API_KEY` is
+    missing or has whitespace. Re-set and restart.
+
+  - **`splitMeshRegions failed`** — the case is multi-region but the
+    mesh doesn't have cellZones. Either generate a mesh with gmsh
+    `Physical Volume` groups, or write a single-region case.
+
+  - **VTK 404 in the browser** — the run finished but the sim-server
+    didn't produce any time folders (test-mode crashes, very short
+    runs). The agent handles this gracefully; the network 404 is
+    expected.
+
+  - **Frontend can't reach agent** — check
+    `NEXT_PUBLIC_AGENT_URL`. The browser, not Node, makes those
+    requests; the URL must be reachable from the browser's
+    perspective.
+
+  - **Slow first request** — first LLM call also imports the
+    `google-genai` SDK and warms a connection pool. Subsequent calls
+    are much faster.
+
+
+running tests
+-------------
+
+The agent has a test suite under `tests/`:
+
+    pytest -v
+
+The suite runs in parallel by default (xdist, 30 workers). Use
+`-n 0` if you need sequential output for debugging.
+
+The sim-server has its own suite:
+
+    cd ../simd-agent-simulation
+    pytest -v
+
+The frontend has no automated tests today.

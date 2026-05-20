@@ -1,0 +1,1 @@
+Simulate steady-state compressible flow of air through this inverted-U duct. Hot air enters the main inlet at a mass flow rate of 0.012 kg/s and 500 K. A cooler secondary stream enters the small side inlet at mass flow rate 0.001 kg/s and 280 K. The duct walls are at 600 K. Outlet at 101325 Pa. No gravity. Use k-omega SST turbulence use rhosimplefoam

@@ -1,0 +1,105 @@
+example: z-bend
+===============
+
+Transient turbulent water flow through a Z-shaped pipe. The classic
+shape for studying separation and reattachment around 90° bends.
+Single region, no heat transfer, kOmegaSST turbulence.
+
+
+<img src="../images/z-bend.png" width="700" alt="z-bend velocity field">
+
+
+what it teaches
+---------------
+
+  - how a **very terse prompt** (3 short clauses) flows through the
+    enrichment pipeline. The agent fills in the outlet (atmospheric),
+    the fluid properties (water at room T), the deltaT (from
+    Courant-aware mesh inspection), the iteration budget, and the
+    initial conditions
+  - how `pimpleFoam` differs from `simpleFoam` — transient
+    PIMPLE pressure-velocity coupling, `nOuterCorrectors`,
+    `nNonOrthogonalCorrectors`, residualControl with sub-dicts
+  - how kOmegaSST gets its `0/k`, `0/omega`, `0/nut` generated for
+    an incompressible solver (no `alphat` here — that's only
+    needed for compressible RAS)
+  - how the validator auto-injects a `value uniform $internalField`
+    on `turbulentIntensityKineticEnergyInlet` BCs (mandatory in OF
+    2406, missing in older LLM output → solver aborts on iteration 0)
+
+
+the prompt
+----------
+
+    i want water flowing at 2.3 m/s, transient turbulent flow for 4
+    seconds, turbulence model k-omega SST
+
+
+what the agent does
+-------------------
+
+  1. **Precheck**: detects the mesh is single-region, picks an
+     inlet patch via name heuristics, stamps `fixedValue (2.3 0 0)`
+     on `0/U`. No temperature mentioned → no thermal BCs.
+
+  2. **Lints**: detects transient (`for 4 seconds`), incompressible
+     (water + room T + no mass-flow-rate or compressibility hint),
+     turbulent (kOmegaSST named). Re = 2.3 × D / nu_water — well
+     above 4000 for any reasonable pipe diameter, so the turbulent
+     classification holds.
+
+  3. **Selects**: `pimpleFoam`. The selector's LLM gets the
+     incompressible + transient + turbulent classification and
+     picks pimpleFoam unambiguously.
+
+  4. **Generates ~9 files**:
+     `system/{controlDict,fvSchemes,fvSolution}`,
+     `constant/{transportProperties,turbulenceProperties}`,
+     `0/{U,p,k,omega,nut}`.
+
+  5. **Validates** (auto-fixes that fire for this case):
+       - `endTime = 4`, `deltaT` chosen from mesh-quality data
+         (typically 0.001–0.01 depending on the smallest cell).
+       - `adjustTimeStep yes; maxCo 0.5` for transient stability.
+       - `nOuterCorrectors ≥ 2`, `nCorrectors ≥ 1`,
+         `nNonOrthogonalCorrectors ≥ 1`.
+       - PIMPLE residualControl rewritten as sub-dictionaries
+         (plain scalars crash with "Residual data for p must be
+         specified as a dictionary").
+       - `0/k` `internalField` and inlet value clamped to the
+         physically plausible range (k = 1.5 × (I × U)² where
+         I ≈ 0.05 — for U = 2.3 m/s this gives k ≈ 0.04).
+       - `0/k` `turbulentIntensityKineticEnergyInlet` BC gets a
+         `value uniform $internalField` injected (OF 2406 strictness).
+
+  6. **Submits**: sim-server runs `pimpleFoam`. Vortex shedding
+     develops in the bends after the first second of simulated
+     time.
+
+Typical runtime: 45–75 seconds codegen, 5–20 minutes solver
+depending on mesh density and CFL.
+
+
+to reproduce
+------------
+
+From the frontend (http://localhost:3000):
+
+  1. New project → upload `examples/z-bend/mesh/z-bend.msh`.
+  2. Paste `examples/z-bend/prompt.txt`.
+  3. Click Run.
+
+Or directly with OpenFOAM:
+
+    cd examples/z-bend/case
+    pimpleFoam
+
+
+what you should see
+-------------------
+
+A flow that decelerates and separates at the inner edge of each
+bend, then reattaches downstream. After ~1 second of simulated
+time the flow becomes quasi-periodic with vortex shedding visible
+in the velocity field. Pressure drops monotonically from inlet to
+outlet with localized spikes at the bend outer walls.

@@ -1,0 +1,105 @@
+example: u-shape pipe (inverted-U duct)
+=======================================
+
+Compressible flow through an inverted-U duct: hot air enters the
+main inlet, a cooler secondary stream merges at a side inlet,
+walls are heated, outlet vents to atmosphere. Steady state,
+single region, kOmegaSST turbulence.
+
+
+<img src="../images/u-shape.png" width="700" alt="inverted-U duct temperature field">
+
+
+what it teaches
+---------------
+
+  - how the agent honours an explicit solver pick in the prompt
+    (`use rhosimplefoam` — the selector LLM is skipped)
+  - how **two inlets** flow through the BC pipeline — both get
+    `flowRateInletVelocity` BCs from their mass-flow-rate spec
+  - how mass-flow-rate (`m_dot`) maps to a per-patch BC type and
+    is NEVER converted to a constant velocity — the LLM tries
+    this and the validator catches it
+  - how heated wall BCs (`fixedValue 600 K`) interact with the
+    `fvOptions limitTemperature` clamps (auto-injected only when
+    the wall T exceeds the EOS ceiling, which 600 K does not for
+    air)
+
+
+the prompt
+----------
+
+    Simulate steady-state compressible flow of air through this
+    inverted-U duct. Hot air enters the main inlet at a mass flow
+    rate of 0.012 kg/s and 500 K. A cooler secondary stream enters
+    the small side inlet at mass flow rate 0.001 kg/s and 280 K.
+    The duct walls are at 600 K. Outlet at 101325 Pa. No gravity.
+    Use k-omega SST turbulence use rhosimplefoam
+
+
+what the agent does
+-------------------
+
+  1. **Precheck**: parses two inlets with mass-flow-rate units,
+     stamps `flowRateInletVelocity` BCs on both patches. Wall T
+     fixed at 600 K, outlet fixed at 101325 Pa.
+
+  2. **Lints**: detects compressible (gas mass flow with ΔT > 200 K),
+     steady (no end time), turbulent (kOmegaSST named). Regime is
+     turbulent — main inlet Re is comfortably above 4000.
+
+  3. **Selects**: prompt says `use rhosimplefoam`, the orchestrator
+     uses that and skips the LLM solver-selector call. The
+     `SolverSelector` would have picked the same anyway —
+     compressible + steady + heat transfer is unambiguous.
+
+  4. **Generates ~11 files**:
+     `system/{controlDict,fvSchemes,fvSolution,fvOptions}`,
+     `constant/{thermophysicalProperties,turbulenceProperties}`,
+     `0/{U,T,p,k,omega,nut,alphat}`.
+
+  5. **Validates** (the auto-fixes that fire for this case):
+       - `0/T internalField = 500` (matches the hot inlet, not the
+         300 K default the LLM defaults to).
+       - `0/p internalField = 101325` (matches the outlet
+         pressure).
+       - `div(phi,K)` and `div(phid,p)` present in fvSchemes —
+         rhoSimpleFoam crashes without these.
+       - `GAMG smoother = GaussSeidel` (not DIC — DIC causes
+         SIGFPE here).
+       - `nNonOrthogonalCorrectors = 2`, h relaxation = 0.05
+         for the cryogenic-leaning enthalpy bracket.
+
+  6. **Submits**: sim-server runs `rhoSimpleFoam`. Converges over
+     several hundred iterations as the SIMPLE pressure-velocity
+     coupling settles.
+
+Typical runtime: 60–90 seconds codegen, 2–6 minutes solver.
+
+
+to reproduce
+------------
+
+From the frontend (http://localhost:3000):
+
+  1. New project → upload `examples/u-shape-pipe/mesh/u-pipe.msh`.
+  2. Paste `examples/u-shape-pipe/prompt.txt`.
+  3. Click Run.
+
+Or directly with OpenFOAM, bypassing the agent:
+
+    cd examples/u-shape-pipe/case
+    rhoSimpleFoam
+
+
+what you should see
+-------------------
+
+A hot bulk flow (~500 K) through the main leg of the U, cooled at
+the side-inlet junction where the 280 K secondary stream mixes in,
+then re-heated by the 600 K walls along the rest of the duct. The
+temperature field shows distinct thermal regions: hot bulk + cold
+plume + wall-driven warming.
+
+The pressure field shows a small drop through the duct (~hundreds
+of Pa, not bars — this is a low-Mach flow).

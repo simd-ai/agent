@@ -1,0 +1,114 @@
+ollama (local)
+==============
+
+Runs the LLM on your own machine. No API keys, no network calls,
+no rate limits. Trades cost and capability for privacy and offline
+operation.
+
+Use for: air-gapped environments, fully local development, privacy-
+sensitive customer demos, exploring how dependent the agent is on
+the cloud models.
+
+
+setup
+-----
+
+  1. Install Ollama: https://ollama.com/download.
+
+  2. Pull a model. Recommended starting points:
+
+         ollama pull gemma3
+         ollama pull gemma3:27b      # if you have the VRAM
+
+     The agent doesn't care which model — it asks Ollama by tag.
+
+  3. Verify the server is running:
+
+         curl http://localhost:11434/api/tags
+         # {"models":[{"name":"gemma3:latest", ...}]}
+
+  4. In `.env`:
+
+         DEFAULT_PROVIDER=ollama
+         OLLAMA_HOST=http://localhost:11434
+         OLLAMA_MODEL=gemma3
+         OLLAMA_SUPER_MODEL=gemma3:27b
+
+  5. Restart the agent.
+
+
+model recommendations
+---------------------
+
+The codegen workload is "fill an OpenFOAM file from a deterministic
+template + per-patch values." Models that are strong at structured
+output and instruction-following beat models that are strong at
+prose.
+
+  | model                 | rough VRAM     | what to expect           |
+  |-----------------------|----------------|--------------------------|
+  | gemma3 (4B)           | 4 GB           | works for single-region |
+  |                       |                | + simple turbulence.    |
+  |                       |                | Multi-region is rough.  |
+  | gemma3:27b            | 18 GB          | most cases work; CHT    |
+  |                       |                | sometimes needs more    |
+  |                       |                | retries than Gemini.    |
+  | qwen2.5-coder:32b     | 22 GB          | strong at code-shaped   |
+  |                       |                | output; good fallback   |
+  |                       |                | for the super model.    |
+  | llama3.3:70b          | 40 GB+         | quality close to small  |
+  |                       |                | Gemini, slow.           |
+
+The smaller models cost you in self-healing retries — a case that
+takes 1 attempt with Gemini Pro may take 3–4 with gemma3 (4B).
+Set `MAX_RETRIES` higher when running local.
+
+
+performance notes
+-----------------
+
+  - **First call after restart** loads the model into VRAM. Can
+    take 10–60 seconds depending on size. After that, calls are
+    fast.
+
+  - **Parallel codegen** is the agent's normal mode — 5-10 file
+    calls in parallel. Ollama serialises these on a single GPU.
+    Local runs are typically 2–4× slower than cloud as a result.
+
+  - **Streaming works** — the agent's `generate_stream()` path
+    flows through to Ollama's chat-stream endpoint. Tokens stream
+    to the UI as the model produces them.
+
+
+remote ollama
+-------------
+
+If you're running Ollama on a separate machine (workstation with
+a GPU, server in your homelab):
+
+    OLLAMA_HOST=http://192.168.1.100:11434
+
+The Ollama server binds to `127.0.0.1` by default. To accept
+remote connections set `OLLAMA_HOST=0.0.0.0` in Ollama's
+environment.
+
+
+troubleshooting
+---------------
+
+  - **`ImportError: ollama provider requires the 'ollama' package`**
+    — the agent's `pip install -e ".[dev]"` should pull it. If it
+    didn't: `pip install 'ollama>=0.4.0'`.
+
+  - **`Connection refused` on first request** — Ollama isn't
+    running. `ollama serve` (or restart the desktop app).
+
+  - **`model not found`** — you haven't pulled it. `ollama pull
+    <tag>`.
+
+  - **Generation is silent for minutes** — the model is loading.
+    Watch `ollama ps` to see active models.
+
+  - **All cases fail validation** — small models often miss
+    OpenFOAM-specific keywords. Move up a size, or accept higher
+    `MAX_RETRIES` and let the self-healing loop fix it.

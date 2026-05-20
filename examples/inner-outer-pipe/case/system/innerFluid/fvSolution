@@ -1,0 +1,83 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "system/innerFluid";
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+solvers
+{
+    rho
+    {
+        solver          PCG;
+        preconditioner  DIC;
+        tolerance       1e-7;
+        relTol          0.1;
+    }
+
+    rhoFinal
+    {
+        $rho;
+        tolerance       1e-7;
+        relTol          0;
+    }
+
+    p_rgh
+    {
+        solver          GAMG;
+        smoother        GaussSeidel;
+        tolerance       1e-7;
+        relTol          0.001;
+    }
+
+    p_rghFinal
+    {
+        $p_rgh;
+        tolerance       1e-7;
+        relTol          0;
+    }
+
+    "(U|h)"
+    {
+        solver          PBiCGStab;
+        preconditioner  DILU;
+        tolerance       1e-7;
+        relTol          0.1;
+    }
+
+    "(U|h)Final"
+    {
+        $U;
+        tolerance       1e-7;
+        relTol          0;
+    }
+}
+
+SIMPLE
+{
+    momentumPredictor        yes;
+    nNonOrthogonalCorrectors 1;
+    pRefCell                 0;
+    pRefValue                100000;
+    rhoMin                   161.6;
+    rhoMax                   1616;
+}
+
+relaxationFactors
+{
+    fields
+    {
+        rho           1.0;
+        p_rgh         0.3;
+    }
+    equations
+    {
+        U             0.3;
+        h             0.7;
+    }
+}
+
+// ************************************************************************* //

@@ -1,0 +1,22 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      fvOptions;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+temperatureLimiter
+{
+    type            limitTemperature;
+    active          yes;
+
+    selectionMode   all;
+
+    min             150.0;   // 50% of coldest BC temperature [K]
+    max             550;  // 90% of EOS ceiling = same as wall BC clamp in 0/T
+}
+
+// ************************************************************************* //

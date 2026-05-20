@@ -4,8 +4,18 @@
 # Usage:
 #   docker compose -f docker/docker-compose.yml up -d
 #
-# Requires .env in the repo root (copy from .env.example).
-# The install.sh script generates this automatically.
+# Or via the wrapper (recommended for first-time setup):
+#   ./install.sh
+#
+# The wrapper generates .env from .env.example and prompts for your
+# Gemini key (or Vertex / Ollama credentials).
+#
+# Images are pulled from GitHub Container Registry. To build from
+# source instead (for development), uncomment the `build:` blocks
+# and comment out the `image:` lines. See:
+#   - simd-ai/simd-agent       (this repo, the agent)
+#   - simd-ai/simd-agent-ui    (Next.js frontend)
+#   - simd-ai/simd-agent-simulation  (OpenFOAM runner)
 # ══════════════════════════════════════════════════════════════
 
 services:
@@ -25,21 +35,25 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    restart: unless-stopped
 
   # ── SIMD Agent (backend API) ─────────────────────────────────
   agent:
-    build:
-      context: ..
-      dockerfile: docker/agent.Dockerfile
+    image: ghcr.io/simd-ai/agent:latest
+    # build:
+    #   context: ..
+    #   dockerfile: docker/agent.Dockerfile
     env_file: ../.env
     environment:
       DATABASE_URL: postgresql+asyncpg://simd:simd@postgres:5432/simd
-      SIMULATION_SERVER_URL: http://runner:8000
+      SIMULATION_SERVER_URL: http://runner:9000
     ports:
       - "8000:8000"
     volumes:
       - agent-storage:/app/storage
       - agent-progress:/tmp/simd_progress
+      # Mount a service-account JSON if using Vertex or GCS:
+      # - ./gcp-sa.json:/secrets/sa-key.json:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -47,17 +61,17 @@ services:
 
   # ── Frontend (Next.js) ───────────────────────────────────────
   frontend:
-    build:
-      context: ../ui
-      dockerfile: ../docker/frontend.Dockerfile
-      args:
-        NEXT_PUBLIC_AGENT_URL: http://localhost:8000
-        NEXT_PUBLIC_AGENT_WS_URL: ws://localhost:8000
-        NEXT_PUBLIC_AUTH_DISABLED: "true"
+    image: ghcr.io/simd-ai/agent-ui:latest
+    # To build from source, clone simd-ai/simd-agent-ui beside this
+    # repo and uncomment the build block:
+    # build:
+    #   context: ../../simd-agent-ui
     env_file: ../.env
     environment:
-      # Server-side env vars (not inlined at build time)
       DATABASE_URL: postgresql://simd:simd@postgres:5432/simd
+      NEXT_PUBLIC_AGENT_URL: http://localhost:8000
+      NEXT_PUBLIC_AGENT_WS_URL: ws://localhost:8000
+      NEXT_PUBLIC_AUTH_DISABLED: "true"
     ports:
       - "3000:3000"
     depends_on:
@@ -66,13 +80,15 @@ services:
 
   # ── OpenFOAM Runner ──────────────────────────────────────────
   runner:
-    build:
-      context: ../simulation_server
-      dockerfile: ../docker/runner.Dockerfile
+    image: ghcr.io/simd-ai/agent-runner:latest
+    # To build from source, clone simd-ai/simd-agent-simulation
+    # beside this repo and uncomment the build block:
+    # build:
+    #   context: ../../simd-agent-simulation
     volumes:
       - runner-data:/tmp/simd-runs
     ports:
-      - "8001:8000"
+      - "9000:9000"
     restart: unless-stopped
 
 volumes:

@@ -1,0 +1,117 @@
+Contributing
+============
+
+Thanks for considering a contribution. The project is small and
+focused: an agent that drives OpenFOAM from natural language. Most
+useful contributions fall into one of three buckets.
+
+
+1. solver plugins
+-----------------
+
+Add a new OpenFOAM solver, or improve validation for an existing
+one. See `Documentation/solvers/adding-a-solver.md` — the contract
+is short and the existing plugins are good copy-paste starting
+points.
+
+What we'd especially welcome:
+
+  - **`rhoCentralFoam`** — high-Mach compressible, currently
+    unsupported.
+  - **`buoyantPimpleFoam` validation hardening** — natural
+    convection has its own pitfalls (Boussinesq vs full
+    compressible, gravity vector orientation, …) and the
+    auto-fixes are thinner than the steady variants.
+  - **Multiphase plugin port** — `compressibleInterFoam`,
+    `compressibleMultiphaseInterFoam`, `interFoam` still use the
+    legacy monolithic prompt-pack format. Porting them to the
+    plugin layout brings them parity with the single-region
+    solvers. See `Documentation/solvers/multiphase.md`.
+
+
+2. LLM providers
+----------------
+
+Add support for a new LLM. See
+`Documentation/llm-providers/adding-a-provider.md`. The current set
+covers Gemini (AI Studio + Vertex) and Ollama (local). Anthropic
+Claude and OpenAI-compatible endpoints are the most-requested
+additions.
+
+
+3. examples and documentation
+-----------------------------
+
+Real-world cases are the best documentation. Drop a new directory
+into `examples/<name>/` with the case files, the prompt, and a
+walkthrough doc under `Documentation/examples/`.
+
+
+what we'd rather you didn't add
+-------------------------------
+
+  - **New abstractions for hypothetical extensibility.** The
+    plugin system is the abstraction. Don't add framework layers
+    on top.
+  - **Generic CFD utilities.** If it's not OpenFOAM-specific, it
+    probably belongs in a separate library.
+  - **Commercial / closed-source hooks.** Keep the OSS path
+    clean; commercial integrations live in separate forks.
+
+
+workflow
+--------
+
+  1. Fork and clone.
+  2. Branch off `main`.
+  3. Run the test suite: `pytest -v`. Add tests for what you change.
+  4. Open a PR. Link the issue if there is one.
+
+Most PRs get a review within a few days. Small focused PRs are
+faster to land than large ones.
+
+
+code style
+----------
+
+  - **No unused imports, no dead code.** Run `ruff check .` before
+    pushing.
+  - **Type hints on new code.** mypy isn't enforced in CI yet, but
+    we keep the new code typed.
+  - **Tests for new code paths.** The repo has 200+ tests; they
+    run in parallel and finish in ~6 seconds. There's no excuse
+    not to add yours.
+  - **Comments on the *why*, not the *what*.** Identifiers carry
+    the what. Comments explain hidden constraints, gotchas, and
+    the reason behind non-obvious choices.
+
+
+reporting bugs
+--------------
+
+Open an issue with:
+
+  - the prompt
+  - the mesh file (or a link to one)
+  - the orchestrator log up to the failure (the
+    `[STAGE]`-prefixed lines from `uvicorn`)
+  - the final `AgentEvent` payload from the WebSocket
+
+For OpenFOAM-side bugs (solver crashes that the self-healing loop
+couldn't fix), include the full stderr — that's the same input the
+diagnoser sees, and humans can usually spot what it missed.
+
+
+license
+-------
+
+By contributing, you agree your contributions are licensed under
+Apache 2.0 (the same as the project). No CLA needed.
+
+
+code of conduct
+---------------
+
+Be kind. Disagree on ideas, not on people. We follow the
+[Contributor Covenant](https://www.contributor-covenant.org/) v2.1
+in spirit.

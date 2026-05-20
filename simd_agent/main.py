@@ -785,6 +785,61 @@ async def get_run_status(run_id: str) -> dict[str, Any]:
     }
 
 
+# ── Run summary — short JSON for the CLI (`simd ls`, end-of-run) ────────────
+@app.get("/api/runs/{run_id}/summary")
+async def get_run_summary(run_id: str, request: Request) -> dict[str, Any]:
+    """One-shot summary of a run.
+
+    Carries just enough for the CLI to render its final-stage block and for
+    `simd ls` to show a table — without the full event firehose.  All fields
+    are optional; any field the run hasn't reached yet returns ``None``.
+    """
+    try:
+        run_uuid = UUID(run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid run ID format")
+
+    store = EventStore()
+    run = await store.get_run(run_uuid)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    result_data: dict = {}
+    if run.result:
+        try:
+            result_data = json.loads(run.result) if isinstance(run.result, str) else run.result
+        except Exception:
+            pass
+
+    # Build the VTK URL only when the run actually has a sim_run_id — the
+    # CLI knows that absence means "no VTK output exists" (same convention
+    # as `/api/runs/{id}/vtk-results` returning 404).
+    base = str(request.base_url).rstrip("/")
+    sim_run_id = result_data.get("sim_run_id")
+    vtk_url = (
+        f"{base}/api/runs/{run_id}/vtk-results" if sim_run_id else None
+    )
+
+    started_at = run.started_at.isoformat() if run.started_at else None
+    completed_at = (
+        run.completed_at.isoformat() if getattr(run, "completed_at", None) else None
+    )
+
+    return {
+        "run_id":         run_id,
+        "status":         run.status.value,
+        "solver":         result_data.get("solver"),
+        "op":             getattr(run, "op", None) or result_data.get("op"),
+        "started_at":     started_at,
+        "completed_at":   completed_at,
+        "sim_run_id":     sim_run_id,
+        "vtk_url":        vtk_url,
+        "final_residuals": result_data.get("final_residuals"),
+        "iterations":     result_data.get("iterations"),
+        "error":          result_data.get("error"),
+    }
+
+
 @app.post("/api/runs/{run_id}/cancel")
 async def cancel_run(run_id: str) -> dict[str, Any]:
     """Explicitly cancel a run — marks it as CANCELLED in the DB.

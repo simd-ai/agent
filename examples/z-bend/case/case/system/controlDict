@@ -1,0 +1,95 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  v2312                                 |
+|   \\  /    A nd           | Web:      www.OpenFOAM.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     pimpleFoam;
+
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+endTime         4;
+deltaT          0.004;
+
+writeControl    adjustableRunTime;
+writeInterval   0.1;
+purgeWrite      0;
+
+writeFormat     ascii;
+writePrecision  6;
+writeCompression off;
+
+timeFormat      general;
+timePrecision   6;
+
+runTimeModifiable true;
+
+adjustTimeStep  yes;
+maxCo           2.0;
+maxDeltaT       0.1;
+
+
+// ************************************************************************* //
+
+functions
+{
+    vol_volAverage_p
+    {
+        type            volFieldValue;
+        libs            (fieldFunctionObjects);
+        fields          (p);
+        operation       volAverage;
+        regionType      all;
+        writeFields     false;
+        writeControl    runTime;
+        writeInterval   0.2;
+        log             true;
+    }
+    patchAvg_inlet
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        regionType      patch;
+        name            inlet;
+        fields          (p);
+        operation       areaAverage;
+        writeFields     false;
+        writeControl    runTime;
+        writeInterval   0.2;
+        log             true;
+    }
+    patchAvg_outlet
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        regionType      patch;
+        name            outlet;
+        fields          (p);
+        operation       areaAverage;
+        writeFields     false;
+        writeControl    runTime;
+        writeInterval   0.2;
+        log             true;
+    }
+    fieldMinMax
+    {
+        type            fieldMinMax;
+        libs            (fieldFunctionObjects);
+        fields          (U p k omega);
+        writeControl    runTime;
+        writeInterval   0.2;
+        log             true;
+    }
+}

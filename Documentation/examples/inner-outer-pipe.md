@@ -1,0 +1,148 @@
+example: inner-outer-pipe (2D regasifier)
+=========================================
+
+A 2D counter-flow conjugate heat transfer simulation of a
+Regascold-style tube-in-shell vaporizer. LN2 inside, water outside,
+stainless steel between. The detailed-spec twin of the
+`cylindrical-cht` example — same physics, different geometry
+(stacked 2D layers here, concentric tubes there).
+
+
+<img src="../images/inner-outer-pipe.png" width="700" alt="2D regasifier temperature field">
+
+
+what it teaches
+---------------
+
+  - how a **specification-grade prompt** (every dimension, every
+    BC, every material property) flows through the precheck and
+    region extractor — almost no inference needed, the LLM just
+    transcribes
+  - how the **per-region fluid preset inference** picks `ln2` for
+    the cold region and `water` for the warm region purely from
+    the prompt's named fluids
+  - how the **regasifier topology rule** stays out of the way
+    here (it only fires when the warm region defaults to `air`;
+    when the user names water explicitly, the per-region pass wins)
+  - how `convergence criterion 1e-5` is parsed into
+    `residualControl { p_rgh 1e-5; ... }` per fluid region
+  - how `writing every 50` becomes `writeControl runTime;
+    writeInterval 50;` in `controlDict`
+  - how adiabatic walls (`zeroGradient T`) on the pipe ends and
+    the outer shell coexist with the coupled-baffle BCs on the
+    `*_to_*` interfaces
+
+
+the prompt
+----------
+
+The full prompt is in `examples/inner-outer-pipe/prompt.txt`. The
+load-bearing clauses:
+
+  - solver:     `Use chtMultiRegionSimpleFoam.`
+  - geometry:   `1.0 m long`, three regions with y-extents
+  - innerFluid: `LN2`, T = 77 K, U = 0.05 m/s +x, **laminar**,
+                outlet at 1 bar
+  - wall:       `316L stainless steel`, k=16, rho=7900, Cp=500,
+                ends adiabatic
+  - outerFluid: `water`, T = 290 K, U = 0.10 m/s -x (counter-flow),
+                **laminar**, outlet at 1 bar, top adiabatic
+  - 2D:         `Front and back faces are empty`
+  - control:    `500 iterations`, `convergence criterion 1e-5`,
+                `writing every 50`
+
+
+what the agent does
+-------------------
+
+  1. **Precheck**: the boundary planner parses every patch BC
+     explicitly named in the prompt. Per-patch BCs stamped:
+       - innerFluid_inlet: T=77, U=(0.05,0,0), p=outlet
+       - innerFluid_outlet: p=101325 (fixedValue)
+       - innerFluid_symmetry: symmetry
+       - outerFluid_inlet: T=290, U=(-0.10,0,0), p=outlet
+       - outerFluid_outlet: p=101325 (fixedValue)
+       - outerFluid_top: T=zeroGradient (adiabatic)
+       - wall_left_end / wall_right_end: T=zeroGradient (adiabatic)
+
+  2. **Region detection**: cellZones from the mesh →
+     `innerFluid`, `wall`, `outerFluid`. Fluid/solid classification
+     by name (`wall` matches the solid keyword set).
+
+  3. **Region details (LLM)**: confirms `fluid_preset = "ln2"` for
+     innerFluid, `"water"` for outerFluid, `"stainless"` for wall.
+     Solid material properties from the prompt override the
+     `stainless` preset's defaults.
+
+  4. **Per-region fluid preset inference**: noop here — the
+     `RegionExtractor` already named the presets. The fallback
+     rules don't fire.
+
+  5. **Selects**: prompt says `Use chtMultiRegionSimpleFoam.`,
+     selector LLM is skipped.
+
+  6. **Generates the LLM file**: `system/controlDict` (the only
+     LLM-owned file for CHT cases — the orchestrator passes the
+     500 iterations, the 50 write interval, and the 1e-5
+     convergence into the prompt).
+
+  7. **Deterministic renderer** builds:
+       - `constant/regionProperties`
+       - `constant/{innerFluid,outerFluid,wall}/thermophysicalProperties`
+         (innerFluid uses LN2's `icoPolynomial` ρ(T) and Cp=2042;
+         wall uses the user-specified k=16, ρ=7900, Cp=500;
+         outerFluid uses water's `icoPolynomial` ρ(T) and Cp=4182)
+       - `constant/{innerFluid,outerFluid}/{turbulenceProperties,g}`
+         (turbulenceProperties says `laminar` — no k/omega files)
+       - `system/<region>/{fvSchemes,fvSolution,changeDictionaryDict}`
+       - `0/<region>/{T,U,p,p_rgh}` per fluid region with the
+         per-patch BCs from step 1, and the coupled-baffle BC on
+         `*_to_*` interfaces
+
+  8. **Submits**: sim-server runs `gmshToFoam → fix_boundary_types
+     → splitMeshRegions → fix_boundary_types per region → checkMesh
+     -allRegions → chtMultiRegionSimpleFoam`. Converges in
+     200–400 SIMPLE iterations.
+
+Typical runtime: 90 seconds codegen, 4–7 minutes solver.
+
+
+to reproduce
+------------
+
+    cd examples/inner-outer-pipe/case
+    chtMultiRegionSimpleFoam
+
+…or via the agent.
+
+
+what you should see
+-------------------
+
+A clear counter-flow temperature profile:
+
+  - **innerFluid (LN2 side):** enters at 77 K on the left, warms
+    progressively as it flows right, exits around 130–160 K
+    (still well below water's freezing point because the heat
+    transfer area is short and the LN2 mass flow rate is
+    significant).
+  - **outerFluid (water side):** enters at 290 K on the right,
+    cools as it flows left, exits around 250–270 K. Water has
+    higher volumetric heat capacity (4.17 MJ/m³·K vs LN2's
+    1.65) so its ΔT is smaller per unit length.
+  - **wall:** smooth temperature gradient across its 1.5 mm
+    thickness, ~80 K next to LN2, ~285 K next to water.
+
+Energy is conserved between the two streams. The adiabatic ends
+and outer shell ensure all heat exchanged passes through the
+wall, not out the boundaries.
+
+
+what's NOT modeled
+------------------
+
+Same caveat as cylindrical-cht: this is single-phase. LN2 above
+77 K should be vapor (GN2), and the latent heat of vaporization
+isn't captured. For a real Regascold sizing calculation you'd use
+`compressibleMultiphaseInterFoam` (experimental — see
+`solvers/multiphase.md`).

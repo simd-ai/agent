@@ -67,6 +67,24 @@ Bare-metal installation (Python venv, system OpenFOAM, external
 Postgres) is in Documentation/installation.md.
 
 
+CLI
+---
+
+A ``simd`` command-line client ships in this repo. Install it with
+``pip install -e .`` and run:
+
+    simd init                                # interactive setup
+    simd run examples/u-shape-pipe/prompt.txt \
+             examples/u-shape-pipe/mesh/u-shape-pipe.msh
+
+``simd init`` asks where each component should run (bundled docker,
+bare-metal local, or remote) and writes the config; ``simd run``
+auto-starts the backend when needed, then walks you through mesh
+upload, precheck, interactive patch review, and the five-stage
+progress display.  No login, no account, no tracking.  Same backend
+as the frontend.  Full reference: Documentation/cli.md.
+
+
 how it works
 ------------
 
@@ -90,10 +108,14 @@ its prompt, and the generated OpenFOAM case files — so you can run
 the simulation directly with OpenFOAM, or watch the agent regenerate
 it from the prompt.
 
-    examples/u-shape-pipe/        incompressible turbulent, kOmegaSST
-    examples/z-bend/              compressible with heat transfer
-    examples/inner-outer-pipe/    two-fluid heat exchanger (CHT)
-    examples/cylindrical-cht/     LN2 regasifier, concentric CHT
+    examples/u-shape-pipe/        compressible inverted-U duct,
+                                  rhoSimpleFoam + kOmegaSST
+    examples/z-bend/              transient turbulent water pipe,
+                                  pimpleFoam + kOmegaSST
+    examples/inner-outer-pipe/    2D LN2/water counter-flow
+                                  regasifier, chtMultiRegionSimpleFoam
+    examples/cylindrical-cht/     natural convection around a heated
+                                  cylinder, buoyantBoussinesqSimpleFoam
 
 Walk-throughs and screenshots in Documentation/examples/.
 

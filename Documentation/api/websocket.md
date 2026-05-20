@@ -1,0 +1,183 @@
+WebSocket protocol
+==================
+
+The agent has three WebSocket endpoints. All three speak the same
+JSON envelope on the server-to-client side.
+
+
+endpoints
+---------
+
+  - `WS /ws/run` — start a new run. Client sends one
+    `StartRequest`, server streams events until the run completes.
+  - `WS /ws/watch/{run_id}` — reconnect to an in-progress run after
+    a page reload. Replays missed events then streams live.
+  - `WS /ws/precheck` — streaming version of `POST /api/precheck`,
+    with thought tokens.
+  - `WS /ws/chat` — chat with the agent (post-run Q&A about a
+    simulation; uses tool-calling).
+
+
+/ws/run lifecycle
+-----------------
+
+  1. Client opens the WebSocket.
+  2. Client sends a `StartRequest` JSON:
+
+         {
+           "op": "CFD_CODEGEN_RUN",            // or "CFD_LINT"
+           "user_requirements": "<prompt>",
+           "config": { … SimulationConfigV1 … },
+           "mesh": { "mesh_id": "..." },
+           "constraints": {
+             "max_retries": 7,
+             "timeout_seconds": 600
+           },
+           "metadata": { ... }
+         }
+
+  3. Server streams `AgentEvent` frames (one per JSON message)
+     until the run reaches a terminal state.
+
+  4. Server closes with code `1000` on normal completion.
+
+Field shapes are pinned in `simd_agent/models.py`.
+
+
+AgentEvent envelope
+-------------------
+
+Every event is one JSON object:
+
+    {
+      "seq": 42,
+      "type": "file_generated",
+      "level": "info",            // "info" | "warn" | "error"
+      "ts": "2026-05-19T20:44:30.916Z",
+      "run_id": "df0df3cc-…",
+      "message": "Generated 0/innerFluid/T (922 chars)",
+      "payload": { … type-specific … }
+    }
+
+  - `seq` is a per-run monotonic counter. The
+    `/ws/watch/{run_id}?last_seq=N` endpoint uses it to resume.
+  - `type` is one of the `EventTypes` enum values
+    (`simd_agent/models.py`).
+  - `payload` carries the typed event data — schema depends on
+    `type`. See `events.md` for the catalogue.
+
+
+event types you'll see
+----------------------
+
+Roughly in the order they fire for a successful run:
+
+  | event                          | when                                  |
+  |--------------------------------|---------------------------------------|
+  | `run_started`                  | first event, includes run_id          |
+  | `lint_result`                  | physics + BC linting done             |
+  | `planning_complete`            | precheck → boundary plan ready        |
+  | `solver_selected`              | LLM picked an OpenFOAM solver         |
+  | `codegen_started`              | per-iteration codegen begins          |
+  | `file_generating`              | one per file, when LLM call starts    |
+  | `file_generated`               | one per file, with content + length   |
+  | `codegen_verification_started` | super-model verification begins       |
+  | `codegen_verification_complete`| pass/fail + issues list               |
+  | `codegen_iteration`            | summary of this iteration's files     |
+  | `codegen_complete`             | case ZIP built, ready to submit       |
+  | `sim_submitted`                | sim_run_id arrives from sim-server    |
+  | `sim_extract_started`          | sim-server unzipping the case         |
+  | `mesh_conversion_started`      | gmshToFoam running                    |
+  | `boundary_types_fixed`         | polyMesh patch-type coercion result   |
+  | `split_mesh_started/complete`  | multi-region splitMeshRegions         |
+  | `checkmesh_started/complete`   | mesh quality probe                    |
+  | `sim_run_started`              | OpenFOAM solver starts                |
+  | `sim_progress_batch`           | residuals batch (NDJSON)              |
+  | `sim_run_complete`             | solver finished cleanly               |
+  | `codegen_complete`             | post-processing zipped, ready to view |
+  | `final`                        | terminal event with run summary       |
+
+Self-healing path adds:
+
+  | event             | when                                    |
+  |-------------------|------------------------------------------|
+  | `sim_run_failed`  | sim-server reports an error             |
+  | `diagnosing`      | diagnoser LLM call starts               |
+  | `error_summary`   | diagnoser response, with affected_files |
+  | `retrying`        | "Retrying (N/M)" — orchestrator loops   |
+  | `sim_progress_reset` | clear stale residuals for the retry  |
+
+Stop / cancel path:
+
+  | event                | when                                |
+  |----------------------|--------------------------------------|
+  | `sim_run_stopping`   | stop accepted, runner unwinding      |
+  | `sim_run_stopped`    | runner wrote final time folder       |
+  | `run_stopped`        | DB updated, frontend can navigate    |
+
+
+message ordering
+----------------
+
+The agent guarantees:
+
+  - `seq` is strictly increasing per run.
+  - Events are sent in the order they happen on the server side.
+  - WebSocket framing preserves order on the client side.
+
+If `last_seq` arrives in `/ws/watch/{run_id}?last_seq=N`, the
+server replays events with `seq > N` from the DB before resuming
+live streaming. Lost events on reconnect are not possible — every
+event is persisted before being sent.
+
+
+client examples
+---------------
+
+JavaScript (frontend):
+
+    const ws = new WebSocket(
+      "ws://localhost:8000/ws/run",
+      // protocols: [] — none required
+    );
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        op: "CFD_CODEGEN_RUN",
+        user_requirements: "incompressible turbulent ...",
+        config: { ... },
+        constraints: { max_retries: 7 },
+      }));
+    };
+    ws.onmessage = (msg) => {
+      const event = JSON.parse(msg.data);
+      console.log(event.type, event.message);
+    };
+
+Python (testing):
+
+    import asyncio
+    import json
+    import websockets
+
+    async def run():
+        async with websockets.connect(
+            "ws://localhost:8000/ws/run"
+        ) as ws:
+            await ws.send(json.dumps({
+                "op": "CFD_LINT",
+                "config": { ... },
+            }))
+            async for raw in ws:
+                event = json.loads(raw)
+                print(event["type"], event["message"])
+
+    asyncio.run(run())
+
+
+heartbeats
+----------
+
+The server sends a heartbeat frame every `WS_HEARTBEAT_INTERVAL`
+seconds (default 30). Clients don't need to respond — the
+heartbeat exists to keep load balancers from closing the connection
+as idle. Set `WS_HEARTBEAT_INTERVAL=0` to disable.

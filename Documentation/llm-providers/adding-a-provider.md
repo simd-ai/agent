@@ -1,0 +1,187 @@
+adding an LLM provider
+======================
+
+Drop a directory into `simd_agent/llm/<name>/`. The registry finds
+it. No registry edits.
+
+
+the contract
+------------
+
+Your provider class subclasses `LLMProvider`
+(`simd_agent/llm/base.py`) and lives at
+`simd_agent/llm/<name>/provider.py`. The package's `__init__.py`
+exports a configured instance as `provider_plugin`.
+
+A minimal provider:
+
+    # simd_agent/llm/anthropic/provider.py
+    from __future__ import annotations
+
+    import types as _builtin_types
+    from typing import Any, AsyncIterator
+
+    from simd_agent.llm.base import LLMProvider
+
+
+    class AnthropicProvider(LLMProvider):
+        name = "anthropic"
+
+        def __init__(self) -> None:
+            self.models: dict[str, str] = {}
+            self._client = None
+            self._api_key: str | None = None
+
+        # ── lifecycle ───────────────────────────────────────
+        def configure(self, **kwargs: Any) -> None:
+            self._api_key = kwargs.get("api_key")
+            self._client = None
+            self.models = {
+                "default": kwargs.get("default_model",
+                                       "claude-haiku-4-5"),
+                "super":   kwargs.get("super_model",
+                                       "claude-opus-4-7"),
+            }
+
+        @property
+        def client(self):
+            if self._client is None:
+                if not self._api_key:
+                    raise ValueError(
+                        "Anthropic provider not configured — "
+                        "set ANTHROPIC_API_KEY in .env"
+                    )
+                from anthropic import AsyncAnthropic
+                self._client = AsyncAnthropic(api_key=self._api_key)
+            return self._client
+
+        @property
+        def types(self) -> _builtin_types.ModuleType:
+            # If your SDK has a types module, return it.
+            # Otherwise return a shim — see ollama for an example.
+            import anthropic
+            return anthropic
+
+        # ── generation ──────────────────────────────────────
+        async def generate(self, model, contents, *, config=None):
+            ...  # translate Gemini-shaped `contents`/`config`
+                 # into your SDK's call format, return a
+                 # response whose `.text` carries the model output
+
+        async def generate_stream(self, model, contents, *,
+                                  config=None):
+            ...  # yield provider-native chunk objects
+
+        # ── error classification ────────────────────────────
+        def is_retryable_error(self, exc: Exception) -> bool:
+            # 429 rate-limit, 529 overloaded — both worth retrying
+            msg = str(exc)
+            return "429" in msg or "529" in msg
+
+The `__init__.py`:
+
+    # simd_agent/llm/anthropic/__init__.py
+    from simd_agent.llm.anthropic.provider import AnthropicProvider
+    provider_plugin = AnthropicProvider()
+    __all__ = ["provider_plugin"]
+
+
+registry wiring
+---------------
+
+The registry (`simd_agent/llm/registry.py`) calls
+`configure_from_settings()` once at startup. Add a block for your
+provider:
+
+    anthropic = self._providers.get("anthropic")
+    if anthropic is not None and settings.anthropic_api_key:
+        anthropic.configure(
+            api_key=settings.anthropic_api_key,
+            default_model=settings.anthropic_model,
+            super_model=settings.anthropic_super_model,
+        )
+
+And the settings (`simd_agent/settings.py`):
+
+    anthropic_api_key: str | None = Field(
+        default=None,
+        description="Anthropic API key",
+    )
+    anthropic_model: str = Field(default="claude-haiku-4-5")
+    anthropic_super_model: str = Field(default="claude-opus-4-7")
+
+Set `DEFAULT_PROVIDER=anthropic` in `.env` to make it the active
+provider.
+
+
+the cross-provider translation problem
+--------------------------------------
+
+The codebase builds prompts using Gemini's `types` (Content, Part,
+GenerateContentConfig, Tool, ToolConfig, etc.). Your provider can
+either:
+
+  - **Pass-through** — if your SDK's call format is already
+    compatible (Vertex is, because it's the same SDK), return the
+    real types module from `types` and pass the config through.
+
+  - **Translate** — if not, return a *shim* types module with the
+    same constructor shapes, and translate inside `generate()`.
+    The Ollama provider does this (`simd_agent/llm/ollama/`):
+    `_translate.py` maps Gemini Content/Part to Ollama's
+    `{role, content}` message format, and a `_types_shim` module
+    re-exposes the Gemini-shaped constructors so chat-tools code
+    doesn't need to know which provider is active.
+
+Translation is more work, but it means everything downstream of
+`get_provider()` stays provider-agnostic.
+
+
+what call sites depend on
+-------------------------
+
+Most code reaches the LLM through `provider.generate(...)`. A few
+spots (chat tools, function calling) reach into the SDK directly:
+
+    provider.client.aio.models.generate_content(...)
+
+If your provider needs to support tool/function calling, expose a
+`client.aio.models` surface that mimics Gemini's. The Ollama
+provider's `_OllamaClientShim` shows the pattern.
+
+
+testing your provider
+---------------------
+
+A smoke test against the live provider:
+
+    python -c "
+    import asyncio
+    from simd_agent.llm import get_provider
+    p = get_provider('anthropic')
+    async def t():
+        r = await p.generate(
+            p.models['default'],
+            contents='Reply with one word.',
+        )
+        print(r.text)
+    asyncio.run(t())
+    "
+
+For automated tests, mock at the `LLMProvider` level. Tests in
+`tests/test_value_filler.py` and `tests/test_enrichment_pipeline.py`
+show the patching pattern.
+
+
+error retries
+-------------
+
+The agent retries on `is_retryable_error()`. Be specific:
+
+  - retry: rate limits (429, 529), transient server errors (503,
+    504), network blips (ConnectionError, timeouts).
+  - do NOT retry: auth errors (401, 403), bad requests (400), our
+    own validation failures.
+
+Returning `True` on a non-retryable error wastes the retry budget;
+returning `False` on a transient error makes the agent look fragile.

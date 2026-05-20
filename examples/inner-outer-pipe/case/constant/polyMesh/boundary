@@ -1,0 +1,88 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2406                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    arch        "LSB;label=32;scalar=64";
+    class       polyBoundaryMesh;
+    location    "constant/polyMesh";
+    object      boundary;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+10
+(
+    back
+    {
+        type            empty;
+        inGroups        1(empty);
+        nFaces          66000;
+        startFace       130934;
+    }
+    innerFluid_symmetry
+    {
+        type            symmetry;
+        inGroups        1(symmetry);
+        nFaces          1000;
+        startFace       196934;
+    }
+    innerFluid_outlet
+    {
+        type            patch;
+        nFaces          24;
+        startFace       197934;
+    }
+    innerFluid_inlet
+    {
+        type            patch;
+        nFaces          24;
+        startFace       197958;
+    }
+    front
+    {
+        type            empty;
+        inGroups        1(empty);
+        nFaces          66000;
+        startFace       197982;
+    }
+    wall_right_end
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          6;
+        startFace       263982;
+    }
+    wall_left_end
+    {
+        type            wall;
+        inGroups        1(wall);
+        nFaces          6;
+        startFace       263988;
+    }
+    outerFluid_inlet
+    {
+        type            patch;
+        nFaces          36;
+        startFace       263994;
+    }
+    outerFluid_top
+    {
+        type            patch;
+        nFaces          1000;
+        startFace       264030;
+    }
+    outerFluid_outlet
+    {
+        type            patch;
+        nFaces          36;
+        startFace       265030;
+    }
+)
+
+// ************************************************************************* //

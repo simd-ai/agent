@@ -1,0 +1,41 @@
+inner-outer-pipe (2D regasifier, tube-in-shell)
+===============================================
+
+Counter-flow conjugate heat transfer between a cold LN2 inner stream
+and a warm water outer stream, separated by a thin stainless wall.
+A 2D half-pipe representation of a Regascold-style tube-in-shell
+vaporizer.
+
+  - solver:     chtMultiRegionSimpleFoam
+  - turbulence: laminar
+  - regime:     steady, multi-region CHT, counter-flow
+  - regions:    innerFluid (LN2 77 K, 0.05 m/s +x),
+                outerFluid (water 290 K, 0.10 m/s -x),
+                wall (316L stainless, 1.5 mm thick, adiabatic ends)
+  - geometry:   1.0 m long, 5 mm LN2 + 1.5 mm wall + 6.5 mm water,
+                centerline symmetry on bottom, insulated top
+
+The prompt is deliberately verbose — it pins every dimension, every
+boundary, every material property, and the solver. A "specification-
+grade" prompt for a real engineering use case, as opposed to the
+terse z-bend prompt.
+
+See `Documentation/examples/inner-outer-pipe.md` for the walkthrough,
+including how the per-region preset inference and regasifier
+topology rule fire.
+
+
+reproduce with OpenFOAM directly
+--------------------------------
+
+    cd case && chtMultiRegionSimpleFoam
+
+
+reproduce via the agent
+-----------------------
+
+    simd run examples/inner-outer-pipe/prompt.txt \
+             examples/inner-outer-pipe/mesh/inner-outer-pipe.msh
+
+Or upload the mesh + paste the prompt in the frontend at
+http://localhost:3000 — same backend.

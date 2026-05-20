@@ -26,6 +26,7 @@ design
 reference
 ---------
 
+  - cli.md                  the `simd` CLI reference
   - api/rest.md             REST endpoints
   - api/websocket.md        WebSocket frames (/ws/run, /ws/precheck,
                             /ws/watch)

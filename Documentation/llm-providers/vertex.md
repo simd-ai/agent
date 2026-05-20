@@ -1,0 +1,127 @@
+vertex ai (gcp)
+===============
+
+Gemini through Google Cloud Vertex AI. Same models as the public
+provider, no daily request cap, authenticated with a service-
+account JSON.
+
+Use for: production, demos that need to survive a Gemini API
+outage, deployments where the AI Studio cap is too small.
+
+
+setup — service-account JSON only, no gcloud CLI
+-------------------------------------------------
+
+  1. In the GCP Console, create or pick a project.
+
+  2. Enable the Vertex AI API:
+     https://console.cloud.google.com/apis/library/aiplatform.googleapis.com
+     (the agent surfaces a clickable link in the error message when
+     this is missing).
+
+  3. IAM & Admin → Service Accounts → Create. Grant role
+     **Vertex AI User** (`roles/aiplatform.user`). One service
+     account works for both Vertex and GCS storage if you also
+     grant **Storage Object Admin** on your bucket.
+
+  4. Service account → Keys → Add Key → Create new (JSON).
+     Download the file. Treat it like a password.
+
+  5. In `.env`:
+
+         DEFAULT_PROVIDER=vertex
+         VERTEX_PROJECT=your-gcp-project-id
+         VERTEX_LOCATION=us-central1
+         GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/key.json
+
+  6. Restart the agent. First call logs:
+
+         [LLM/VERTEX] Injected GOOGLE_APPLICATION_CREDENTIALS=…
+
+
+getting your project ID
+-----------------------
+
+The GCP Console's project selector dropdown shows both the project
+name and the project ID. The ID is the one you want. Looks like
+`my-org-12345` or `auto-generated-name-481923`.
+
+There's no separate "Vertex project" — Vertex AI runs inside any
+GCP project that has the API enabled.
+
+
+picking a location
+------------------
+
+`us-central1` is the safe default. It has the broadest model
+availability and the fastest response from most of the world.
+
+Other regions worth knowing:
+
+  - `europe-west4` (Netherlands) — for EU data residency.
+  - `asia-southeast1` (Singapore), `asia-northeast1` (Tokyo) —
+    for APAC latency.
+  - `global` — auto-routes to the nearest region.
+
+Not every Gemini model is available in every region. Check
+https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
+if you hit `404 Publisher Model … not found`.
+
+
+model defaults
+--------------
+
+    VERTEX_MODEL=gemini-2.5-flash       # default codegen
+    VERTEX_SUPER_MODEL=gemini-2.5-pro   # solver selection,
+                                        # verification
+
+Override either in `.env`.
+
+
+how the credentials are loaded
+------------------------------
+
+`pydantic-settings` reads `.env` but doesn't export to `os.environ`.
+`google-genai` (via `google-auth`) only reads from `os.environ`. To
+bridge the gap, the Vertex provider exports
+`GOOGLE_APPLICATION_CREDENTIALS` itself on first use. Same pattern
+as the GCS storage backend (`simd_agent/storage/gcs.py`).
+
+If `GOOGLE_APPLICATION_CREDENTIALS` is already set in your
+process's environment (Docker secret mount, systemd `Environment=`,
+etc.), the provider leaves it alone.
+
+
+migration from gemini
+---------------------
+
+If you already have a working Gemini setup, the migration is two
+env vars:
+
+    DEFAULT_PROVIDER=vertex      # was: gemini
+    VERTEX_PROJECT=…             # new
+    VERTEX_LOCATION=us-central1  # new
+    GOOGLE_APPLICATION_CREDENTIALS=/…/key.json  # new
+    # GEMINI_API_KEY=...         # can stay, becomes inactive
+
+All call sites use `get_provider()` — no source code changes
+needed. Restart, watch the first codegen call go through Vertex.
+
+
+common errors and what they mean
+--------------------------------
+
+  - **`403 PERMISSION_DENIED — Vertex AI API has not been used in
+    project X`** — enable the API (step 2 above), wait 2–3 minutes.
+
+  - **`google.auth.exceptions.DefaultCredentialsError`** —
+    `GOOGLE_APPLICATION_CREDENTIALS` points at a missing or
+    unreadable JSON file. Check the path is absolute and the
+    process can read it.
+
+  - **`403 IAM permission denied`** — the service account is
+    missing `roles/aiplatform.user` on the project named in
+    `VERTEX_PROJECT`.
+
+  - **`404 Publisher Model …`** — the model isn't available in
+    your region. Change `VERTEX_MODEL` or `VERTEX_LOCATION`.

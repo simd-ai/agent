@@ -1,0 +1,75 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     rhoSimpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+endTime         3000;
+
+deltaT          1;
+
+writeControl    runTime;
+
+writeInterval   150;
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  6;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable true;
+
+functions
+{
+    vol_volAverage_p
+    {
+        type            volFieldValue;
+        libs            (fieldFunctionObjects);
+        fields          (p);
+        operation       volAverage;
+        regionType      all;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+    vol_volAverage_T
+    {
+        type            volFieldValue;
+        libs            (fieldFunctionObjects);
+        fields          (T);
+        operation       volAverage;
+        regionType      all;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+    fieldMinMax
+    {
+        type            fieldMinMax;
+        libs            (fieldFunctionObjects);
+        fields          (U p T k omega);
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+}

@@ -1,0 +1,226 @@
+self-healing
+============
+
+When OpenFOAM crashes, the agent diagnoses why and tries again. Up to
+seven attempts by default. Most cases either succeed on attempt 1 or
+succeed within three.
+
+
+the loop
+--------
+
+    ┌──────────────────────┐
+    │ codegen + validation │
+    └──────────┬───────────┘
+               │  case ZIP
+               ▼
+    ┌──────────────────────┐
+    │  submit to sim-server│
+    └──────────┬───────────┘
+               │  SSE events
+               ▼
+         ┌─────┴─────┐
+         │ success?  │
+         └──┬─────┬──┘
+            │ yes │ no
+            ▼     ▼
+        ┌──────┐ ┌──────────────┐
+        │ done │ │ diagnose with│
+        └──────┘ │ small LLM    │
+                 └──────┬───────┘
+                        │  affected_files, root_cause
+                        ▼
+                 ┌──────────────┐
+                 │ codegen mode │
+                 │   = "fix"    │
+                 └──────┬───────┘
+                        │  (regenerate only what changed)
+                        └────────────┐
+                                     │ up to max_retries times
+                                     ▼
+                              (back to top)
+
+The `max_retries` constraint comes from the `StartRequest` (default 7).
+The loop in `simd_agent/run/orchestration.py` increments `self._retries`
+each pass.
+
+
+what each step does
+-------------------
+
+  codegen + validation
+        The orchestrator builds a `CaseSpec` from the enriched config,
+        loads the matching solver plugin, and asks `GenAICodeGenerator`
+        to write every required file in parallel. The plugin's
+        `validate_full()` then runs deterministic Python checks against
+        the result (fixing what it can, surfacing the rest as issues).
+
+  submit to sim-server
+        The case is zipped and POSTed to the sim-server. The sim-server
+        runs `gmshToFoam`, fixes patch types in the polyMesh boundary
+        file, runs `splitMeshRegions` for CHT, decomposes for parallel,
+        and finally invokes the solver under a 20-second test budget.
+
+  diagnose
+        On failure, the orchestrator hands `stderr` to a smaller
+        Gemini model (`gemini-2.5-flash`). The diagnoser returns a
+        JSON-ish blob:
+
+            ROOT_CAUSE: <one-line natural language summary>
+            AFFECTED_FILES: <comma-separated paths>
+            FIX_1: <description of the fix>
+            CONFIDENCE: <0.0 – 1.0>
+
+  codegen mode = "fix"
+        The orchestrator parses `AFFECTED_FILES` and asks
+        `GenAICodeGenerator` to regenerate ONLY those files. Files the
+        deterministic renderer owns (per-region 0/* in CHT, etc.) are
+        skipped — fixing them is the validator's job, not the LLM's.
+        The orchestrator then re-runs validation against the freshly
+        merged file set.
+
+  re-submit
+        New ZIP, same sim-server. The cycle repeats.
+
+
+a real walkthrough — LN2 regasifier
+-----------------------------------
+
+We ran a cylindrical CHT case: LN2 (77 K) inside a stainless tube,
+water (290 K) outside. Two-fluid + one-solid topology.
+
+**Attempt 1 — solver crash at iteration 2.**
+
+    FOAM FATAL ERROR: Negative initial temperature T0: -117.455
+      in species::thermo<hConstThermo<perfectGas>, sensibleEnthalpy>::T
+
+    iter=2  exit_code=-6 (SIGABRT)
+
+The solver ran two SIMPLE iterations, then aborted in the enthalpy-
+to-temperature inverter. The first iteration's pressure correction
+swung enthalpy below the bracket the inverter can solve.
+
+**Diagnose.**
+
+    ROOT_CAUSE: The OpenFOAM solver chtMultiRegionSimpleFoam aborts
+      because the initial temperature T0 for one of the fluid regions
+      is calculated to be a negative value (-117.455 K)…
+    AFFECTED_FILES: 0/innerFluid/T, 0/outerFluid/T
+    CONFIDENCE: 1.00
+
+**Attempt 2 — mode=fix.**
+
+The orchestrator logs:
+
+    [PARALLEL] Skipping LLM regen for deterministic files:
+      ['0/innerFluid/T', '0/outerFluid/T']
+    [PARALLEL] Deterministic files are the primary error targets but
+      are built by the plugin validator, not the LLM. Regenerating
+      ALL LLM-owned files to give the validator fresh input.
+
+So the LLM regenerates `system/controlDict` (the only LLM-owned
+file for CHT cases). Importantly, between attempt 1 and attempt 2
+**mesh quality data is now cached on the sim-server**. The CaseSpec
+builder reads it:
+
+    [MESH_QUALITY] Raw metrics: non_ortho=0.0, skew=1.11e-12,
+                                aspect=29.9
+    [MESH_QUALITY] Decision: tier='good' → GAMG=YES, SIMPLEC=YES,
+                                           nNonOrthoCorr=0
+
+That flips three pressure-velocity-coupling knobs:
+
+  - **SIMPLEC instead of SIMPLE** — much stronger under-relaxation
+    on the pressure correction.
+  - **GAMG for `p_rgh`** — faster, smoother convergence than
+    PBiCGStab+DILU at startup.
+  - **`nNonOrthogonalCorrectors=0`** — mesh is orthogonal,
+    correctors aren't needed.
+
+**Submit again. Solver runs to completion.** The agent fetches the
+VTPs, streams them to the frontend, and the user sees the temperature
+field render.
+
+Net: one failure, one diagnose pass, one regeneration with better
+numerical settings, success. From the user's point of view this looks
+like a small "retrying… (1/7)" status flicker followed by a normal
+run.
+
+
+what makes diagnosis work
+-------------------------
+
+  - **A small, fast model for the diagnoser.** `gemini-2.5-flash`,
+    not the same model that did codegen. The diagnoser's job is
+    pattern-matching ("negative T0 → check internalField on T
+    fields"), which a smaller model does fine, faster, and cheaper.
+
+  - **The stderr is the signal.** OpenFOAM aborts loudly. The
+    fatal-error format is regular enough that the diagnoser almost
+    always finds a usable root cause — even when its
+    `AFFECTED_FILES` is wrong, the root cause text is right.
+
+  - **Failure paths are deterministic.** When the diagnoser names
+    files that the LLM doesn't own (per-region 0/* in CHT), the
+    orchestrator falls back to "regenerate everything LLM-owned"
+    so the validator gets a fresh pass.
+
+  - **Mesh-quality and similar runtime info accumulates.** Each
+    attempt the sim-server learns more about the case
+    (`checkMesh` output, the polyMesh boundary file). The
+    orchestrator reads that on the next attempt's CaseSpec build,
+    so attempt N has strictly more information than attempt N-1.
+
+
+what stops the loop
+-------------------
+
+  - **success** — solver reached its end time / converged.
+  - **`max_retries` exhausted** — final status is `failed`, the
+    last stderr + diagnose result is surfaced to the user.
+  - **non-recoverable error** — schema validation failure,
+    submission timeout, mesh format unsupported. These short-
+    circuit immediately.
+  - **user stop** — the frontend hit `/api/runs/{id}/stop`. The
+    orchestrator unwinds, marks the run `stopped`, and reverts
+    the UI to the previously-selected run.
+
+
+what you'll see in the logs
+---------------------------
+
+The orchestrator prefixes every line:
+
+    [ORCHESTRATOR]    high-level state changes
+    [CODEGEN]         per-file generation activity
+    [VALIDATE]        deterministic validator output, auto-fixes
+    [SIM_SERVER]      SSE relay from the runner
+    [SIM_ERROR]       a solver failure event
+    [DIAGNOSE]        the diagnoser's response
+    [PARALLEL]        the parallel codegen loop
+    [MESH_QUALITY]    the cached mesh metrics being read
+
+A successful run shows roughly:
+
+    ORCHESTRATOR start →
+      CODEGEN iter 1 → VALIDATE iter 1 → SIM_SERVER run started →
+      SIM_SERVER run complete → VTK fetched → done
+
+A self-healed run shows:
+
+    ORCHESTRATOR start →
+      CODEGEN iter 1 → SIM_ERROR (attempt 1/7) →
+      DIAGNOSE → CODEGEN iter 2 (mode=fix) → SIM_SERVER run
+      complete → VTK fetched → done
+
+
+tuning
+------
+
+The retry count is per-request, not global:
+
+    StartRequest.constraints.max_retries = 7
+
+Lower it for impatient demos (`= 1`), raise for hard cases (`= 15`).
+The diagnoser model is configured by the active LLM provider — see
+`llm-providers/`.

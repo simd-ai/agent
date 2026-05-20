@@ -1,0 +1,1 @@
+i want water flowing at 2.3 m/s, transient turbulent flow for 4 seconds, turbulence model k-omega SST

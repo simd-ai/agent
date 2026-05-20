@@ -1,0 +1,114 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     rhoSimpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+endTime         1000;
+
+deltaT          1;
+
+writeControl    runTime;
+
+writeInterval   50;
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  6;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable true;
+
+functions
+{
+    vol_volAverage_p
+    {
+        type            volFieldValue;
+        libs            (fieldFunctionObjects);
+        fields          (p);
+        operation       volAverage;
+        regionType      all;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+    vol_volAverage_T
+    {
+        type            volFieldValue;
+        libs            (fieldFunctionObjects);
+        fields          (T);
+        operation       volAverage;
+        regionType      all;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+    patchAvg_inlet_main
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        regionType      patch;
+        name            inlet_main;
+        fields          (p T);
+        operation       areaAverage;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+    patchAvg_inlet_small
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        regionType      patch;
+        name            inlet_small;
+        fields          (p T);
+        operation       areaAverage;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+    patchAvg_outlet
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        regionType      patch;
+        name            outlet;
+        fields          (p T);
+        operation       areaAverage;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+    fieldMinMax
+    {
+        type            fieldMinMax;
+        libs            (fieldFunctionObjects);
+        fields          (U p T k omega);
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+}

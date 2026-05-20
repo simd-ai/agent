@@ -1,0 +1,103 @@
+solvers
+=======
+
+The agent ships with plugin packages for the OpenFOAM solvers most
+people actually use. Each plugin is a self-contained directory under
+`simd_agent/solvers/<name>/` — the registry auto-discovers them.
+
+
+what's supported
+----------------
+
+  | category        | solver                               | doc                  |
+  |-----------------|--------------------------------------|----------------------|
+  | incompressible  | simpleFoam, pimpleFoam, icoFoam      | single-region.md     |
+  | compressible    | rhoSimpleFoam, rhoPimpleFoam         | single-region.md     |
+  | buoyant         | buoyantSimpleFoam, buoyantPimpleFoam | single-region.md     |
+  | Boussinesq      | buoyantBoussinesqSimpleFoam,         | single-region.md     |
+  |                 | buoyantBoussinesqPimpleFoam          |                      |
+  | conjugate HT    | chtMultiRegionSimpleFoam,            | multi-region-cht.md  |
+  |                 | chtMultiRegionFoam                   |                      |
+  | multiphase      | compressibleInterFoam,               | multiphase.md        |
+  | (experimental)  | compressibleInterIsoFoam,            |                      |
+  |                 | compressibleMultiphaseInterFoam,     |                      |
+  |                 | interFoam, interIsoFoam              |                      |
+
+
+how the agent picks one
+-----------------------
+
+The `SolverSelector` (`simd_agent/run/solver_selector.py`) builds a
+roster from the registry and asks the LLM to pick. The LLM gets:
+
+  - the user's natural-language prompt
+  - the physics block (flow regime, compressibility, heat transfer,
+    multiphase flag, gravity)
+  - the mesh shape (single-region vs multi-region)
+  - a structured list of every solver's capabilities
+
+It returns `{solver, confidence, reason, flags, warnings}`. The
+orchestrator stores the result for inspection.
+
+There's a deterministic safety net: when the mesh has multiple
+cellZones (CHT topology), the orchestrator forces a chtMultiRegion
+variant regardless of what the LLM says. The time scheme picks
+between Simple and PIMPLE.
+
+
+how plugins fit together
+------------------------
+
+  simd_agent/solvers/
+    base.py                 # SolverPlugin abstract base + helpers
+    registry.py             # auto-discovery + classification queries
+    families/               # shared bases for solver families:
+      _multi_region.py      #   chtMultiRegion* + RegionSpec presets
+      _multi_region_bcs.py  #   per-region BC builders
+    simpleFoam/             # one self-contained directory per solver:
+      __init__.py           #     exports `solver_plugin = ...()`
+      solver.py             #     class attributes + matches() +
+                            #     required_files() + validate()
+      prompts/              #     per-file prompt docs
+        _solver.md
+        system/{controlDict,fvSchemes,fvSolution}.md
+        constant/{transportProperties,turbulenceProperties}.md
+        fields/{U,p,k,omega,...}.md
+    pimpleFoam/
+    rhoSimpleFoam/
+    rhoPimpleFoam/
+    buoyantSimpleFoam/
+    chtMultiRegionSimpleFoam/
+    chtMultiRegionFoam/
+    ...
+
+Dropping a new directory in is the entire onboarding for a new
+solver. See `adding-a-solver.md`.
+
+
+what each plugin owns
+---------------------
+
+  - **identity** — `name`, `algorithm`, `pressure_field`,
+    `is_transient`, `is_compressible`, `supports_energy`,
+    `needs_gravity`, `is_multiphase`. Class attributes; the
+    registry uses these for classification queries
+    (`p_solvers()`, `energy_solvers()`, etc.).
+
+  - **selection scoring** — `matches(config) → MatchResult`. The
+    selector uses this when the LLM is unavailable, and to filter
+    the LLM's candidate roster.
+
+  - **the file manifest** — `required_files(config) → list[str]`.
+    Exact paths the LLM must produce. For multi-region solvers
+    this is just `["system/controlDict"]` — the rest is rendered
+    deterministically.
+
+  - **per-file prompts** — `prompt_for_file(path)` reads from
+    `prompts/<system|constant|fields>/<X>.md`. Keeps the LLM's
+    context tight, one file at a time.
+
+  - **validation** — `validate(files, config) → ValidationResult`.
+    Solver-specific deterministic checks and auto-fixes. Universal
+    helpers live on the base class
+    (`_fix_controldict_solver`, `_fix_constraint_patch_bcs`, etc.).

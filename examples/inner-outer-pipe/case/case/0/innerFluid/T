@@ -1,0 +1,40 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    location    "0/innerFluid";
+    object      T;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+dimensions      [0 0 0 1 0 0 0];
+internalField   uniform 77.0;
+
+boundaryField
+{
+    innerFluid_symmetry
+    {
+        type            symmetry;
+    }
+    innerFluid_outlet
+    {
+        type            inletOutlet;
+        inletValue      uniform 77.0;
+        value           uniform 77.0;
+    }
+    innerFluid_inlet
+    {
+        type            fixedValue;
+        value           uniform 77.0;
+    }
+    innerFluid_to_wall
+    {
+        type            compressible::turbulentTemperatureCoupledBaffleMixed;
+        Tnbr            T;
+        kappaMethod     fluidThermo;
+        value           uniform 77.0;
+    }
+}
+
+// ************************************************************************* //

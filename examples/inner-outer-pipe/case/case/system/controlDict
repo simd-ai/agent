@@ -1,0 +1,146 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "system";
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     chtMultiRegionSimpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+endTime         500;
+
+deltaT          1.0;
+
+writeControl    runTime;
+
+writeInterval   25;
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  6;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable true;
+
+functions
+{
+    volAvg_T_innerFluid
+    {
+        type            volFieldValue;
+        libs            (fieldFunctionObjects);
+        region          innerFluid;
+        fields          (T);
+        operation       volAverage;
+        regionType      all;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+
+    patchAvg_innerFluid_outlet
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        region          innerFluid;
+        regionType      patch;
+        name            innerFluid_outlet;
+        fields          (T U p);
+        operation       areaAverage;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+
+    patchAvg_innerFluid_inlet
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        region          innerFluid;
+        regionType      patch;
+        name            innerFluid_inlet;
+        fields          (T U p);
+        operation       areaAverage;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+
+    volAvg_T_outerFluid
+    {
+        type            volFieldValue;
+        libs            (fieldFunctionObjects);
+        region          outerFluid;
+        fields          (T);
+        operation       volAverage;
+        regionType      all;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+
+    patchAvg_outerFluid_inlet
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        region          outerFluid;
+        regionType      patch;
+        name            outerFluid_inlet;
+        fields          (T U p);
+        operation       areaAverage;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+
+    patchAvg_outerFluid_outlet
+    {
+        type            surfaceFieldValue;
+        libs            (fieldFunctionObjects);
+        region          outerFluid;
+        regionType      patch;
+        name            outerFluid_outlet;
+        fields          (T U p);
+        operation       areaAverage;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+
+    volAvg_T_wall
+    {
+        type            volFieldValue;
+        libs            (fieldFunctionObjects);
+        region          wall;
+        fields          (T);
+        operation       volAverage;
+        regionType      all;
+        writeFields     false;
+        writeControl    timeStep;
+        writeInterval   1;
+        log             true;
+    }
+}
+
+// ************************************************************************* //

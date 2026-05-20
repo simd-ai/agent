@@ -1,0 +1,62 @@
+gemini (google ai studio)
+=========================
+
+The default provider. Public API, single API key, generous free
+tier, hard daily request cap.
+
+Use for: development, demos, small-volume production where the
+daily cap is comfortable.
+
+Switch to Vertex AI (`vertex.md`) when the cap starts biting.
+
+
+setup
+-----
+
+  1. Get an API key at https://aistudio.google.com/apikey.
+
+  2. In `.env`:
+
+         DEFAULT_PROVIDER=gemini
+         GEMINI_API_KEY=AIza…
+
+  3. (Optional) Override model selection:
+
+         GEMINI_MODEL=gemini-3-flash-preview          # default codegen
+         GEMINI_SUPER_MODEL=gemini-3.1-pro-preview    # solver selection
+                                                     # + code verification
+
+  4. Restart the agent.
+
+
+how the agent uses it
+---------------------
+
+Three call sites:
+
+  - **codegen** — `GEMINI_MODEL` (flash). One call per file, in
+    parallel.
+  - **solver selection + super-model verification** —
+    `GEMINI_SUPER_MODEL` (pro). One call per run, sometimes two.
+  - **failure diagnosis** — `gemini-2.5-flash`. Hardcoded to a
+    small model so retries are cheap.
+
+
+what happens at the cap
+-----------------------
+
+When you hit the daily cap, the agent's per-file codegen calls
+fail with `429 RESOURCE_EXHAUSTED`. Self-healing retries make this
+worse — each retry is 5–15 fresh API calls.
+
+The provider's `is_retryable_error()` recognises 429 and 503, so
+the agent retries with exponential backoff. But if you're truly
+out of quota for the day, backoff just delays the same failure.
+
+Signs you're hitting the cap:
+
+  - "Please retry in Xh Ym" in the diagnoser stderr.
+  - Runs that succeeded yesterday failing today at the same step.
+  - A single demo working but the second one in a row failing.
+
+The fix is to switch to Vertex AI — same models, no daily cap.

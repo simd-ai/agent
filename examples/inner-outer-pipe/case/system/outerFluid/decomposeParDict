@@ -1,0 +1,12 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    location    "system/outerFluid";
+    object      decomposeParDict;
+}
+
+numberOfSubdomains  12;
+
+method              scotch;

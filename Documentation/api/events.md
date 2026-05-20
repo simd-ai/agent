@@ -1,0 +1,228 @@
+AgentEvent reference
+====================
+
+Every server-to-client message on the run WebSockets is an
+`AgentEvent`. The envelope is documented in `websocket.md`. This
+document enumerates the `type` values and the shape of each
+`payload`.
+
+The authoritative definitions live in `simd_agent/models.py`. When
+the source disagrees with this doc, the source wins.
+
+
+envelope reminder
+-----------------
+
+    {
+      "seq":     <int>,                 // per-run monotonic
+      "type":    "<event_type>",        // see below
+      "level":   "info" | "warn" | "error",
+      "ts":      "<ISO-8601>",
+      "run_id":  "<uuid>",
+      "message": "<human-readable>",
+      "payload": { … }
+    }
+
+
+lifecycle
+---------
+
+  **`run_started`**
+      First event for any run.
+      payload: `{ run_id, op, started_at }`
+
+  **`final`**
+      Terminal event for any run.
+      payload: `{ status, run_id, result, error? }`
+      `status` is one of `succeeded`, `failed`, `stopped`,
+      `cancelled`.
+
+
+linting and precheck
+--------------------
+
+  **`lint_result`**
+      Output of `CFDLinter.lint()`.
+      payload: `LintResultPayload` (see `models.py`). Carries
+      `issues` (list of warnings/errors), `regime` (laminar /
+      transitional / turbulent), `reynolds_number`.
+
+  **`planning_complete`**
+      The precheck pipeline finished. Carries the suggested
+      per-patch boundary plan.
+      payload: `PlanningCompletePayload`.
+
+  **`solver_selected`**
+      LLM solver-selector decision.
+      payload: `{ solver, confidence, reason, flags, warnings,
+                  deterministic_files: [...] }`
+
+
+codegen
+-------
+
+  **`codegen_started`**
+      One per iteration. `mode` is `"full"` (first attempt) or
+      `"fix"` (retry).
+      payload: `{ iteration, mode, patching_files,
+                  affected_files }`
+
+  **`file_generating`**
+      LLM call for one file started.
+      payload: `{ path, iteration, mode, status: "generating" }`
+
+  **`file_generated`**
+      One file's content arrived.
+      payload: `{ path, content, iteration, char_count, mode,
+                  status: "generated" }`
+
+  **`codegen_verification_started`**
+      Super-model verification pass starting.
+      payload: `{ iteration, file_count }`
+
+  **`codegen_verification_complete`**
+      Verification done.
+      payload: `{ iteration, passed, summary, issues: [...] }`
+
+  **`codegen_iteration`**
+      End-of-iteration summary.
+      payload: `{ iteration, mode, patching_files, affected_files,
+                  files: [...] }`
+
+  **`codegen_complete`**
+      Final iteration's case is ready, ZIPped, uploaded to
+      storage.
+      payload: `{ iteration, case_zip_size }`
+
+
+simulation server events
+------------------------
+
+Each event below corresponds to an SSE event the sim-server pushed
+to the agent. The agent re-emits them with the same name.
+
+  **`sim_submitted`**
+      The run was POSTed to the sim-server and accepted.
+      payload: `{ sim_run_id, mode, events_url }`
+
+  **`sim_extract_started` / `sim_extract_complete`**
+      Sim-server unzipping the case bundle.
+      payload (complete): `{ case_dir, solver, mesh_source }`
+
+  **`mesh_conversion_started` / `mesh_conversion_complete`**
+      `gmshToFoam` running.
+      payload (complete): `{ success, exit_code, had_warnings,
+                              stdout, stderr }`
+
+  **`boundary_types_fixed`**
+      polyMesh patch-type coercion done. Single-region:
+      `{ patches_fixed }`. Multi-region: `{ patches_fixed,
+      by_region: {...}, multi_region: true }`.
+
+  **`split_mesh_started` / `split_mesh_complete`**
+      Multi-region only. `splitMeshRegions`.
+      payload (complete): `{ regions: [...], stdout, stderr }`
+
+  **`checkmesh_started` / `checkmesh_complete`**
+      Advisory mesh-quality probe.
+      payload (complete): `{ success, exit_code, stdout, stderr }`
+
+  **`sim_run_started`**
+      OpenFOAM solver launched.
+      payload: `{ solver, mode, n_cores, simulation_type,
+                  turbulence_model }`
+
+  **`run_progress_batch`**
+      Batched residuals + KPIs. `items` is a list of
+      NDJSON-shaped progress entries.
+      payload: `{ items: [...] }`
+
+  **`sim_run_complete`**
+      Solver finished cleanly.
+      payload: `{ exit_code, iterations_observed, final_time }`
+
+  **`sim_run_failed`**
+      Solver crashed or test budget exceeded.
+      payload: `{ sim_run_id, error, exit_code,
+                  iterations_observed?, stderr? }`
+
+
+self-healing
+------------
+
+  **`diagnosing`**
+      Diagnoser LLM call started.
+      payload: `{}`
+
+  **`thinking_started` / `thinking_complete`**
+      Generic "LLM is thinking" indicator with a label.
+      payload: `{ label }`
+
+  **`error_summary`**
+      Diagnoser response.
+      payload: `{ root_cause, actionable_changes: [...],
+                  affected_files: [...] }`
+
+  **`retrying`**
+      Retry budget consumed; another iteration starts.
+      payload: `{ attempt, max_retries }`
+
+  **`sim_progress_reset`**
+      Clears stale residual data on the frontend before the
+      retry's solver run starts.
+      payload: `{ attempt }`
+
+
+stop / cancel
+-------------
+
+  **`sim_run_stopping`**
+      User-requested stop accepted, sim-server unwinding.
+      payload: `{}`
+
+  **`sim_run_stopped`**
+      Sim-server wrote the final time folder.
+      payload: `{ has_checkpoint, latest_time }`
+
+  **`run_stopped`**
+      DB updated, run is now in terminal `stopped` state.
+      payload: `{}`
+
+
+post-processing
+---------------
+
+  **`vtk_started`**
+      `foamToVTK` running on the sim-server.
+      payload: `{}`
+
+  **`vtk_complete`**
+      VTPs ready in storage.
+      payload: `{ time, fields, regions? }`
+
+  **`isPostProcessing`** (deprecated; rolled into the above)
+
+
+chat
+----
+
+  **`chat_message`**
+      Chat turn from agent (post-run Q&A).
+      payload: `{ role, content, tool_calls? }`
+
+  **`chat_tool_result`**
+      A tool the chat agent called returned.
+      payload: `{ tool_name, result }`
+
+
+how to add an event type
+------------------------
+
+  1. Add the literal value to `EventTypes` in `models.py`.
+  2. Add a Pydantic payload model alongside the other
+     `*Payload` classes if the payload has structure.
+  3. Emit via `EventBus.emit(type, message, payload=...)` from
+     wherever in the orchestrator / runner it makes sense.
+  4. Document it here.
+  5. Handle it on the frontend (`useSimulation.ts` switch
+     statement).

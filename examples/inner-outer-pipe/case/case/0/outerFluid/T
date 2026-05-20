@@ -1,0 +1,40 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    location    "0/outerFluid";
+    object      T;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+dimensions      [0 0 0 1 0 0 0];
+internalField   uniform 290.0;
+
+boundaryField
+{
+    outerFluid_inlet
+    {
+        type            fixedValue;
+        value           uniform 290.0;
+    }
+    outerFluid_top
+    {
+        type            zeroGradient;
+    }
+    outerFluid_outlet
+    {
+        type            inletOutlet;
+        inletValue      uniform 290.0;
+        value           uniform 290.0;
+    }
+    outerFluid_to_wall
+    {
+        type            compressible::turbulentTemperatureCoupledBaffleMixed;
+        Tnbr            T;
+        kappaMethod     fluidThermo;
+        value           uniform 290.0;
+    }
+}
+
+// ************************************************************************* //
