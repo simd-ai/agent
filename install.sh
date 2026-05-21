@@ -318,7 +318,7 @@ esac
 # ══════════════════════════════════════════════════════════════
 header "simulation runner"
 
-echo "  the OpenFOAM runner is a separate service (simd-ai/simulation_server)."
+echo "  the OpenFOAM runner is a separate service (simd-ai/runner)."
 echo "  enter the URL where it's reachable from here."
 echo
 ask "simulation runner URL" "${PREV_SIM_SERVER_URL:-http://localhost:9000}" SIM_SERVER_URL
@@ -658,7 +658,6 @@ else
     # → http://localhost:9000
 
     # terminal 3 — frontend UI (separate repo, optional)
-    # skip if you'll drive the agent via HTTP / WebSocket directly.
     git clone https://github.com/simd-ai/ui ../ui
     cd ../ui
     npm install

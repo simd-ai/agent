@@ -60,9 +60,9 @@ Quick start
 The agent is one of three components — the other two live in their own
 repos:
 
-  - **simd-ai/agent** (this repo) — the FastAPI orchestrator
-  - **simd-ai/simulation_server** — the OpenFOAM runner (separate process)
-  - **simd-ai/ui** — the Next.js frontend (optional, drive the agent via HTTP/WS otherwise)
+  - **simd-ai/agent** (this repo) — the orchestrator
+  - **simd-ai/runner** — the OpenFOAM runner (separate process)
+  - **simd-ai/ui** — the Next.js frontend (drive the agent)
 
 You'll need:
 
@@ -97,7 +97,7 @@ Installs only the agent in a local Python venv.  The wizard prints the
 want a UI) frontend:
 
     # OpenFOAM runner — clone & start separately
-    git clone https://github.com/simd-ai/simulation_server
+    git clone https://github.com/simd-ai/runner
     cd simulation_server && ./run.sh
     # (or point ``SIMULATION_SERVER_URL`` at a remote one)
 
@@ -119,6 +119,10 @@ post-processed VTK back through a WebSocket. When the solver fails,
 the agent diagnoses the error with a smaller LLM call and retries
 with focused fixes — up to seven attempts by default. This is the
 self-healing loop.
+
+<p align="center">
+  <img src="Documentation/images/agent-loop.gif" width="720" alt="end-to-end run — codegen, residuals, post-processed flow fields">
+</p>
 
 See Documentation/architecture for the full design,
 Documentation/self-healing for a walkthrough of one real failure.
