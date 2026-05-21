@@ -643,15 +643,27 @@ else
   header "setup complete"
   cat <<EOF
 
-  start the agent in this terminal (or with nohup / systemd):
+  three terminals — the agent, the OpenFOAM runner, the frontend.
 
+    # terminal 1 — agent (this repo)
     cd $AGENT_DIR
     source .venv/bin/activate
     uvicorn simd_agent.main:app --port 8000
+    # → http://localhost:8000
 
-  the agent listens on http://localhost:8000.  drive it via the
-  HTTP / WebSocket API (see Documentation/api/) or run the frontend
-  separately on http://localhost:3000.
+    # terminal 2 — OpenFOAM runner (separate repo)
+    # skip this if SIMULATION_SERVER_URL points at a remote runner.
+    git clone https://github.com/simd-ai/runner ../runner
+    cd ../runner && ./run.sh
+    # → http://localhost:9000
+
+    # terminal 3 — frontend UI (separate repo, optional)
+    # skip if you'll drive the agent via HTTP / WebSocket directly.
+    git clone https://github.com/simd-ai/ui ../ui
+    cd ../ui
+    npm install
+    NEXT_PUBLIC_AGENT_URL=http://localhost:8000 npm run dev
+    # → http://localhost:3000
 
   to deactivate the venv when you're done:
     deactivate

@@ -57,34 +57,56 @@ See [Documentation/solvers](Documentation/solvers) for the full list of supporte
 Quick start
 -----------
 
+The agent is one of three components — the other two live in their own
+repos:
+
+  - **simd-ai/agent** (this repo) — the FastAPI orchestrator
+  - **simd-ai/simulation_server** — the OpenFOAM runner (separate process)
+  - **simd-ai/ui** — the Next.js frontend (optional, drive the agent via HTTP/WS otherwise)
+
 You'll need:
 
-  - Docker + Docker Compose
+  - Docker + Docker Compose, **or** Python 3.11+ for bare-metal mode
   - One LLM credential: a Gemini API key, OR a Vertex AI service-account
     JSON, OR a local Ollama install
 
-The compose stack ships OpenFOAM v2406, Postgres, the agent, and the
-frontend — nothing else to install.
+Clone and run the installer:
 
     git clone https://github.com/simd-ai/agent
     cd agent
     ./install.sh
 
-``install.sh`` is an interactive wizard.  Pick **Docker mode** to
-run everything in containers (postgres + agent come up via
-``docker compose``), or **bare-metal mode** to use a Python venv
-on this machine.  Either way it asks for your LLM key, the
-simulation runner URL, and where to store results — then writes
-``.env``.  In Docker mode the stack starts automatically; in
-bare-metal mode the wizard prints the ``uvicorn`` command to run.
+``install.sh`` is an interactive wizard that writes ``.env`` and either
+brings up the stack (Docker mode) or sets up a venv (bare-metal mode).
 
 <p align="center">
   <img src="Documentation/images/install-wizard.png" width="640" alt="install.sh wizard — deployment mode, LLM provider, simulation runner, object storage, authentication, database, .env write, bare-metal setup">
 </p>
 
-Once the agent is up at ``http://localhost:8000``, drive it through
-the WebSocket / HTTP API (see ``Documentation/api/``) or run the
-frontend at ``http://localhost:3000``.
+### Docker mode
+
+Brings up agent + postgres + frontend + OpenFOAM runner from a single
+``docker compose`` file.  Once the wizard finishes, the agent is at
+``http://localhost:8000`` and the frontend at ``http://localhost:3000``.
+Everything stops with ``docker compose down``.
+
+### Bare-metal mode
+
+Installs only the agent in a local Python venv.  The wizard prints the
+``uvicorn`` command at the end.  You bring your own runner and (if you
+want a UI) frontend:
+
+    # OpenFOAM runner — clone & start separately
+    git clone https://github.com/simd-ai/simulation_server
+    cd simulation_server && ./run.sh
+    # (or point ``SIMULATION_SERVER_URL`` at a remote one)
+
+    # Frontend — clone & start separately (optional)
+    git clone https://github.com/simd-ai/ui
+    cd ui && npm install && npm run dev
+
+Or skip the UI entirely and drive the agent through the WebSocket /
+HTTP API at ``http://localhost:8000`` (see ``Documentation/api/``).
 
 
 How it works
