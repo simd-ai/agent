@@ -271,26 +271,51 @@ if [ "$DEPLOY_MODE" = "docker" ]; then
     else
       fail "install Docker, then re-run ./install.sh"
     fi
-  elif ! docker info >/dev/null 2>&1; then
-    err "Docker is installed but the daemon isn't running."
-    if [ "$(uname)" = "Linux" ]; then
-      echo "    start it with:  sudo systemctl start docker"
-      echo "    then re-run this installer."
-    elif [ "$(uname)" = "Darwin" ]; then
-      echo "    start Docker Desktop (open -a Docker), wait ~30s, re-run."
-    fi
-    echo
-    arrow_choice "what now?" \
-      "Switch to bare-metal mode and continue" \
-      "Quit so I can start Docker, then re-run"
-    if [ "$_ARROW_INDEX" -eq 0 ]; then
-      DEPLOY_MODE="bare-metal"
-      ok "switched to bare-metal mode"
-    else
-      fail "start Docker daemon, then re-run ./install.sh"
-    fi
   else
-    ok "Docker is available"
+    # ``docker info`` returns non-zero for two distinct reasons:
+    #   1) daemon isn't running
+    #   2) daemon IS running but the current user isn't in the ``docker``
+    #      group → permission denied on /var/run/docker.sock
+    # We have to read stderr to tell them apart so we give the right
+    # remediation instead of the generic "start the daemon" advice.
+    DOCKER_ERR=$(docker info 2>&1 >/dev/null || true)
+    if [ -z "$DOCKER_ERR" ]; then
+      ok "Docker is available"
+    elif echo "$DOCKER_ERR" | grep -qi "permission denied"; then
+      err "Docker daemon is running, but $USER can't talk to it."
+      echo "    add yourself to the docker group:"
+      echo "        sudo usermod -aG docker \$USER"
+      echo "        newgrp docker"
+      echo "    then re-run this installer (no sudo needed)."
+      echo
+      arrow_choice "what now?" \
+        "Switch to bare-metal mode and continue" \
+        "Quit so I can fix permissions, then re-run"
+      if [ "$_ARROW_INDEX" -eq 0 ]; then
+        DEPLOY_MODE="bare-metal"
+        ok "switched to bare-metal mode"
+      else
+        fail "fix docker group membership, then re-run ./install.sh"
+      fi
+    else
+      err "Docker is installed but the daemon isn't running."
+      if [ "$(uname)" = "Linux" ]; then
+        echo "    start it with:  sudo systemctl start docker"
+        echo "    then re-run this installer."
+      elif [ "$(uname)" = "Darwin" ]; then
+        echo "    start Docker Desktop (open -a Docker), wait ~30s, re-run."
+      fi
+      echo
+      arrow_choice "what now?" \
+        "Switch to bare-metal mode and continue" \
+        "Quit so I can start Docker, then re-run"
+      if [ "$_ARROW_INDEX" -eq 0 ]; then
+        DEPLOY_MODE="bare-metal"
+        ok "switched to bare-metal mode"
+      else
+        fail "start Docker daemon, then re-run ./install.sh"
+      fi
+    fi
   fi
 fi
 
