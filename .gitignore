@@ -11,5 +11,7 @@ skills-lock.json
 *-service-account.json
 test_meshes/
 test_mesh/
-CLAUDE.md
+CLAUDE.md 
+.claude/
+.gitignore
 tmp/
