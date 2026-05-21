@@ -137,7 +137,7 @@ The exclusion is critical. Without it, the renderer would coerce
 innerFluid_to_wall to wall and OpenFOAM would crash with
 "Type should be a mappedPatch".
 
-See simd-ai/simd-agent-simulation:app/runner.py:fix_boundary_types.
+See simd-ai/runner:app/runner.py:fix_boundary_types.
 
 
 fvSchemes

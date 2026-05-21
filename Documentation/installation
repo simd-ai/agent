@@ -13,9 +13,9 @@ what you'll be installing
 Three processes, side by side:
 
   - agent — this repo. FastAPI service on port 8000.
-  - frontend — simd-ai/simd-agent-ui. Next.js dev server on
+  - frontend — simd-ai/ui. Next.js dev server on
     port 3000.
-  - sim-server — simd-ai/simd-agent-simulation. OpenFOAM
+  - sim-server — simd-ai/runner. OpenFOAM
     runner on port 9000.
 
 And two backing stores:
@@ -98,7 +98,7 @@ in a Linux container, ports to localhost:
     docker run -d --name simd-runner \
       -p 9000:9000 \
       -v simd-runs:/tmp/simd-runs \
-      ghcr.io/simd-ai/agent-runner:latest
+      ghcr.io/simd-ai/runner:latest
 
 Then in the agent's .env:
 
@@ -107,8 +107,8 @@ Then in the agent's .env:
 Option B — bare-metal Linux. Install OpenFOAM v2406 from the
 ESI distribution, then:
 
-    git clone https://github.com/simd-ai/simd-agent-simulation
-    cd simd-agent-simulation
+    git clone https://github.com/simd-ai/runner
+    cd runner
     python -m venv .venv && source .venv/bin/activate
     pip install -r requirements.txt
     uvicorn app.main:app --port 9000
@@ -122,8 +122,8 @@ container image ships all of these.
 3. frontend
 -----------
 
-    git clone https://github.com/simd-ai/simd-agent-ui
-    cd simd-agent-ui
+    git clone https://github.com/simd-ai/ui
+    cd ui
     npm install
 
 Configure .env.local:
@@ -258,7 +258,7 @@ The suite runs in parallel by default (xdist, 30 workers). Use
 
 The sim-server has its own suite:
 
-    cd ../simd-agent-simulation
+    cd ../runner
     pytest -v
 
 The frontend has no automated tests today.

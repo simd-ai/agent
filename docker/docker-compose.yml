@@ -13,9 +13,9 @@
 # Images are pulled from GitHub Container Registry. To build from
 # source instead (for development), uncomment the `build:` blocks
 # and comment out the `image:` lines. See:
-#   - simd-ai/simd-agent       (this repo, the agent)
-#   - simd-ai/simd-agent-ui    (Next.js frontend)
-#   - simd-ai/simd-agent-simulation  (OpenFOAM runner)
+#   - simd-ai/agent   (this repo, the agent)
+#   - simd-ai/ui      (Next.js frontend)
+#   - simd-ai/runner  (OpenFOAM runner)
 # ══════════════════════════════════════════════════════════════
 
 services:
@@ -72,11 +72,11 @@ services:
 
   # ── Frontend (Next.js) ───────────────────────────────────────
   frontend:
-    image: ghcr.io/simd-ai/agent-ui:latest
-    # To build from source, clone simd-ai/simd-agent-ui beside this
+    image: ghcr.io/simd-ai/ui:latest
+    # To build from source, clone simd-ai/ui beside this
     # repo and uncomment the build block:
     # build:
-    #   context: ../../simd-agent-ui
+    #   context: ../../ui
     env_file: ../.env
     environment:
       # The frontend keeps its own DATABASE_URL because Drizzle still
@@ -95,11 +95,11 @@ services:
 
   # ── OpenFOAM Runner ──────────────────────────────────────────
   runner:
-    image: ghcr.io/simd-ai/agent-runner:latest
-    # To build from source, clone simd-ai/simd-agent-simulation
+    image: ghcr.io/simd-ai/runner:latest
+    # To build from source, clone simd-ai/runner
     # beside this repo and uncomment the build block:
     # build:
-    #   context: ../../simd-agent-simulation
+    #   context: ../../runner
     volumes:
       - runner-data:/tmp/simd-runs
     ports:

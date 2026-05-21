@@ -9,7 +9,7 @@ the picture
 -----------
 
               ┌──────────────┐
-   user  ──→  │   frontend   │   (Next.js, simd-ai/simd-agent-ui)
+   user  ──→  │   frontend   │   (Next.js, simd-ai/ui)
               └──────┬───────┘
                      │ WebSocket  /ws/run, /ws/precheck, /ws/watch
                      ▼
@@ -22,7 +22,7 @@ the picture
                      ▼
               ┌──────────────┐
               │  sim-server  │   (OpenFOAM v2406,
-              │              │    simd-ai/simd-agent-simulation)
+              │              │    simd-ai/runner)
               └──────┬───────┘
                      │
         ┌────────────┴────────────┐

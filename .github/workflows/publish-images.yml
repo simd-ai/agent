@@ -6,9 +6,9 @@
 #   - tag v*.*.*        → ghcr.io/simd-ai/agent:vX.Y.Z + :latest
 #
 # This workflow only builds the agent image. The frontend and
-# sim-server images are built by their own repos:
-#   - simd-ai/simd-agent-ui          → ghcr.io/simd-ai/agent-ui
-#   - simd-ai/simd-agent-simulation  → ghcr.io/simd-ai/agent-runner
+# runner images are built by their own repos:
+#   - simd-ai/ui      → ghcr.io/simd-ai/ui
+#   - simd-ai/runner  → ghcr.io/simd-ai/runner
 #
 # To push to GHCR the workflow needs write access on packages.
 # Grant it once in Settings → Actions → General → Workflow
