@@ -16,23 +16,16 @@ AI-native physics simulation agent.
 🎯 What it does
 ---------------
 
-Takes a **natural-language description of the physical phenomena you want
-to understand** — flow regime, heat transfer, buoyancy, pressure drop,
-mixing, conjugate heat transfer through solids — together with a
-**mesh of the physical domain** you care about.
-
-From those two inputs the agent picks the governing equations and
-turbulence model that fit, configures the discretization schemes,
-linear-solver settings, thermophysical and material properties, and
-boundary conditions, submits the case to an OpenFOAM solver, streams
-residuals and post-processed flow fields back as the run converges,
-and self-heals on solver failure.
-
-The intent is **design-decision support**. Questions that usually take a
-CFD specialist a week to set up — "does this U-bend overheat at the
-500 K inlet?", "what's the pressure drop through the regasifier?", "is
-natural convection enough or do I need a forced inlet?" — become a
-paragraph of intent plus a geometry.
+Describe the physics you want to understand — flow, heat transfer,
+buoyancy, pressure drop, mixing — together with a mesh of the physical
+domain, and the agent picks the governing equations and turbulence
+model, configures discretization schemes, properties, and boundary
+conditions, submits the case to an OpenFOAM solver, streams residuals
+and flow fields back, and self-heals on solver failure. The result:
+**design-decision support** — questions that usually take a CFD
+specialist a week ("does this U-bend overheat at 500 K?", "what's the
+pressure drop through the regasifier?") become a paragraph of intent
+plus a geometry.
 
 ✨ Features
 -----------
@@ -62,7 +55,7 @@ See [Documentation/solvers](Documentation/solvers) for the full list of supporte
 
 
 <p align="center">
-  <img src="Documentation/images/agent-loop.gif" width="720" alt="end-to-end run — codegen, residuals, post-processed flow fields">
+  <img src="Documentation/images/agent-loop.gif" width="100%" alt="end-to-end run — codegen, residuals, post-processed flow fields">
 </p>
 
 
@@ -139,7 +132,7 @@ HTTP API at ``http://localhost:8000`` (see ``Documentation/api/``).
 
 A FastAPI service orchestrates per-file OpenFOAM codegen with an LLM,
 validates the output with deterministic plugin-side rules, ships the
-case to a sim-server running OpenFOAM, and streams residuals and
+case to a service running OpenFOAM, and streams residuals and
 post-processed VTK back through a WebSocket. When the solver fails,
 the agent diagnoses the error with a smaller LLM call and retries
 with focused fixes — up to seven attempts by default. This is the
