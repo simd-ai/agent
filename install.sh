@@ -253,6 +253,47 @@ case "$_ARROW_INDEX" in
   1) DEPLOY_MODE="bare-metal" ; ok "bare-metal deployment selected" ;;
 esac
 
+# ── pre-flight: check Docker availability before the wizard ─────
+# If the user picked Docker mode but Docker isn't usable, we'd rather
+# tell them now (and offer to switch to bare-metal) than after they
+# fill out 6 wizard screens and write ``.env``.
+if [ "$DEPLOY_MODE" = "docker" ]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    err "Docker isn't installed on this machine."
+    echo "    install: https://docs.docker.com/engine/install/"
+    echo
+    arrow_choice "what now?" \
+      "Switch to bare-metal mode and continue" \
+      "Quit and install Docker first"
+    if [ "$_ARROW_INDEX" -eq 0 ]; then
+      DEPLOY_MODE="bare-metal"
+      ok "switched to bare-metal mode"
+    else
+      fail "install Docker, then re-run ./install.sh"
+    fi
+  elif ! docker info >/dev/null 2>&1; then
+    err "Docker is installed but the daemon isn't running."
+    if [ "$(uname)" = "Linux" ]; then
+      echo "    start it with:  sudo systemctl start docker"
+      echo "    then re-run this installer."
+    elif [ "$(uname)" = "Darwin" ]; then
+      echo "    start Docker Desktop (open -a Docker), wait ~30s, re-run."
+    fi
+    echo
+    arrow_choice "what now?" \
+      "Switch to bare-metal mode and continue" \
+      "Quit so I can start Docker, then re-run"
+    if [ "$_ARROW_INDEX" -eq 0 ]; then
+      DEPLOY_MODE="bare-metal"
+      ok "switched to bare-metal mode"
+    else
+      fail "start Docker daemon, then re-run ./install.sh"
+    fi
+  else
+    ok "Docker is available"
+  fi
+fi
+
 
 # ══════════════════════════════════════════════════════════════
 # 3. LLM provider

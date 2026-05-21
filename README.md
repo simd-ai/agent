@@ -175,9 +175,3 @@ See CONTRIBUTING. New solver plugins drop into
 `simd_agent/solvers/<name>/` and are auto-discovered; new LLM
 providers drop into `simd_agent/llm/<name>/`. No registry edits
 needed.
-
-
-📜 License
-----------
-
-AGPL v3 — see LICENSE.
