@@ -13,8 +13,8 @@ AI-native physics simulation agent.
 </div>
 
 
-What it does
-------------
+🎯 What it does
+---------------
 
 Takes a **natural-language description of the physical phenomena you want
 to understand** — flow regime, heat transfer, buoyancy, pressure drop,
@@ -34,28 +34,62 @@ CFD specialist a week to set up — "does this U-bend overheat at the
 natural convection enough or do I need a forced inlet?" — become a
 paragraph of intent plus a geometry.
 
-### Physics
-
-| Capability | Status |
-|---|---|
-| [Compressible & incompressible flow](Documentation/solvers/single-region) | stable |
-| Laminar & turbulent regimes (k-ε, k-ω SST, k-ω, Spalart-Allmaras) | stable |
-| [Conjugate heat transfer (solid-fluid)](Documentation/solvers/multi-region-cht) | stable |
-| [Multiphase flows](Documentation/solvers/multiphase) | experimental |
+<table>
+  <thead>
+    <tr>
+      <th></th>
+      <th>Capability</th>
+      <th>Details</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td rowspan="4"><b>Physics</b></td>
+      <td><a href="Documentation/solvers/single-region">Compressible &amp; incompressible flow</a></td>
+      <td>stable</td>
+    </tr>
+    <tr>
+      <td>Laminar &amp; turbulent regimes</td>
+      <td>k-ε, k-ω SST, k-ω, Spalart-Allmaras</td>
+    </tr>
+    <tr>
+      <td><a href="Documentation/solvers/multi-region-cht">Conjugate heat transfer (solid-fluid)</a></td>
+      <td>stable</td>
+    </tr>
+    <tr>
+      <td><a href="Documentation/solvers/multiphase">Multiphase flows</a></td>
+      <td>experimental</td>
+    </tr>
+    <tr>
+      <td rowspan="3"><b>Infrastructure</b></td>
+      <td>LLM provider</td>
+      <td>
+        <a href="Documentation/llm-providers/gemini">Gemini</a> ·
+        <a href="Documentation/llm-providers/vertex">Vertex AI</a> ·
+        <a href="Documentation/llm-providers/ollama">Ollama</a> (local)
+      </td>
+    </tr>
+    <tr>
+      <td>Object storage</td>
+      <td>local filesystem · Google Cloud Storage</td>
+    </tr>
+    <tr>
+      <td>Authentication</td>
+      <td>Neon Auth · open (no auth)</td>
+    </tr>
+  </tbody>
+</table>
 
 See [Documentation/solvers](Documentation/solvers) for the full list of supported solvers.
 
-### Infrastructure
 
-| Integration | Options |
-|---|---|
-| LLM provider | [Gemini](Documentation/llm-providers/gemini) · [Vertex AI](Documentation/llm-providers/vertex) · [Ollama](Documentation/llm-providers/ollama) (local) |
-| Object storage | local filesystem · Google Cloud Storage |
-| Authentication | Neon Auth · open (no auth) |
+<p align="center">
+  <img src="Documentation/images/agent-loop.gif" width="720" alt="end-to-end run — codegen, residuals, post-processed flow fields">
+</p>
 
 
-Quick start
------------
+🚀 Quick start
+--------------
 
 The agent is one of three components — the other two live in their own
 repos:
@@ -79,18 +113,29 @@ Clone and run the installer:
 ``install.sh`` is an interactive wizard that writes ``.env`` and either
 brings up the stack (Docker mode) or sets up a venv (bare-metal mode).
 
+<details>
+<summary><b>Preview the install wizard</b></summary>
+
 <p align="center">
   <img src="Documentation/images/install-wizard.png" width="640" alt="install.sh wizard — deployment mode, LLM provider, simulation runner, object storage, authentication, database, .env write, bare-metal setup">
 </p>
 
-### Docker mode
+</details>
+
+<details>
+<summary><b>Docker mode</b></summary>
+<br>
 
 Brings up agent + postgres + frontend + OpenFOAM runner from a single
 ``docker compose`` file.  Once the wizard finishes, the agent is at
 ``http://localhost:8000`` and the frontend at ``http://localhost:3000``.
 Everything stops with ``docker compose down``.
 
-### Bare-metal mode
+</details>
+
+<details>
+<summary><b>Bare-metal mode</b></summary>
+<br>
 
 Installs only the agent in a local Python venv.  The wizard prints the
 ``uvicorn`` command at the end.  You bring your own runner and (if you
@@ -98,7 +143,7 @@ want a UI) frontend:
 
     # OpenFOAM runner — clone & start separately
     git clone https://github.com/simd-ai/runner
-    cd simulation_server && ./run.sh
+    cd runner && ./run.sh
     # (or point ``SIMULATION_SERVER_URL`` at a remote one)
 
     # Frontend — clone & start separately (optional)
@@ -108,9 +153,11 @@ want a UI) frontend:
 Or skip the UI entirely and drive the agent through the WebSocket /
 HTTP API at ``http://localhost:8000`` (see ``Documentation/api/``).
 
+</details>
 
-How it works
-------------
+
+⚙️ How it works
+---------------
 
 A FastAPI service orchestrates per-file OpenFOAM codegen with an LLM,
 validates the output with deterministic plugin-side rules, ships the
@@ -120,16 +167,12 @@ the agent diagnoses the error with a smaller LLM call and retries
 with focused fixes — up to seven attempts by default. This is the
 self-healing loop.
 
-<p align="center">
-  <img src="Documentation/images/agent-loop.gif" width="720" alt="end-to-end run — codegen, residuals, post-processed flow fields">
-</p>
-
 See Documentation/architecture for the full design,
 Documentation/self-healing for a walkthrough of one real failure.
 
 
-Examples
---------
+🧪 Examples
+-----------
 
 Four end-to-end cases ship under `examples/`. Each carries its mesh,
 its prompt, and the generated OpenFOAM case files — so you can run
@@ -144,8 +187,8 @@ it from the prompt.
 | [cylindrical-cht](Documentation/examples/cylindrical-cht) | natural convection around a heated cylinder | buoyantBoussinesqSimpleFoam |
 
 
-Contributing
-------------
+🤝 Contributing
+---------------
 
 See CONTRIBUTING. New solver plugins drop into
 `simd_agent/solvers/<name>/` and are auto-discovered; new LLM
@@ -153,7 +196,7 @@ providers drop into `simd_agent/llm/<name>/`. No registry edits
 needed.
 
 
-License
--------
+📜 License
+----------
 
 AGPL v3 — see LICENSE.
