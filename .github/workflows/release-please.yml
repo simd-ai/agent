@@ -1,0 +1,39 @@
+# ══════════════════════════════════════════════════════════════
+# release-please — automated semantic versioning
+# ══════════════════════════════════════════════════════════════
+# Every push to main:
+#   1. Scans commits since the last release.
+#   2. If any follow Conventional Commits ("feat:", "fix:",
+#      "BREAKING CHANGE:") → opens / updates a release PR with:
+#        - bumped version in pyproject.toml
+#        - auto-generated CHANGELOG.md
+#   3. When YOU merge that PR → release-please cuts the git tag and
+#      creates the GitHub Release.
+#   4. The tag triggers publish-images.yml → ghcr.io/simd-ai/agent:vX.Y.Z.
+#
+# Required GitHub settings (one-time):
+#   Settings → Actions → General → Workflow permissions →
+#     • "Read and write permissions"
+#     • "Allow GitHub Actions to create and approve pull requests"
+# ══════════════════════════════════════════════════════════════
+
+name: release-please
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          release-type: python
+          package-name: simd-agent
+          bump-minor-pre-major: true
+          bump-patch-for-minor-pre-major: true

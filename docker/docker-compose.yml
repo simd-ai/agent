@@ -72,18 +72,17 @@ services:
 
   # ── Frontend (Next.js) ───────────────────────────────────────
   frontend:
+    # Auto-built by simd-ai/ui's GHA workflow on every push to main.
+    # 355 MB standalone image; defaults to local mode (no Stripe / no
+    # auth / no email).  Cloud deployments override at runtime.
     image: ghcr.io/simd-ai/ui:latest
-    # To build from source, clone simd-ai/ui beside this
-    # repo and uncomment the build block:
+    # To build locally from a sibling clone instead, comment the image
+    # line above and uncomment this block:
     # build:
     #   context: ../../ui
-    env_file: ../.env
+    #   dockerfile: Dockerfile
     environment:
-      # The frontend keeps its own DATABASE_URL because Drizzle still
-      # speaks Postgres directly.  When the backend is on SQLite, the
-      # frontend can't share that DB — run the frontend separately
-      # against a Postgres instance, or skip starting it.
-      DATABASE_URL: ${DATABASE_URL:-postgresql://simd:simd@postgres:5432/simd}
+      NEXT_PUBLIC_MODE: ${NEXT_PUBLIC_MODE:-local}
       NEXT_PUBLIC_AGENT_URL: http://localhost:8000
       NEXT_PUBLIC_AGENT_WS_URL: ws://localhost:8000
       NEXT_PUBLIC_AUTH_DISABLED: "true"
