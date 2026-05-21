@@ -159,6 +159,13 @@ it from the prompt.
 | [cylindrical-cht](Documentation/examples/cylindrical-cht) | natural convection around a heated cylinder | buoyantBoussinesqSimpleFoam |
 
 
+🗺 Roadmap
+----------
+
+See [ROADMAP](ROADMAP) for what's next and what's in the idea bin.
+Tracking happens in GitHub Issues.
+
+
 🤝 Contributing
 ---------------
 

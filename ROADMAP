@@ -1,0 +1,44 @@
+roadmap
+=======
+
+A few honest notes about where simd-agent is going. Plans change as we
+learn from real users and contributors — direction, not contract.
+
+Day-to-day work tracking is on GitHub Milestones; for ideas open an
+issue with the "roadmap" label.
+
+
+soon
+----
+
+  - CLI client — `simd run` for humans, end-to-end from a terminal.
+  - Broader self-healing — diagnoser reads step-by-step OpenFOAM logs.
+  - More turbulence models — SA-DES, k-ω SST low-Re, transition.
+  - Multiphase out of experimental — promote interFoam family.
+  - Pre-built simulation templates — pipe, mixing tee, heat exchanger.
+
+
+later
+-----
+
+  - Headless SDK — Python / TS bindings for batch sims and CI/CD.
+  - Benchmarks suite — reference cases with agent-vs-specialist setup time.
+  - Digital-twin streaming — live sensor feed as a prediction surface.
+  - More LLM providers — Claude, OpenAI, local Llama.
+  - Web-based mesh editor — parametric, in-browser.
+
+
+maybe
+-----
+
+  - RL over the run loop — supplements rule-driven self-healing.
+  - Optimisation loop — DoE / gradient-free over geometry.
+  - Surrogate models — trained on high-fidelity simulation data.
+
+
+how to influence the roadmap
+----------------------------
+
+  - Open a GitHub issue with the "roadmap" label.
+  - Build it and open a PR — we prioritise aligned work.
+  - Sponsor specific items if you want them pulled forward.
