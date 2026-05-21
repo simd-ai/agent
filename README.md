@@ -34,51 +34,29 @@ CFD specialist a week to set up — "does this U-bend overheat at the
 natural convection enough or do I need a forced inlet?" — become a
 paragraph of intent plus a geometry.
 
-<table>
-  <thead>
-    <tr>
-      <th></th>
-      <th>Capability</th>
-      <th>Details</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td rowspan="4"><b>Physics</b></td>
-      <td><a href="Documentation/solvers/single-region">Compressible &amp; incompressible flow</a></td>
-      <td>stable</td>
-    </tr>
-    <tr>
-      <td>Laminar &amp; turbulent regimes</td>
-      <td>k-ε, k-ω SST, k-ω, Spalart-Allmaras</td>
-    </tr>
-    <tr>
-      <td><a href="Documentation/solvers/multi-region-cht">Conjugate heat transfer (solid-fluid)</a></td>
-      <td>stable</td>
-    </tr>
-    <tr>
-      <td><a href="Documentation/solvers/multiphase">Multiphase flows</a></td>
-      <td>experimental</td>
-    </tr>
-    <tr>
-      <td rowspan="3"><b>Infrastructure</b></td>
-      <td>LLM provider</td>
-      <td>
-        <a href="Documentation/llm-providers/gemini">Gemini</a> ·
-        <a href="Documentation/llm-providers/vertex">Vertex AI</a> ·
-        <a href="Documentation/llm-providers/ollama">Ollama</a> (local)
-      </td>
-    </tr>
-    <tr>
-      <td>Object storage</td>
-      <td>local filesystem · Google Cloud Storage</td>
-    </tr>
-    <tr>
-      <td>Authentication</td>
-      <td>Neon Auth · open (no auth)</td>
-    </tr>
-  </tbody>
-</table>
+✨ Features
+-----------
+
+  - 🌊 **Natural-language input** — describe the physics you want to understand in plain English
+  - 🧭 **Auto solver selection** — picks the right OpenFOAM solver from your prompt + mesh
+  - 🩹 **Self-healing loop** — diagnoses solver failures and retries with focused fixes
+  - 📡 **Live streaming** — residuals and 3D fields delivered live over WebSocket
+  - 🧠 **Multi-LLM** — Gemini, Vertex AI, or local Ollama
+  - 🔓 **Open source** — AGPL v3, run anywhere
+
+
+🛠 Capabilities
+---------------
+
+| Feature                          | Description                                            |
+|----------------------------------|--------------------------------------------------------|
+| Compressible & incompressible    | [simpleFoam family + rhoSimple variants](Documentation/solvers/single-region) |
+| Turbulence regimes               | k-ε, k-ω SST, k-ω, Spalart-Allmaras                    |
+| Conjugate heat transfer          | [solid-fluid coupling (chtMultiRegion)](Documentation/solvers/multi-region-cht) |
+| Multiphase flows                 | [VOF (experimental — interFoam family)](Documentation/solvers/multiphase) |
+| LLM providers                    | [Gemini](Documentation/llm-providers/gemini) · [Vertex AI](Documentation/llm-providers/vertex) · [Ollama](Documentation/llm-providers/ollama) (local) |
+| Object storage                   | local filesystem · Google Cloud Storage                |
+| Authentication                   | Neon Auth · open (no auth)                             |
 
 See [Documentation/solvers](Documentation/solvers) for the full list of supported solvers.
 
