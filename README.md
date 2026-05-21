@@ -9,6 +9,7 @@ AI-native physics simulation agent.
 [![License](https://img.shields.io/github/license/simd-ai/agent)](LICENSE)
 [![Language](https://img.shields.io/github/languages/top/simd-ai/agent)](https://github.com/simd-ai/agent)
 [![Commit activity](https://img.shields.io/github/commit-activity/m/simd-ai/agent)](https://github.com/simd-ai/agent/commits/main)
+[![Follow SIMD](https://img.shields.io/badge/Follow-SIMD-1DA1F2?style=flat&logo=x&logoColor=white)](https://x.com/simdcompute)
 
 </div>
 
