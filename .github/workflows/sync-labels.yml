@@ -1,0 +1,31 @@
+# ══════════════════════════════════════════════════════════════
+# sync-labels — keep GitHub labels in sync with .github/labels.yml
+# ══════════════════════════════════════════════════════════════
+# Triggers on any push to main that touches the labels manifest.
+# Adds new labels, updates colors/descriptions of existing ones,
+# leaves any other labels alone (set ``delete-other-labels: true``
+# below if you want this file to be the only source of truth).
+
+name: sync-labels
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/labels.yml"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EndBug/label-sync@v2
+        with:
+          config-file: .github/labels.yml
+          # If true, deletes any label NOT in labels.yml.  Off by default
+          # so manual labels added via the UI survive.
+          delete-other-labels: false

@@ -13,6 +13,7 @@ AI-native physics simulation agent.
 
 </div>
 
+![](Documentation/images/divider.png)
 
 🎯 What it does
 ---------------
@@ -59,6 +60,7 @@ See [Documentation/solvers](Documentation/solvers) for the full list of supporte
   <img src="Documentation/images/agent-loop.gif" width="100%" alt="end-to-end run — codegen, residuals, post-processed flow fields">
 </p>
 
+![](Documentation/images/divider.png)
 
 🚀 Quick start
 --------------

@@ -1,0 +1,41 @@
+# ═══════════════════════════════════════════════════════════════════
+# Issue + PR label scheme.
+# ═══════════════════════════════════════════════════════════════════
+# Source of truth for the labels available on this repo.  The
+# sync-labels workflow applies any changes to GitHub on every push
+# to main that touches this file — add, rename, or remove a label
+# here and it'll show up in the issue tracker within ~30 seconds.
+#
+# Keep it short.  More labels = more friction.
+
+- name: bug
+  color: d73a4a
+  description: Something's broken.
+
+- name: enhancement
+  color: a2eeef
+  description: Feature request or improvement.
+
+- name: documentation
+  color: 0075ca
+  description: Typos, unclear sections, missing examples.
+
+- name: question
+  color: cc317c
+  description: "How do I…?  (Consider Discussions instead.)"
+
+- name: roadmap
+  color: 5319e7
+  description: Items from / for the ROADMAP.
+
+- name: good first issue
+  color: 7057ff
+  description: Small, well-scoped task — good for new contributors.
+
+- name: help wanted
+  color: 008672
+  description: We'd happily accept a PR for this.
+
+- name: wontfix
+  color: ffffff
+  description: Won't be addressed (reason in the issue thread).
