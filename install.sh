@@ -632,9 +632,11 @@ GCSYML
   fi
 
   echo
-  warn "the GHCR images don't exist yet for this OSS release."
-  warn "to start the stack, uncomment the \`build:\` blocks in"
-  warn "docker/docker-compose.yml so docker compose builds locally."
+  info "the compose stack pulls these public images on first run:"
+  hint "ghcr.io/simd-ai/agent:latest    (~284 MB)"
+  hint "ghcr.io/simd-ai/runner:latest   (~797 MB)"
+  hint "ghcr.io/simd-ai/ui:latest       (~82 MB)"
+  info "~1.2 GB total — first pull takes a couple of minutes, then cached."
   echo
 
   arrow_choice "start the stack now?" \
