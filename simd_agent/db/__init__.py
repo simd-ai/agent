@@ -1,30 +1,24 @@
-# simd_agent/db.py
+# simd_agent/db/__init__.py
 """Async database engine and session management using SQLAlchemy 2.0.
 
-Uses Neon Postgres with the asyncpg driver.  Key settings:
-  - pool_pre_ping=True  — handles Neon cold-start disconnects
-  - pool_recycle=300     — recycle before Neon's idle timeout (5 min)
-  - pool_size=5          — small since Neon's built-in pooler handles the rest
+Uses Neon Postgres with the asyncpg driver in production and SQLite (via
+aiosqlite) for local installs and tests.  Per-dialect quirks live behind the
+:mod:`simd_agent.db.dialect` package; everything in this module is dialect
+agnostic and delegates translation through :func:`get_dialect`.
+
+Postgres pool settings (Neon-specific):
+  - ``pool_pre_ping=True`` — handles Neon cold-start disconnects
+  - ``pool_recycle=300``   — recycle before Neon's idle timeout (5 min)
+  - ``pool_size=5``        — small since Neon's built-in pooler handles the rest
 """
 
+from __future__ import annotations
+
 import asyncio
-import sqlite3
-import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from sqlalchemy import MetaData, text
-
-
-# Bind ``uuid.UUID`` instances to their canonical string form when the
-# active backend is SQLite.  The codebase carries UUIDs as ``UUID`` objects
-# through every layer (run_id, event_id, simulation_id …); Python's
-# stock sqlite3 driver — which aiosqlite wraps — raises
-# ``ProgrammingError: Error binding parameter`` if it sees a UUID directly.
-# Registering once at import time means all aiosqlite connections in this
-# process get the conversion for free, without sprinkling ``str(...)``
-# casts through every call site.
-sqlite3.register_adapter(uuid.UUID, str)
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -33,6 +27,26 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from simd_agent.settings import get_settings
+
+from .dialect import Dialect, PostgresDialect, SqliteDialect, get_dialect
+
+__all__ = [
+    "Dialect",
+    "PostgresDialect",
+    "SqliteDialect",
+    "close_db",
+    "get_database_url",
+    "get_dialect",
+    "get_engine",
+    "get_session",
+    "get_session_factory",
+    "get_settings",  # re-exported for test patching
+    "init_db",
+    "is_sqlite",
+    "is_sqlite_url",
+    "metadata",
+    "portable_sql",
+]
 
 # Naming convention for constraints
 convention = {
@@ -146,39 +160,27 @@ def get_engine() -> AsyncEngine:
     return _engine
 
 
+def _active_dialect() -> Dialect:
+    """The dialect for the currently configured database URL."""
+    return get_dialect(get_database_url())
+
+
 def is_sqlite() -> bool:
     """True when the active database is SQLite."""
-    return is_sqlite_url(get_database_url())
+    return _active_dialect().name == "sqlite"
 
 
 def is_sqlite_url(url: str) -> bool:
-    return url.startswith("sqlite")
+    return SqliteDialect.matches_url(url)
 
 
 def portable_sql(sql: str) -> str:
-    """Translate Postgres-only SQL fragments for SQLite.
+    """Translate Postgres-flavored runtime SQL for the active dialect.
 
     Centralised so call sites can author one query string that runs on
-    both backends.  Currently rewrites:
-
-      * ``:param::jsonb`` / ``:param::text`` → ``:param``
-      * ``CAST(:param AS jsonb)`` → ``:param``
-      * ``::jsonb`` / ``::text`` (suffix casts on columns or literals) → stripped
-      * ``NOW()`` → ``CURRENT_TIMESTAMP``
-
-    No-op when the active backend is Postgres.
+    every backend.  No-op when the active backend is Postgres.
     """
-    if not is_sqlite():
-        return sql
-    import re
-
-    sql = re.sub(r"(:[A-Za-z_][A-Za-z0-9_]*)::(jsonb|text)", r"\1", sql)
-    sql = re.sub(r"CAST\(\s*(:[A-Za-z_][A-Za-z0-9_]*)\s+AS\s+jsonb\s*\)",
-                 r"\1", sql, flags=re.IGNORECASE)
-    sql = sql.replace("::jsonb", "")
-    sql = sql.replace("::text", "")
-    sql = re.sub(r"\bNOW\(\)", "CURRENT_TIMESTAMP", sql)
-    return sql
+    return _active_dialect().translate_runtime_sql(sql)
 
 
 def get_session_factory() -> async_sessionmaker[AsyncSession]:
@@ -205,43 +207,6 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
-
-
-def _pg_to_sqlite(sql: str) -> str:
-    """Translate Postgres DDL fragments into SQLite-compatible equivalents.
-
-    The schema is authored in Postgres syntax so the production deploy
-    keeps full type fidelity (TIMESTAMPTZ, JSONB, gen_random_uuid()…).
-    On SQLite we substitute equivalents that have the same semantics
-    when queried through the application: UUIDs become TEXT (the app
-    provides ``uuid4().hex``), JSONB becomes TEXT (we already JSON-dump
-    via ``_serialize``), TIMESTAMPTZ becomes TEXT (ISO strings).
-
-    Regex-based so it can stay a single source of truth for the schema.
-    """
-    import re
-
-    repl: list[tuple[str, str]] = [
-        # UUID with default — drop the default; app provides uuid4().hex
-        (r"UUID\s+PRIMARY\s+KEY\s+DEFAULT\s+gen_random_uuid\(\)", "TEXT PRIMARY KEY"),
-        (r"UUID\s+PRIMARY\s+KEY",                                  "TEXT PRIMARY KEY"),
-        (r"\bUUID\b",                                              "TEXT"),
-        # Timestamps
-        (r"TIMESTAMPTZ\s+NOT\s+NULL\s+DEFAULT\s+NOW\(\)",          "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP"),
-        (r"\bTIMESTAMPTZ\b",                                       "TEXT"),
-        # JSON
-        (r"\bJSONB\b",                                             "TEXT"),
-        # Booleans — SQLite has no boolean type, store as 0/1 integers
-        (r"BOOLEAN\s+NOT\s+NULL\s+DEFAULT\s+FALSE",                "INTEGER NOT NULL DEFAULT 0"),
-        (r"BOOLEAN\s+NOT\s+NULL\s+DEFAULT\s+TRUE",                 "INTEGER NOT NULL DEFAULT 1"),
-        (r"\bBOOLEAN\b",                                           "INTEGER"),
-        # Numeric sizes
-        (r"\bSMALLINT\b",                                          "INTEGER"),
-        (r"VARCHAR\(\s*\d+\s*\)",                                  "TEXT"),
-    ]
-    for pat, sub in repl:
-        sql = re.sub(pat, sub, sql, flags=re.IGNORECASE)
-    return sql
 
 
 async def _ensure_columns(conn) -> None:
@@ -340,7 +305,8 @@ async def init_db() -> None:
       - lint_reports:      validation results (many per simulation)
     """
     engine = get_engine()
-    sqlite = is_sqlite()
+    dialect = _active_dialect()
+    sqlite = dialect.name == "sqlite"
 
     if sqlite:
         # Create the parent directory of the SQLite file (eg ~/.simd/) so
@@ -362,7 +328,7 @@ async def init_db() -> None:
             await conn.execute(text("PRAGMA foreign_keys=ON"))
 
         async def ddl(sql: str) -> None:
-            await conn.execute(text(_pg_to_sqlite(sql) if sqlite else sql))
+            await conn.execute(text(dialect.translate_ddl(sql)))
 
         # ── Users ────────────────────────────────────────────────────────
         await ddl("""
